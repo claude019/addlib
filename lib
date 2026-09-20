@@ -1,0 +1,359 @@
+
+
+## 1. Purpose
+
+Given an incoming regulatory alert, decide — risk by risk — whether it bears on each of the bank's standing Library Risks.
+
+The output is a set of Record → Library Risk links, scored and evidenced, replacing a manual mapping exercise. Two lane designs have been built and measured against the same golden dataset.
+
+---
+
+## 2. Architecture
+
+### 2.1 The two lanes
+
+| | **Lane A — routed** | **Lane B — direct** |
+|---|---|---|
+| Path | Alert → Regulation Summary (RSM) → Library Risk | Alert → Library Risk |
+| Candidates | Library risks sitting under the summaries the alert was linked to | Every published library risk with text |
+| Pairs judged | 2,409 | 18,560 |
+| Model calls | ~60 | 480 |
+| Upstream dependency | Yes — Alert→RSM run | None |
+
+Lane B was built to answer one question: what was the route costing us? Everything else is held constant — same 160 alerts, same golden, same prompt, same model, same judge machinery, same `risk_text` construction. Only the candidate source changes.
+
+### 2.2 Pipeline sections
+
+Both lanes share a section structure:
+
+| Section | Purpose |
+|---|---|
+| [0] | Imports, paths, gateway binding |
+| [A] | Data load — the mapping extracts, risk register, alerts, golden |
+| [A1] | Scope recovery (direct lane only) — pins the run to the same records as the routed lane |
+| [A2] | Validation probe — run **before** building anything |
+| [B1] | Config, model params, response schema |
+| [B2] | Reachability — what the recall ceiling actually is |
+| [C] | Candidate build / work plan + concurrent judge execution |
+| [D] | Performance scorecard — **golden enters here, validation only** |
+| [E] | Diagnostic — where the misses go |
+| [F] | LLM-as-a-judge miss audit |
+| [F1] | Honest recall + waterfall |
+| [F0] | Head-to-head (direct lane only) |
+| [G] | Performance pack — confusion matrix + documentation workbook |
+
+### 2.3 Data sources
+
+| Source | Grain | Used for |
+|---|---|---|
+| Mapping extract — summaries & taxonomy | One row per Regulation Summary | Funnel, RSM → regulation parentage |
+| Mapping extract — summaries & library controls | RSM × L1 control × L2 control | **RSM → Library Risk parentage** (dedupe to the RSM–LR pair) |
+| Risk register — US risk extract | Risk **instance** | Library risk text (collapse to one row per library risk) |
+| Alert store | One row per record | Alert text |
+| Golden dataset | Record → Regulation → Library Risk | **Validation only** — never used to build candidates |
+
+### 2.4 Data gotchas worth knowing
+
+- **The risk extract is keyed by risk *instance*, not library risk.** The library risk is carried as parent fields on every instance row. Collapse to one row per library risk, Published only, newest instance wins. Do **not** use the instance-level columns (title, description, risk_owner, inherent/residual risk, lifecycle comments) — they vary across instances of the same library risk.
+- **Taxonomy, business and legal-entity lines are part of the risk's meaning**, not metadata. The one-line description alone is too thin to judge on. They are concatenated into `risk_text`.
+- **Blank IDs arrive as `"-"`, `"NONE"`, `"NAN"`, `"NAT"`**, not as nulls. Filter them before any `nunique()` or join, or counts come out one too high.
+- **Normalise every ID** (string / strip / upper) before joining, or joins silently miss on case and whitespace.
+- The mapping extract is at RSM × L1-control × L2-control grain, so there are multiple rows per RSM. Dedupe to the (RSM, LR) pair.
+
+---
+
+## 3. Universe and coverage
+
+| Count | Value | Note |
+|---|---:|---|
+| Alerts in scope | 160 | |
+| Published library risks with text | 116 | The direct lane's candidate pool |
+| Library risks with **any** RSM parent in the mapping extract | ~85 | The routed lane's structural ceiling |
+| Distinct library risks the routed lane actually offered | 62 | Across all 160 alerts |
+| Distinct library risks appearing in the golden (in scope) | 49 | |
+| Golden Record → Library Risk pairs in scope | 1,229 | |
+| `risk_text` length — median / min / max | 3,754 / 333 / 5,345 | characters |
+| Risks flagged `(TO BE RETIRED)` still in the pool | 28 | 24% of the candidate set |
+
+**Two coverage findings worth carrying forward:**
+
+1. Only ~85 of 116 published library risks have any Regulation Summary parent. Roughly **31 published risks are structurally unreachable by the routed lane** — not narrowly reached, unreachable, for any alert, ever.
+2. For these 160 alerts the routed lane ever offered the model **62 of 116** risks. Fifty-four were never a candidate for any alert in scope.
+
+Separately, only 49 distinct risks appear anywhere in the golden for these alerts. The other 67 have no golden link at all, so every prediction against them lands in the discovery bucket by construction.
+
+---
+
+## 4. How performance is measured
+
+### 4.1 The measurement trap
+
+The golden is **hand-picked, non-exhaustive, and built at regulation level with no Regulation Summary column.** When a record touches a regulation it inherits every risk sitting under every summary of that regulation. The average regulation carries ~2.7 summaries.
+
+Two consequences that govern how we are allowed to report:
+
+1. A golden risk link is verified truth → **we can measure recall.**
+2. A predicted link **not** in the golden is **not** a false positive — the golden is incomplete. We report these as **discoveries**. **Precision and F1 are therefore never computed.**
+
+### 4.2 The recall definitions — and which to quote
+
+| Definition | Numerator | Denominator | When to use |
+|---|---|---|---|
+| **Addressable (naïve) recall** | Caught | All addressable golden links (1,229) | **The only cross-lane comparable number.** Inflated denominator. |
+| Recall vs golden as handed (judged pairs) | Caught | Golden links the model actually judged | Single-lane reporting only. Bases differ across lanes — see warning below. |
+| **Text-derivable recall** | Caught | Caught + audit-derivable misses + insufficient | The number that describes model quality. Routed lane only. |
+| Model-addressable recall | Caught | As above, less SME-only links | As above. |
+
+> ⚠️ **Denominator warning.** "Recall vs judged pairs" uses 1,098 for the routed lane (131 pairs were never judged) and 1,229 for the direct lane (nothing was withheld). Putting 23.0% next to 22.2% reads as a regression when it is the opposite. **Compare lanes on the addressable row only.**
+
+---
+
+## 5. Results — routed lane (Iteration 2)
+
+### 5.1 Funnel
+
+| Category | Count | % |
+|---|---:|---:|
+| Total golden linkages | 1,229 | 100% |
+| Linkages missed (no risk text) | 0 | 0% |
+| Final linkages by solution (addressable) | 1,229 | 100% |
+| Not judged (upstream RSM gap) | 131 | 10.7% |
+| Judged insufficient | 0 | 0% |
+| Judged not linked | 845 | 68.8% |
+| **Caught (validated)** | **253** | **20.6%** |
+| Discoveries | 165 | |
+
+### 5.2 The waterfall — 1,229 down to 272
+
+| Stage | Removed | Remaining |
+|---|---:|---:|
+| Golden links as handed | | 1,229 |
+| less data gap (no risk text) | 0 | 1,229 |
+| less never judged (upstream gap) | 131 | 1,098 |
+| less structural over-mapping | 707 | 391 |
+| less correct rejection | 119 | 272 |
+| less SME-only | 0 | 272 |
+| **= text-derivable truth** | | **272** |
+| of which **validated** | | **253** |
+| of which **fixable miss** | | **19** |
+
+Closes exactly: 1,229 − 131 − 707 − 119 = 272 = 253 + 19.
+
+**Text-derivable recall = 253 / 272 = 93.0%**
+
+### 5.3 How the 1,098 becomes 272
+
+| Stage | Count | Counts toward the 93%? |
+|---|---:|---|
+| 1 · Judged | 1,098 | denominator of the 23% figure |
+| 2a · Model said LINKED | 253 | YES — numerator |
+| 2b · Model said NOT LINKED → sent to audit | 845 | split below |
+| 3a · Audit: structural over-mapping | 707 | NO — removed |
+| 3b · Audit: correct rejection | 119 | NO — removed |
+| 3c · Audit: SME judgement required | 0 | SME only |
+| 3d · Audit: true link missed | 19 | YES — a real miss |
+| 4 · **Corrected denominator** | **272** | denominator of the 93% |
+
+**Narration:** of the 1,098 links we ruled on we made 253; of the 845 we did not make, an independent audit says 826 were never real links — the golden had swept them in wholesale; strip those out and we were judged against 272 genuine links, of which we found 253.
+
+### 5.4 Confusion matrix (2,409 judged pairs)
+
+| | Golden linked | Golden not linked | Total |
+|---|---:|---:|---:|
+| Model LINKED | 253 | 165 | 418 |
+| Model NOT LINKED | 845 | 1,146 | 1,991 |
+| **Total** | **1,098** | **1,311** | **2,409** |
+
+TN is **contaminated** — it also holds real links nobody has recorded yet.
+
+### 5.5 Prompt iteration
+
+Between prompt versions nothing changed but the prompt. Caught links moved **134 → 253** on identical data.
+
+What changed:
+- Removed the business-line veto
+- Taught the model that horizontal / cross-cutting risks (regulatory change, governance, record-keeping) link broadly
+- Mapped obligations to legal entities by regulated role
+- Treated placeholder taxonomy values (`TBD`, blank) as missing data rather than a mismatch
+
+---
+
+## 6. Results — direct lane (Direct Iteration 1)
+
+### 6.1 Run
+
+18,560 pairs · 480 model calls · 8m46s · 0 call errors · all `finish_reason: stop`
+
+### 6.2 Head-to-head, same golden, same 1,229 denominator
+
+| Metric | Routed | Direct | Δ |
+|---|---:|---:|---:|
+| Validated (caught) | 258 | 273 | **+15** |
+| Judged not linked | 831 | 922 | +91 |
+| Judged error | 9 | 34 | +25 |
+| Never judged | 131 | **0** | −131 |
+| Addressable denominator | 1,229 | 1,229 | 0 |
+| Discoveries | 159 | 1,357 | +1,198 |
+| Pairs judged | 2,409 | 18,560 | +16,151 |
+| **Addressable recall** | **21.0%** | **22.2%** | **+1.2 pts** |
+
+*(routed-lane figures here are the rescored set — see §8.3)*
+
+### 6.3 Confusion matrix (18,560 judged pairs)
+
+| | Golden linked | Golden not linked | Total |
+|---|---:|---:|---:|
+| Model LINKED | 273 | 1,357 | 1,630 |
+| Model NOT LINKED | 956 | 15,974 | 16,930 |
+| **Total** | **1,229** | **17,331** | **18,560** |
+
+FN 956 = 922 declined + 34 errored. Never judged = 0.
+
+### 6.4 Discovery rate
+
+| | Routed | Direct |
+|---|---:|---:|
+| Non-golden pairs judged | 1,311 | 17,331 |
+| Discoveries | 165 | 1,357 |
+| **Discovery rate** | **12.6%** | **7.8%** |
+
+Volume rose ~8×; the rate **fell**. The extra discoveries come from judging more pairs, not from better targeting.
+
+### 6.5 What the experiment concluded
+
+- The 131 golden links the route hid were worth about **fifteen** real catches, not 131. The upstream RSM gap was real but far smaller than assumed. **This closes the "upstream recall is the ceiling" hypothesis.**
+- `NOT_JUDGED = 0`. In the routed lane a miss could be a model decision **or** a routing gap and the two could not be separated. In the direct lane every miss is a model decision. **This is the main win** — it is what makes a miss audit interpretable.
+- +1.2 pts of recall for 7.7× the pairs judged is not, on its own, a case for adopting the direct lane. The clean audit frame is.
+
+---
+
+## 7. Current headline numbers
+
+| Number | Value | Scope |
+|---|---:|---|
+| Text-derivable recall | **93.0%** | **Routed lane only** |
+| Addressable recall — routed | 20.6% (253/1,229) | |
+| Addressable recall — direct | 22.2% (273/1,229) | |
+| Golden links never shown to the model — direct | 0 | down from 131 |
+| Discoveries — direct | 1,357 | unvalidated |
+
+---
+
+## 8. Known issues and open risks
+
+### 8.1 The over-mapping split is audit-derived, not arithmetic — MEDIUM
+
+The 707 / 119 split comes from an LLM audit that is **told the over-mapping hypothesis** and is **shown whether the golden says linked**. It returns near-zero model fault whichever way the model performs (2 in v0, 1 in v1 despite +119 caught links). It is corroborating evidence, not independent proof.
+
+**Mitigation in flight:** a deterministic reachability test — for each miss, was the risk reachable through a *specifically linked* summary, or only through the whole-regulation sweep? No LLM in the loop. This converts the 93% from an assertion into an audited fact.
+
+### 8.2 The direct lane has no usable audit — HIGH
+
+The same audit run against the direct lane's 956 misses returned a **single category — "text too thin" — at 100%, with zero model fault**, against risk text averaging 3,754 characters (minimum 333). A classifier putting every case in one bucket is not discriminating, and it contradicts the routed lane's audit on the same golden.
+
+**Consequence:** there is no text-derivable recall figure for the direct lane. The 93% must be presented as a **routed-lane number only**.
+
+**Action:** read the raw reasoning on a sample of `audited` rows — the symptom looks like an empty or truncated payload reaching the auditor, not a judgement.
+
+### 8.3 Two routed-lane scorecards disagree — MEDIUM
+
+The same verdicts parquet scored by two versions of the scorecard:
+
+| Gate | Original | Rescored | Δ |
+|---|---:|---:|---:|
+| Caught | 253 | 258 | +5 |
+| Judged not linked | 845 | 831 | −14 |
+| Judged error | 0 | 9 | +9 |
+| Never judged | 131 | 131 | 0 |
+| Discoveries | 165 | 159 | −6 |
+| Addressable recall | 20.6% | 21.0% | +0.4 pts |
+
+**Cause:** duplicate `(RECORD_ID, LIB_RISK)` rows with conflicting verdicts, resolved in opposite directions; plus omitted-id rows broken out as their own gate rather than folded into "not linked". Both sum to 1,229, so neither is arithmetically wrong.
+
+**Action:** count the duplicates, adopt one scorecard for both lanes, quote one per document.
+
+### 8.4 28 risks flagged for retirement are still in the pool — MEDIUM
+
+24% of the candidate set is marked `(TO BE RETIRED)` but still passes the Published filter. They inflate the denominator and generate discoveries nobody wants. A data fix, no model change.
+
+### 8.5 Discovery value is unproven — MEDIUM
+
+No SME has reviewed the candidate links. Until a sample is validated, discoveries are a **volume, not a benefit**. 1,357 is beyond what an SME will review — rank by `relevance_score` and take a top slice.
+
+### 8.6 Omitted-id rows — LOW
+
+34 of 18,560 pairs (0.2%) came back with the risk id absent from the response. They are counted as misses, which is the conservative treatment. The row-per-candidate loop catches these rather than letting the pair vanish. Not currently a concern at chunk size 40.
+
+---
+
+## 9. Next steps
+
+| # | Action | Type | Expected effect |
+|---|---|---|---|
+| 1 | Deterministic reachability test to replace the audit split | Validation | Makes the 93% defensible without an LLM judge |
+| 2 | Diagnose the audit payload (read raw reasoning on ~5 rows) | Validation | Explains the 100% single-category result |
+| 3 | Exclude the 28 retired risks and re-run both lanes | Data fix | Cleaner denominator; ~+2 pts expected |
+| 4 | Rank + SME-sample the top 50 discoveries | Validation | Turns volume into a proven hit rate |
+| 5 | Request a Regulation Summary column in the golden | Data / SME | Removes the measurement distortion permanently |
+| 6 | Decide whether to adopt the direct lane | Decision | Sets the design going forward |
+
+**Deliberately deferred:** prompt v3 and further prompt iteration. Tuning against a denominator we cannot currently defend is premature. Fix the measurement first.
+
+---
+
+## 10. Running the pipeline
+
+### Routed lane
+Run sections [0] → [F2] in order. Stop after [A2] and read the probe before spending anything.
+
+### Direct lane
+1. `[0]` → `[A]` → `[A1]` — check the scope reconciliation against the previous run
+2. `[A2]` — the cost gate: prints the full cross-join size and the call estimate
+3. `[B2]` — the addressable count becomes the recall denominator
+4. `[C]` — first real spend. Prints the plan size before running.
+5. `[D]`, `[E]`, `[F0]`
+6. `[F]`, `[F1]`, `[F2]` — pasted from the routed-lane pipeline unchanged; add a `_direct` suffix to `AUDIT_SLICE` and output filenames
+7. `[G]` last — picks up `audited` and `comparison` automatically
+
+### Crash safety
+Work unit = `(RECORD_ID, chunk_index)`. The plan is written to `plan.json` **before** any model call and never rebuilt on resume, so a re-embed cannot shift chunk boundaries and orphan finished work. Each completed unit is appended to a fsync'd JSONL; a parquet snapshot lands every 25 units. After a disconnect, re-run cells [0] → [C] and it picks up exactly where it stopped.
+
+**Gotcha:** `build_plan` reloads `plan.json` if it exists. Changing the scope without clearing `checkpoints/` will silently re-run the old plan. Reset with:
+
+```python
+import shutil
+shutil.rmtree(CKPT_DIR, ignore_errors=True)
+CKPT_DIR.mkdir(parents=True, exist_ok=True)
+```
+
+If you interrupt with Ctrl-C in a live kernel, restart the kernel before re-running — the aborted coroutine can linger on the event loop.
+
+---
+
+## 11. Artefacts
+
+| Artefact | Location |
+|---|---|
+| Routed-lane verdicts | `Risk_Linkage/Iteration_1/risk_verdicts_<model>.parquet` |
+| Direct-lane verdicts | `Risk_Linkage/Direct_Iteration_1/risk_verdicts_direct_<model>.parquet` |
+| Scope record list | `Direct_Iteration_1/scope_records_from_routed_lane.csv` |
+| Head-to-head comparison | `Direct_Iteration_1/direct_vs_rsm_comparison.csv` |
+| Performance pack (9 tabs) | `Direct_Iteration_1/performance_pack_direct_<model>.xlsx` |
+| Miss audit | `<output>/risk_audit_false_negatives[_direct]_<model>.xlsx` |
+| Checkpoints | `<output>/checkpoints/` — `plan.json`, `verdicts.jsonl`, `calls.jsonl`, `run_state.json` |
+
+---
+
+## 12. Reporting guidance
+
+Things that will be asked, and the honest answer:
+
+**"Why is recall only 22%?"** — Because the golden's denominator contains links no reader of the two texts would make. Against text-derivable truth it is 93% in the routed lane. That figure is currently audit-derived and being converted to arithmetic.
+
+**"How do you know the 707 aren't real misses?"** — We do not, with certainty. The audit says so, but the audit is not independent. The reachability test in §9.1 is what will settle it. *(This is the single question that can unravel the 93%. Pre-empt it.)*
+
+**"What did removing the route buy?"** — About fifteen more validated links and, more importantly, a clean audit frame: every miss is now a model decision rather than a routing artefact.
+
+**"Are the 1,357 discoveries real?"** — Unknown. No SME has reviewed them. The discovery *rate* per pair judged actually fell.
+
+**Never report precision or F1.** The golden is non-exhaustive; a false positive here is a candidate link, not an error.
