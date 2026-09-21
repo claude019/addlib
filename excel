@@ -1,0 +1,204 @@
+# %% ==========================================================================
+# [H] SME VALIDATION PACK -- routed lane
+# One row per judged (alert, library risk) pair, laid out in four blocks:
+#   RAPID2 Data | RegMap Data | Library Risk Data | Model Recommendation
+# plus an SME feedback block with a Link / Not Link dropdown.
+#
+# The Regulation ID is NOT in `verdicts` -- the judge never sees it. It is
+# rebuilt here from the same inputs build_risk_candidates used:
+#   alert -> its LINKED RSMs (rwt.linked_rsm_ids) -> RegMap Extract3 -> risk
+# ONE ROW PER PATH: each row carries exactly one Regulation ID and one RSM ID.
+# A pair reachable through two RSMs appears as two adjacent rows; the model's
+# decision is per PAIR, so it repeats on each of that pair's rows.
+# =============================================================================
+import re
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.worksheet.datavalidation import DataValidation
+from openpyxl.cell.cell import ILLEGAL_CHARACTERS_RE
+
+SME_FILTER = "ALL"    # "ALL" | "LINKED" | "GOLDEN" | "TP" | "FN" | "FP"
+SME_SAMPLE = None     # int -> seeded random sample of that many rows; None -> all
+SME_FILE   = OUTPUT_DIR / f"sme_validation_pack_{MODEL}.xlsx"
+
+# Extra RAPID2 columns to show if they exist in the file (add names freely).
+ALERT_COLS = {
+    "RECORD_JURISDICTION_CODE": "Alert Jurisdiction Code",
+    "RECORD_JURISDICTION_NAME": "Alert Jurisdiction",
+    "REGULATOR_CODE":           "Alert Regulator",
+    "TITLE":                    "Title",
+    "SUMM_CONTENT":             "Summary Content",
+    "SUMM_UPDATE":              "Summary Update",
+}
+
+# ---- 1. provenance: (RECORD_ID, LIB_RISK) -> RSM(s) -> REG_ID(s) ------------
+_lk = rwt[rwt["final_decision"].astype(str).str.upper() == "LINKED"]
+_pairs = []
+for rid, ids in zip(_norm_id(_lk["RECORD_ID"]), _lk["linked_rsm_ids"].fillna("").astype(str)):
+    for x in re.split(r"[|,]", ids):
+        if x.strip():
+            _pairs.append((rid, x.strip().upper()))
+rec_rsm = pd.DataFrame(_pairs, columns=["RECORD_ID", "SUM_ID"]).drop_duplicates()
+
+rsm_risk = regmap_risk[["REG_ID", "SUM_ID", "LIB_RISK"]].drop_duplicates()
+paths = rec_rsm.merge(rsm_risk, on="SUM_ID", how="inner")
+
+_rt = regmap_rsm.copy()
+for c in ["REG_ID", "SUM_ID"]:
+    if c in _rt.columns:
+        _rt[c] = _norm_id(_rt[c])
+_keep = [c for c in ["SUM_ID", "JUR", "SUM_TITLE", "SUM_TEXT"] if c in _rt.columns]
+paths = paths.merge(_rt[_keep].drop_duplicates("SUM_ID"), on="SUM_ID", how="left")
+
+
+paths = (paths.drop_duplicates(["RECORD_ID", "LIB_RISK", "REG_ID", "SUM_ID"])
+              .sort_values(["RECORD_ID", "LIB_RISK", "REG_ID", "SUM_ID"]))
+paths["n_paths"] = paths.groupby(["RECORD_ID", "LIB_RISK"])["SUM_ID"].transform("size")
+paths["path_no"] = paths.groupby(["RECORD_ID", "LIB_RISK"]).cumcount() + 1
+paths["path_label"] = paths.path_no.astype(str) + " of " + paths.n_paths.astype(str)
+
+# ---- 2. base: every judged pair, deduped (LINKED wins, same as the scorecard)
+v = verdicts.copy()
+v["RECORD_ID"], v["LIB_RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
+v["decision"] = v.decision.astype(str).str.strip().str.upper()
+_rank = {"LINKED": 4, "INSUFFICIENT_EVIDENCE": 3, "NOT_LINKED": 2, "MISSING": 1, "ERROR": 0}
+v = (v.assign(_r=v.decision.map(_rank).fillna(-1))
+      .sort_values("_r", ascending=False)
+      .drop_duplicates(["RECORD_ID", "LIB_RISK"])
+      .drop(columns="_r"))
+
+gk = golden[~golden.LIB_RISK.isin(_BLANK)]
+gk = set(_norm_id(gk.RECORD_ID) + "|" + _norm_id(gk.LIB_RISK))
+v["in_golden"] = (v.RECORD_ID + "|" + v.LIB_RISK).isin(gk)
+v["cell"] = np.select(
+    [v.in_golden & v.decision.eq("LINKED"), v.in_golden & ~v.decision.eq("LINKED"),
+     ~v.in_golden & v.decision.eq("LINKED")],
+    ["TP", "FN", "FP"], default="TN")
+
+# ---- 3. filter / sample BEFORE the heavy joins ------------------------------
+if SME_FILTER == "LINKED":
+    v = v[v.decision.eq("LINKED")]
+elif SME_FILTER == "GOLDEN":
+    v = v[v.in_golden]
+elif SME_FILTER in ("TP", "FN", "FP"):
+    v = v[v.cell.eq(SME_FILTER)]
+if SME_SAMPLE:
+    v = v.sample(n=min(SME_SAMPLE, len(v)), random_state=42)
+
+# ---- 4. attach alert, RegMap and library-risk data --------------------------
+_ra = pd.read_parquet(RAPID2_FILE, engine="pyarrow")
+_ra["RECORD_ID"] = _norm_id(_ra["RECORD_ID"])
+_acols = ["RECORD_ID"] + [c for c in ALERT_COLS if c in _ra.columns]
+_ra = _ra[_acols].drop_duplicates("RECORD_ID")
+
+sme = (v.merge(_ra, on="RECORD_ID", how="left")
+        .merge(paths, on=["RECORD_ID", "LIB_RISK"], how="left")
+        .merge(helios[["LIB_RISK", "library_risk_title", "library_risk_description", "risk_text"]],
+               on="LIB_RISK", how="left")
+        .sort_values(["RECORD_ID", "LIB_RISK", "REG_ID", "SUM_ID"], na_position="last")
+        .reset_index(drop=True))
+
+# ---- 5. layout: (block, source column, header) ------------------------------
+LAYOUT = (
+    [("RAPID2 Data", "RECORD_ID", "Record ID")]
+    + [("RAPID2 Data", c, h) for c, h in ALERT_COLS.items() if c in sme.columns]
+    + [("RegMap Data", "REG_ID", "Regulation ID"),
+       ("RegMap Data", "SUM_ID", "Regulation Summary ID"),
+       ("RegMap Data", "JUR", "RegMap Jurisdiction"),
+       ("RegMap Data", "SUM_TITLE", "Summary Title"),
+       ("RegMap Data", "SUM_TEXT", "Summary Text"),
+       ("RegMap Data", "path_label", "Path (of this pair)"),
+       ("Library Risk Data", "LIB_RISK", "Library Risk ID"),
+       ("Library Risk Data", "library_risk_title", "Library Risk Title"),
+       ("Library Risk Data", "library_risk_description", "Library Risk Description"),
+       ("Library Risk Data", "risk_text", "Full Risk Text (as judged)"),
+       ("Model Recommendation", "decision", "Model Decision"),
+       ("Model Recommendation", "relevance_score", "Relevance Score"),
+       ("Model Recommendation", "reasoning", "Model Reasoning"),
+       ("Model Recommendation", "in_golden", "In Golden Dataset?"),
+       ("Feedback - SME", None, "Please select Link/Not Link"),
+       ("Feedback - SME", None, "Reason/Comment")]
+)
+
+_hdrs = [h for _, _, h in LAYOUT]
+assert len(_hdrs) == len(set(_hdrs)), f"duplicate headers: {[h for h in _hdrs if _hdrs.count(h) > 1]}"
+out = pd.DataFrame({h: (sme[c] if c and c in sme.columns else "") for _, c, h in LAYOUT})
+out["In Golden Dataset?"] = out["In Golden Dataset?"].map({True: "Yes", False: "No"})
+
+
+def _clean(x):
+    # openpyxl rejects control characters; Excel caps a cell at 32,767 chars
+    if isinstance(x, str):
+        return ILLEGAL_CHARACTERS_RE.sub("", x)[:32000]
+    return x
+
+
+out = out.apply(lambda col: col.map(_clean))
+out.to_excel(SME_FILE, index=False, startrow=1, sheet_name="SME_Validation")
+
+# ---- 6. styling: block banners, headers, dropdown, freeze panes --------------
+BLOCK_FILL = {"RAPID2 Data": "262626", "RegMap Data": "C55A11",
+              "Library Risk Data": "1F3864", "Model Recommendation": "2F5597",
+              "Feedback - SME": "DDEBF7"}
+BLOCK_FONT = {"Feedback - SME": "1F3864"}
+WIDE = {"Summary Content", "Summary Update", "Summary Text", "Full Risk Text (as judged)",
+        "Library Risk Description", "Model Reasoning", "Reason/Comment", "Summary Title"}
+
+wb = load_workbook(SME_FILE)
+ws = wb["SME_Validation"]
+thin = Side(style="thin", color="BFBFBF")
+box = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+col, start = 1, 1
+blocks = [b for b, _, _ in LAYOUT]
+for i in range(1, len(blocks) + 1):
+    if i == len(blocks) or blocks[i] != blocks[i - 1]:
+        b = blocks[i - 1]
+        ws.merge_cells(start_row=1, start_column=start, end_row=1, end_column=i)
+        c = ws.cell(1, start, b)
+        c.font = Font(bold=True, size=12, color=BLOCK_FONT.get(b, "FFFFFF"))
+        c.alignment = Alignment(horizontal="center", vertical="center")
+        for k in range(start, i + 1):
+            ws.cell(1, k).fill = PatternFill("solid", fgColor=BLOCK_FILL[b])
+            h = ws.cell(2, k)
+            h.fill = PatternFill("solid", fgColor=BLOCK_FILL[b])
+            h.font = Font(bold=True, color=BLOCK_FONT.get(b, "FFFFFF"))
+            h.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            h.border = box
+        start = i + 1
+
+for k, (_, _, h) in enumerate(LAYOUT, start=1):
+    letter = ws.cell(2, k).column_letter
+    ws.column_dimensions[letter].width = 55 if h in WIDE else 18
+    for r in range(3, len(out) + 3):
+        cell = ws.cell(r, k)
+        cell.alignment = Alignment(wrap_text=True, vertical="top")
+        cell.border = box
+ws.row_dimensions[1].height = 22
+ws.row_dimensions[2].height = 32
+for r in range(3, len(out) + 3):
+    ws.row_dimensions[r].height = 90
+
+fb = list(out.columns).index("Please select Link/Not Link") + 1
+fb_letter = ws.cell(2, fb).column_letter
+dv = DataValidation(type="list", formula1='"Link,Not Link"', allow_blank=True)
+ws.add_data_validation(dv)
+dv.add(f"{fb_letter}3:{fb_letter}{len(out) + 2}")
+for r in range(3, len(out) + 3):
+    ws.cell(r, fb).fill = PatternFill("solid", fgColor="FFF2CC")
+    ws.cell(r, fb + 1).fill = PatternFill("solid", fgColor="FFF2CC")
+
+ws.freeze_panes = "B3"
+ws.auto_filter.ref = f"A2:{ws.cell(2, len(LAYOUT)).column_letter}{len(out) + 2}"
+wb.save(SME_FILE)
+
+# ---- 7. report --------------------------------------------------------------
+print(f"[H] SME pack -> {SME_FILE}")
+_npairs = sme[["RECORD_ID", "LIB_RISK"]].drop_duplicates().shape[0]
+print(f"    rows: {len(out):,} (one per RSM path)   pairs: {_npairs:,}   "
+      f"filter={SME_FILTER}   sample={SME_SAMPLE}")
+print(f"    cells: {v.cell.value_counts().to_dict()}")
+print(f"    rows with NO RegMap path  : {int(sme.REG_ID.isna().sum()):,}  (should be 0 in the routed lane)")
+print(f"    pairs reachable via >1 RSM: {int((sme.drop_duplicates(['RECORD_ID','LIB_RISK']).n_paths.fillna(0) > 1).sum()):,}")
+print("    NOTE: the model decision is per PAIR and repeats on each path row --")
+print("          count SME verdicts per pair, not per row, when computing a hit rate.")
