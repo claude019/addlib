@@ -202,3 +202,154 @@ print(f"    rows with NO RegMap path  : {int(sme.REG_ID.isna().sum()):,}  (shoul
 print(f"    pairs reachable via >1 RSM: {int((sme.drop_duplicates(['RECORD_ID','LIB_RISK']).n_paths.fillna(0) > 1).sum()):,}")
 print("    NOTE: the model decision is per PAIR and repeats on each path row --")
 print("          count SME verdicts per pair, not per row, when computing a hit rate.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================================
+# ANSWER PACK — golden reconciliation, top-k attainable recall, funnel,
+# confusion matrix. Run once per notebook; set LANE below.
+# ============================================================================
+import numpy as np, pandas as pd
+
+LANE = "direct"     # "direct" or "routed" -- controls the alias block only
+
+if LANE == "direct":
+    reg_frame   = golden          # has REG_ID column
+    risk_frame  = register        # helios in the routed notebook
+    risk_id_col = "LIB_RISK"
+    risk_pool   = sorted(set(risk_frame.LIB_RISK))
+    # reuse the ordering build_plan already computed -- ZERO extra cost
+    order_by_alert = globals().get("order_by_record")
+    if order_by_alert is None:
+        risk_text_by_id = dict(zip(risk_frame.LIB_RISK, risk_frame.risk_text))
+        _al = load_alerts(set(scope_records))
+        alert_text_by_id = dict(zip(_al.RECORD_ID, _al.alert_text))
+        risk_vecs  = embed_cache(risk_pool, [risk_text_by_id[c] for c in risk_pool],
+                                 "helios_library_risks")
+        alert_vecs = embed_cache(sorted(scope_records),
+                                 [alert_text_by_id[r] for r in sorted(scope_records)],
+                                 "alerts_risk_lane_direct")
+        order_by_alert = {}
+        for i, rid in enumerate(sorted(scope_records)):
+            sims = np.asarray(risk_vecs) @ np.asarray(alert_vecs)[i]
+            order_by_alert[rid] = [risk_pool[j] for j in np.argsort(-sims)]
+
+else:  # routed
+    reg_frame   = golden
+    risk_frame  = helios
+    risk_pool   = sorted(set(helios.LIB_RISK))
+    # rebuild the per-alert RSM-cascade candidate pool, ordered by cosine sim,
+    # using the SAME cache tags as the run -- this hits cache, no new spend
+    _lk = rwt[rwt["final_decision"].astype(str).str.upper() == "LINKED"]
+    _pairs = []
+    for rid, ids in zip(_norm_id(_lk.RECORD_ID), _lk.linked_rsm_ids.fillna("").astype(str)):
+        for x in __import__("re").split(r"[|,]", ids):
+            if x.strip():
+                _pairs.append((rid, x.strip().upper()))
+    rec_rsm  = pd.DataFrame(_pairs, columns=["RECORD_ID", "SUM_ID"]).drop_duplicates()
+    rsm_risk = regmap_risk[["SUM_ID", "LIB_RISK"]].drop_duplicates()
+    cand_pool = (rec_rsm.merge(rsm_risk, on="SUM_ID")
+                        .groupby("RECORD_ID")["LIB_RISK"].apply(lambda s: sorted(set(s))))
+
+    risk_text_by_id = dict(zip(helios.LIB_RISK, helios.risk_text))
+    _al = load_alerts(set(cand_pool.index))
+    alert_text_by_id = dict(zip(_al.RECORD_ID, _al.alert_text))
+    risk_vecs = embed_cache(risk_pool, [risk_text_by_id[c] for c in risk_pool],
+                            "helios_library_risks")
+    rpos = {r: i for i, r in enumerate(risk_pool)}
+    order_by_alert = {}
+    for rid, pool in cand_pool.items():
+        if rid not in alert_text_by_id or not pool:
+            order_by_alert[rid] = []
+            continue
+        alert_vec = embed_cache([rid], [alert_text_by_id[rid]], "alerts_risk_lane")[0]
+        idx = [rpos[p] for p in pool]
+        sims = np.asarray(risk_vecs)[idx] @ np.asarray(alert_vec)
+        order = np.argsort(-sims)
+        order_by_alert[rid] = [pool[j] for j in order]
+
+print(f"[answer-pack] LANE={LANE}  order_by_alert built for {len(order_by_alert):,} alerts")
+
+# ---- 1. golden dataset stats + the 1229 reconciliation ----------------------
+g_raw = reg_frame.copy()
+print("\n--- GOLDEN DATASET ---")
+print(f"raw rows                          : {len(g_raw):,}")
+g_valid = g_raw[~_norm_id(g_raw.LIB_RISK).isin(_BLANK)]
+print(f"after blank LIB_RISK filter        : {len(g_valid):,}")
+print(f"distinct regulations (all golden)  : {_norm_id(g_valid.REG_ID).nunique():,}")
+print(f"distinct library risks (all golden): {_norm_id(g_valid.LIB_RISK).nunique():,}")
+g_pairs_all = g_valid[["RECORD_ID", "LIB_RISK"]].assign(
+    RECORD_ID=lambda d: _norm_id(d.RECORD_ID), LIB_RISK=lambda d: _norm_id(d.LIB_RISK)
+).drop_duplicates()
+print(f"distinct (RECORD_ID, LIB_RISK)     : {len(g_pairs_all):,}")
+g_scope = g_pairs_all[g_pairs_all.RECORD_ID.isin(scope_records)]
+print(f"... restricted to {len(scope_records)} scoped alerts     : {len(g_scope):,}  <-- this is the 1,229 you see downstream")
+print(f"distinct regulations in scope      : {_norm_id(g_valid[g_valid.RECORD_ID.isin(scope_records)].REG_ID).nunique():,}")
+print(f"distinct library risks in scope    : {g_scope.LIB_RISK.nunique():,}")
+
+# ---- 2. top-k attainable recall sweep ---------------------------------------
+def attainable_recall_sweep(order_by_alert, golden_pairs, ks):
+    ranks = []
+    for rid, lr in golden_pairs:
+        pool = order_by_alert.get(rid, [])
+        ranks.append(pool.index(lr) + 1 if lr in pool else np.nan)
+    ranks = pd.Series(ranks)
+    total = len(ranks)
+    ceiling = int(ranks.notna().sum())
+    rows = [{"k": k, "caught": int(((ranks.notna()) & (ranks <= k)).sum()), "total": total,
+             "attainable_recall": ((ranks.notna()) & (ranks <= k)).sum() / total}
+            for k in ks]
+    rows.append({"k": "ceiling (no cap)", "caught": ceiling, "total": total,
+                 "attainable_recall": ceiling / total})
+    return pd.DataFrame(rows), ranks
+
+golden_pairs = list(zip(g_scope.RECORD_ID, g_scope.LIB_RISK))
+sweep, ranks = attainable_recall_sweep(order_by_alert, golden_pairs, ks=list(range(10, 101, 10)))
+print("\n--- TOP-K ATTAINABLE RECALL (retrieval only, before the LLM is asked) ---")
+print(sweep.to_string(index=False, formatters={"attainable_recall": "{:.1%}".format}))
+_ceil_recall = sweep.loc[sweep.k == "ceiling (no cap)", "attainable_recall"].iloc[0]
+_opt = sweep.loc[(sweep.k != "ceiling (no cap)") & (sweep.attainable_recall >= _ceil_recall - 1e-9), "k"]
+print(f"optimal k (first k reaching the ceiling): {_opt.min() if len(_opt) else 'none in the swept range'}")
+print(f"golden pairs structurally unreachable   : {int(ranks.isna().sum()):,}  "
+      f"({'RSM cascade never surfaced this risk for this alert' if LANE=='routed' else 'should be 0 in the direct lane'})")
+
+# ---- 3. what was actually shown to the LLM, and naive recall ----------------
+v = verdicts.copy()
+v["RECORD_ID"], v["LIB_RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
+v["decision"] = v.decision.astype(str).str.upper()
+_rank = {"LINKED": 4, "INSUFFICIENT_EVIDENCE": 3, "NOT_LINKED": 2, "MISSING": 1, "ERROR": 0}
+v = (v.assign(_r=v.decision.map(_rank).fillna(-1)).sort_values("_r", ascending=False)
+      .drop_duplicates(["RECORD_ID", "LIB_RISK"]).drop(columns="_r"))
+print("\n--- SHOWN TO THE LLM ---")
+print(f"pairs judged        : {len(v):,}")
+print(v.decision.value_counts().to_string())
+
+gk = set(g_scope.RECORD_ID + "|" + g_scope.LIB_RISK)
+v["in_golden"] = (v.RECORD_ID + "|" + v.LIB_RISK).isin(gk)
+tp = int((v.in_golden & v.decision.eq("LINKED")).sum())
+print(f"\nNAIVE RECALL = caught / judged golden pairs = {tp}/{v.in_golden.sum()} = {tp/max(v.in_golden.sum(),1):.1%}")
+print(f"ADDRESSABLE RECALL = caught / all {len(g_scope)} golden pairs = {tp}/{len(g_scope)} = {tp/len(g_scope):.1%}")
+
+# ---- 4. confusion matrix -----------------------------------------------------
+cm = pd.crosstab(v.decision.eq("LINKED").map({True: "Model LINKED", False: "Model NOT LINKED"}),
+                 v.in_golden.map({True: "Golden LINKED", False: "Golden NOT LINKED"}))
+print("\n--- CONFUSION MATRIX ---\n", cm)
+
+# ---- 5. the "4 sections" -- run the audit on the FULL miss set, not a sample
+print("\n--- NEXT: LLM-as-judge audit for honest recall ---")
+print("Run the [F] cell with AUDIT_SLICE='false_negatives', AUDIT_SAMPLE=None")
+print(f"(this covers the full {int((~v.in_golden.eq(False) & v.decision.eq('NOT_LINKED') & v.in_golden).sum())} "
+      f"false negatives, not a sample) -- the 4 categories are STRUCTURAL_OVERMAPPING, "
+      f"CORRECT_REJECTION, SME_JUDGEMENT_REQUIRED, TRUE_LINK_MISSED. honest_recall() in [F1] "
+      f"then gives text-derivable recall.")
