@@ -1,0 +1,667 @@
+# Alert → Library Risk Linkage: What We Built, What We Found
+
+**Owner:** Dipayan Banerjee
+**Date:** 24 September 2026
+**Status:** Both approaches built and measured. Results are real but come with three caveats that must be read before any number is quoted.
+
+---
+
+## 1. The one-page version
+
+We built a GenAI solution that reads an incoming regulatory alert and decides, risk by risk, which of the bank's standing Library Risks it affects. This replaces a manual mapping exercise.
+
+We built it **two different ways** so we could measure which design is better:
+
+- **The routed approach** reaches risks indirectly — alert → Regulation Summary → Library Risk
+- **The direct approach** skips the middle step — alert → Library Risk
+
+Both were run on the same 160 alerts against the same 1,229 hand-verified links.
+
+**The results:**
+
+| | Routed | Direct |
+|---|---:|---:|
+| Links correctly found | 259 | 264 |
+| Recall (on the same base) | 21.1% | 21.5% |
+| Links the model never even saw | 131 | 0 |
+| New candidate links surfaced | 169 | 1,376 |
+| Alert-risk pairs sent to the model | 2,409 | 18,560 |
+
+**What this means in plain terms:** removing the middle step lets the model see everything, which eliminates the 131 blind spots entirely. But it only converts about **5 extra links** into correct catches, at roughly **7.7 times the processing cost**. The recall difference is small. The real gain is that we can now tell the difference between "the model got it wrong" and "the model never had a chance" — which we genuinely could not do before.
+
+**The most important caveat:** the headline recall of ~21% is *not* a fair measure of how good the model is. It is depressed by how the reference data was built, not by model quality. Section 3 explains why. We have a method to correct for it, but that method is currently broken — Section 8.
+
+---
+
+## 2. What problem this solves
+
+Regulatory alerts arrive continuously. Someone has to read each one and decide which of the bank's standing Library Risks it bears on. Historically this was done by hand.
+
+The solution automates the decision. For each (alert, risk) pair it returns:
+- a **decision** — linked or not linked
+- a **relevance score** — how strongly
+- a **one-line reason** — why
+
+That last part matters. A reviewer can read the reasoning and agree or disagree, rather than being handed an unexplained yes/no.
+
+---
+
+## 3. Why the headline number looks worse than the model is
+
+This is the single most important thing to understand about these results, and the thing most likely to be misread.
+
+**Our reference data — the "golden" dataset — was recorded at the wrong level of detail.**
+
+The real relationship runs like this:
+
+```
+Alert  →  Regulation  →  Regulation Summary  →  Library Risk
+```
+
+But the golden dataset only records:
+
+```
+Alert  →  Regulation  →  Library Risk
+```
+
+The Regulation Summary step is missing from it.
+
+**The consequence:** when an alert touches a regulation, the golden marks it as linked to *every* Library Risk sitting under *every* summary of that regulation — including risks that specific alert has nothing to do with. One regulation typically carries several summaries.
+
+So we are being scored against a list that contains links no human reading the two documents would ever make.
+
+**A concrete example from the audit output:**
+
+> An alert about *medical information used in consumer credit decisions* is marked in the golden as linked to a risk about *handling of non-public market information*. The model correctly declined to link them. The golden counts that as a miss.
+
+**Two further consequences that shape how we are allowed to report:**
+
+1. **A golden link is verified truth, so we CAN measure recall** — what share of known-true links did we find.
+2. **A predicted link that is NOT in the golden is not necessarily wrong.** The golden is hand-picked and incomplete — it records the links someone needed at the time, not every link that exists. So we report these as **discoveries** (candidates for expert review), never as errors.
+
+**Because of point 2, we never compute precision or F1.** They would punish the model for finding things nobody had got round to recording. This is a deliberate reporting choice, not an oversight, and it should be stated explicitly whenever these numbers are shared.
+
+---
+
+## 4. The two approaches, explained simply
+
+### The routed approach
+
+For each alert, we look up which Regulation Summaries that alert was linked to by an earlier upstream process. We then gather all the Library Risks sitting under those summaries, and ask the model to judge only those.
+
+**Why we built it this way first:** it's efficient. Each alert only gets ~15 candidate risks instead of all 116, so the model does far less work.
+
+**The built-in weakness:** if the upstream process failed to link the right summary, the correct risk is never offered to the model at all. It gets counted as a miss the model never had a chance to avoid. In this run that happened to **131 of the 1,229 links** — about 11%.
+
+There is a second, quieter version of the same problem: across all 160 alerts, this approach only ever offered the model **62 of the 116** published risks. Fifty-four risks were never a candidate for any alert.
+
+### The direct approach
+
+We delete the middle step. Every alert is judged against every published Library Risk — all 116.
+
+**Why we built it:** to measure what the routing was actually costing us. It was an experiment, not an assumed improvement.
+
+**What it buys:** nothing is hidden from the model. The "never judged" count drops from 131 to zero. Every remaining miss is now genuinely a model decision, not a plumbing gap.
+
+**What it costs:** 18,560 pairs judged instead of 2,409 — about 7.7 times the work.
+
+---
+
+## 5. Results — the routed approach
+
+**Scale:** 160 alerts, 2,409 alert-risk pairs judged, zero failed calls.
+
+### Where the 1,229 golden links ended up
+
+| Outcome | Count | What it means |
+|---|---:|---|
+| **Caught** | 259 | Model found it, golden confirms |
+| Judged not linked | 839 | Model saw it and declined |
+| Never judged | 131 | Model was never shown it (the routing gap) |
+| Judged insufficient | 0 | |
+| **Total** | **1,229** | |
+
+**Recall = 259 / 1,229 = 21.1%**
+
+### New links surfaced
+**169** predicted links are not in the golden at all. These are candidates for expert review, not errors.
+
+### How narrow the routing really was
+
+This is worth highlighting to anyone assessing the design:
+
+- Only **62 of 116** risks were ever offered to any alert
+- Only **~85 of 116** risks have any Regulation Summary parent at all in the mapping data — so roughly 31 risks are unreachable by this design no matter what
+- One risk (`LR-00000906`) appears in the mapping tables but has no published text, so it can be referenced but never actually judged
+
+### A genuinely useful finding: the cost lever
+
+We tested what would happen if we capped the number of candidate risks per alert:
+
+| Cap at top… | Links still findable | % of achievable |
+|---:|---:|---:|
+| 10 | 773 | 62.9% |
+| 20 | 1,056 | 85.9% |
+| 30 | 1,096 | 89.2% |
+| **40** | **1,098** | **89.3%** |
+| 50–100 | 1,098 | 89.3% |
+
+**It flatlines at 40.** The routed approach could be capped at 40 candidate risks per alert with *zero* loss of recall. That's a straightforward efficiency saving, available today, with no downside.
+
+The 89.3% ceiling is not caused by the cap — it's the 131 links with no routing path at all. That's a data-mapping limitation, not a tuning choice.
+
+---
+
+## 6. Results — the direct approach
+
+**Scale:** 160 alerts, 18,560 pairs judged, zero failed calls.
+
+### Where the 1,229 golden links ended up
+
+| Outcome | Count | What it means |
+|---|---:|---|
+| **Caught** | 264 | Model found it, golden confirms |
+| Judged not linked | 953 | Model saw it and declined |
+| Judged error | 12 | Model's response omitted the risk ID — counted as a miss (conservative) |
+| **Never judged** | **0** | Nothing was hidden — this is the point of the design |
+| **Total** | **1,229** | |
+
+**Recall = 264 / 1,229 = 21.5%**
+
+### New links surfaced
+**1,376** — eight times the routed approach. But see the caution below.
+
+### A caution on the discovery number
+
+1,376 sounds dramatically better than 169. It isn't, quite. Per pair judged, the discovery *rate* actually **fell** — the extra volume comes from judging 16,151 more pairs, not from better targeting. And 1,376 is well beyond what an expert can realistically review. The practical next step is to rank them by relevance score and review the top slice.
+
+---
+
+## 7. Head to head
+
+Both scored against the same golden, same 1,229 denominator:
+
+| Metric | Routed | Direct | Change |
+|---|---:|---:|---:|
+| Caught | 259 | 264 | **+5** |
+| Judged not linked | 839 | 953 | +114 |
+| Never judged | 131 | **0** | **−131** |
+| Discoveries | 169 | 1,376 | +1,207 |
+| Pairs judged | 2,409 | 18,560 | +16,151 |
+| **Recall** | **21.1%** | **21.5%** | **+0.4 pts** |
+
+### How to read this
+
+**The routing gap was real but much smaller than it looked.** We assumed 131 hidden links meant 131 lost catches. Showing all of them to the model yielded about **five** extra catches. The other ~126 behave like the rest of the miss pile — the golden marks them because the risk sits under a touched regulation, not because the documents support a link.
+
+**This closes a hypothesis.** "Upstream recall is our ceiling" survived for a while on the strength of that 131. It turns out not to be the binding constraint.
+
+**The real win is measurement, not recall.** With the routed approach, a miss could be a model decision *or* a routing gap, and we had no way to separate them. With the direct approach every miss is a model decision. That's what makes a miss analysis meaningful — and it's a better argument for the design than +0.4 points would ever be on its own.
+
+**Is +0.4 points worth 7.7× the cost?** On recall alone, no. As a measurement instrument, arguably yes. A sensible middle path is to keep the routed approach for production (capped at 40 candidates, per Section 5) and use the direct approach periodically as a diagnostic.
+
+---
+
+## 8. What is broken and must be fixed
+
+I'd rather flag these now than have them found later.
+
+### 8.1 The direct approach's miss analysis did not run — HIGH
+
+We have a second model pass that classifies *why* each miss happened. In the direct approach it returned a single category for all 965 misses, with zero model fault.
+
+That is not a finding — it's a failure. The diagnostic output shows `"audit failed"` on every sampled row. The category it reported is the **fallback value the code assigns when the call errors**, not a judgement the model made. We also confirmed the input text was being read correctly, so it's the call itself failing.
+
+**Consequence:** the direct approach has no valid miss breakdown, and its two "corrected recall" figures are meaningless. They must not be quoted.
+
+### 8.2 The two approaches are no longer strictly comparable — HIGH
+
+The direct notebook now feeds the model a much shorter description of each risk (median ~441 characters) than it did previously (~3,754 characters). The routed notebook was not changed.
+
+**Consequence:** the +0.4 point difference reflects *two* changes, not one — removing the route, and shortening the input text. Before presenting that difference as the value of route removal, the two notebooks need to be brought back into alignment.
+
+### 8.3 The routed approach's miss analysis is interpretable but self-serving — MEDIUM
+
+It produced a proper breakdown: 90.6% "the golden swept in a whole regulation", 9.4% "the model was right to decline", and **zero** genuine model errors across 839 misses.
+
+The concern: this analysis is *told* the hypothesis it's testing and *shown* the golden's answer. It has returned near-zero model fault in every iteration, including one where a prompt change swung results by 119 links. It is corroborating evidence, not proof.
+
+**Consequence:** the category split is worth showing as indicative. The "corrected recall" it implies — a literal 100% — must not be presented as a real number.
+
+### 8.4 Numbers have drifted between runs — MEDIUM
+
+The routed approach has produced 253, 258, 251, and 259 correct catches across four runs of nominally the same pipeline.
+
+We now have a fingerprint check that records every input file's timestamp and content hash at the start and end of each run. It has already identified a likely cause: **both mapping extract files were refreshed on 22 September**, after the earlier measurements. Worth confirming with the owner of that refresh whether it was expected.
+
+### 8.5 Twenty-eight risks are flagged for retirement but still in scope — MEDIUM
+
+24% of the candidate pool is marked "(TO BE RETIRED)" yet still passes the published filter. They inflate the denominator and generate discoveries nobody wants. This is a data cleanup, not a model change.
+
+### 8.6 A small reconciliation gap — LOW
+
+Two internal reports disagree on the "never judged" count by 3 (131 vs 134). Immaterial to conclusions, but should be closed before the detailed workbook is circulated.
+
+---
+
+## 9. What we can and cannot say today
+
+**Can say, with confidence:**
+- Both approaches run end to end, reliably, with zero failed calls
+- The routing approach only ever showed the model 62 of 116 risks
+- Capping the routed approach at 40 candidates per alert costs nothing in recall
+- Removing the route eliminates all 131 blind spots and yields ~5 extra catches
+- The reference data materially understates model quality, for a structural reason we can describe precisely
+
+**Cannot say yet:**
+- Any "corrected" or "honest" recall figure — both approaches' correction methods are currently unusable
+- That the +0.4 point difference is attributable to route removal alone — the input text also changed
+- That the 1,376 discoveries have value — nobody has reviewed them
+
+---
+
+## 10. Recommended next steps
+
+| # | Action | Type | Why it matters |
+|---|---|---|---|
+| 1 | Fix the direct approach's miss-analysis call | Fix | Without it there is no honest denominator for that lane |
+| 2 | Re-align the risk text between the two notebooks | Fix | Makes the comparison valid again |
+| 3 | Replace the model-based miss analysis with a deterministic check | Method | A simple data join answers the same question without an opinion |
+| 4 | Confirm the 22 September mapping refresh was intentional | Data | Explains run-to-run drift |
+| 5 | Cap the routed approach at 40 candidates | Efficiency | Free saving, zero recall loss |
+| 6 | Exclude the 28 retired risks and re-run | Data | Cleaner denominator and discovery set |
+| 7 | Rank and expert-review the top ~50 discoveries | Validation | Turns a volume into a proven hit rate |
+
+**Deliberately not doing yet:** further prompt tuning. Optimising against a denominator we cannot currently defend is premature. Fix the measurement first.
+
+---
+
+## 11. Plain-English glossary
+
+| Term | What it means |
+|---|---|
+| **Golden dataset** | The hand-verified list of known-correct links. Our reference for "right answers". Incomplete by design. |
+| **Recall** | Of the known-correct links, what share did we find? |
+| **Discovery** | A link the model predicted that isn't in the golden. Possibly a genuine link nobody recorded. Not an error. |
+| **Never judged** | A known-correct link the model was never shown, so it had no chance to find it. |
+| **Structural over-mapping** | The golden marking a link only because the risk sits under a regulation the alert touched — not because the documents support it. |
+| **Correct rejection** | The model declined to link, and was right to. |
+| **Top-k** | A cap on how many candidate risks each alert is checked against. |
+| **Addressable** | Links the model could in principle find — i.e. the risk has published text. |
+
+---
+
+## 12. Where the detail lives
+
+- **`Routed_vs_Direct_Comparison_24SEP26.xlsx`** — data funnel, both confusion matrices, and the full question-by-question answers
+- **`routed_library_risk_linkage.py`** — the routed pipeline, end to end
+- **`direct_library_risk_linkage.py`** — the direct pipeline, end to end
+- Per-run outputs, including row-level discovery and miss lists, sit in the run output folders
+
+
+
+
+
+
+
+  # %% [H2] Routed lane — candidate derivation funnel ("how do we get 2,409?")
+# -----------------------------------------------------------------------------
+# Answers the reviewer comments on Routed_vs_Direct_Comparison_24SEP26.xlsx:
+#   (1) "Why does Routed show 18,560 too?"  -> 18,560 is the alert x LR cross-join
+#       CEILING shared by both lanes, not the routed lane's pair count.
+#   (2) "How is 2,409 derived?"             -> Table A rebuilds it stage by stage
+#       from rwt -> Extract3 -> Helios using pure joins (no LLM), then reconciles
+#       the rebuilt pair set against the routed verdicts parquet 1:1.
+#   (3) "Top-k 40 / 89% — why no reduction?" -> Table B: per-alert candidate pools
+#       are already <= 40, so a k=40 cap removes nothing. The 89.3% is the upstream
+#       reachability ceiling (Table C), not a top-k effect.
+#   (4) "Approach 1 = RSM -> RGL -> all LRs of the RGL?" -> Table D computes that
+#       RGL-rollup counterfactual so we can show which one the lane actually does.
+#
+# Principle kept: the golden builds NOTHING here. It enters only in Table C,
+# as validation of what the (already-built) candidate set can reach.
+#
+# Inputs: module-level globals already loaded by the routed notebook [0]->[C].
+# Rename in the INPUTS block if your globals differ. Column names are auto-
+# detected from candidate lists; a KeyError prints the real columns.
+# -----------------------------------------------------------------------------
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from openpyxl import load_workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+
+# ---- INPUTS (edit names here only) ------------------------------------------
+RWT  = rwt            # results_with_truth, 1 row / record, has linked_rsm_ids
+E2   = regmap_rsm     # RegMap Extract2 (RSM -> RGL), used ONLY for Table D
+E3   = regmap_risk    # RegMap Extract3 (RSM -> LR parentage)
+HEL  = helios         # Helios collapsed to 1 row / published LR with text (116)
+GOLD = golden         # golden parquet (validation only — Table C)
+VERD = verdicts       # routed verdicts parquet (2,409 rows)
+MIN_SCORE = LANE.get("min_score", 5) if "LANE" in globals() else 5
+
+WB_IN  = Path("Routed_vs_Direct_Comparison_24SEP26.xlsx")
+WB_OUT = Path("Routed_vs_Direct_Comparison_24SEP26_v2.xlsx")   # never overwrite the original
+SHEET  = "Routed_Funnel"
+RUN_LABEL = "Routed lane, 24 Sep 2026 fresh run (gpt-5.6-luna, prompt v3)"
+
+# ---- helpers ----------------------------------------------------------------
+# Blank IDs arrive as "-", "NONE", "NAN", "NAT" — not nulls. Filter before any
+# nunique/join (this is what caused the spurious 51-vs-49 LR scare).
+BLANK_TOKENS = {"", "-", "NONE", "NAN", "NAT", "NULL", "<NA>"}
+
+def _nid(s: pd.Series) -> pd.Series:
+    """Normalise IDs: str/strip/upper, drop float '.0' tails, blanks -> NaN."""
+    out = (s.astype(str).str.strip().str.upper()
+             .str.replace(r"\.0$", "", regex=True))
+    return out.where(~out.isin(BLANK_TOKENS))
+
+def _col(df: pd.DataFrame, *cands: str) -> str:
+    """First matching column, case-insensitive. Fails loudly with the real list."""
+    low = {c.lower(): c for c in df.columns}
+    for c in cands:
+        if c.lower() in low:
+            return low[c.lower()]
+    raise KeyError(f"None of {cands} found. Columns: {list(df.columns)}")
+
+def _stage(df: pd.DataFrame) -> dict:
+    return {
+        "rows":    len(df),
+        "records": df["_rec"].nunique() if "_rec" in df else np.nan,
+        "rsms":    df["_rsm"].nunique() if "_rsm" in df else np.nan,
+        "lrs":     df["_lr"].nunique()  if "_lr"  in df else np.nan,
+    }
+
+# ---- column detection -------------------------------------------------------
+rwt_rec = _col(RWT,  "RECORD_ID", "record_id")
+rwt_rsm = _col(RWT,  "linked_rsm_ids")
+e3_rsm  = _col(E3,   "SUM_ID", "RSM_ID", "Regulation Summary ID Number", "summary_id")
+e3_lr   = _col(E3,   "LIB_RISK", "Library Risk ID Number", "library_risk_id",
+                     "Regulation Summary Library Risk ID Number")
+e2_rsm  = _col(E2,   "SUM_ID", "RSM_ID", "Regulation Summary ID Number", "summary_id")
+e2_rgl  = _col(E2,   "RGL_ID", "REG_ID", "Regulation ID Number", "regulation_id")
+hel_lr  = _col(HEL,  "LIB_RISK", "library_risk_id")
+g_rec   = _col(GOLD, "RECORD_ID", "record_id")
+g_lr    = _col(GOLD, "LIB_RISK", "Regulation Summary Library Risk ID Number", "library_risk_id")
+v_rec   = _col(VERD, "RECORD_ID", "record_id")
+v_lr    = _col(VERD, "LIB_RISK", "library_risk_id", "risk_id")
+
+# Decision: prefer an explicit label column; fall back to score >= min_score.
+try:
+    v_dec = _col(VERD, "verdict", "decision", "link_decision", "label")
+    v_linked = VERD[v_dec].astype(str).str.upper().eq("LINKED")
+except KeyError:
+    v_dec = _col(VERD, "relevance_score")
+    v_linked = pd.to_numeric(VERD[v_dec], errors="coerce").ge(MIN_SCORE)
+
+# ---- reference sets ---------------------------------------------------------
+v = pd.DataFrame({"_rec": _nid(VERD[v_rec]), "_lr": _nid(VERD[v_lr]),
+                  "_linked": v_linked.values}).dropna(subset=["_rec", "_lr"])
+SCOPE   = set(v["_rec"])                      # the 160 scoped alerts
+HEL_IDS = set(_nid(HEL[hel_lr]).dropna())     # 116 published LRs with text
+
+e3 = (pd.DataFrame({"_rsm": _nid(E3[e3_rsm]), "_lr": _nid(E3[e3_lr])})
+        .dropna().drop_duplicates())          # Extract3 is RSM x L1C x L2C -> dedupe to RSM-LR
+e2 = (pd.DataFrame({"_rsm": _nid(E2[e2_rsm]), "_rgl": _nid(E2[e2_rgl])})
+        .dropna().drop_duplicates())
+
+# =============================================================================
+# TABLE A — stage-by-stage derivation of the routed candidate set
+# =============================================================================
+# S0: every rwt record
+s0 = pd.DataFrame({"_rec": _nid(RWT[rwt_rec])}).dropna().drop_duplicates()
+
+# S1: explode linked_rsm_ids (pipe/comma separated string, NOT a SUM_ID column)
+tmp = pd.DataFrame({"_rec": _nid(RWT[rwt_rec]),
+                    "_raw": RWT[rwt_rsm].fillna("").astype(str).str.split(r"[|,]")})
+s1 = tmp.explode("_raw")
+s1["_rsm"] = _nid(s1["_raw"])
+s1 = s1.dropna(subset=["_rec", "_rsm"])[["_rec", "_rsm"]].drop_duplicates()
+
+# S2: keep only linked RSMs that parent at least one LR in Extract3
+s2 = s1[s1["_rsm"].isin(e3["_rsm"])]
+
+# S3: expand each (record, RSM) to its child LRs -> (record, RSM, LR) paths
+s3 = s2.merge(e3, on="_rsm", how="inner")
+
+# S4: collapse paths to distinct (record, LR) pairs — the LLM judges per PAIR,
+#     so an LR reachable via 2 linked RSMs is judged once, not twice
+s4 = s3[["_rec", "_lr"]].drop_duplicates()
+
+# S5: drop LRs with no published Helios text (e.g. LR-00000906) — unjudgeable
+s5 = s4[s4["_lr"].isin(HEL_IDS)]
+
+# S6: restrict to the scoped alerts (drops record(s) with no alert text)
+s6 = s5[s5["_rec"].isin(SCOPE)]
+
+STAGES = [
+    ("S0", "Records in rwt",                 "Every record with an Alert→RSM result",                          _stage(s0)),
+    ("S1", "Record × linked RSM",            "Split linked_rsm_ids on | or , ; blanks removed",               _stage(s1)),
+    ("S2", "…whose RSM has an LR parent",    "Keep RSMs present in Extract3 (RSM→LR parentage)",              _stage(s2)),
+    ("S3", "Record × RSM × LR paths",        "Expand each linked RSM to its child Library Risks",             _stage(s3)),
+    ("S4", "Distinct record × LR pairs",     "Collapse multiple RSM paths to one pair (judged once)",         _stage(s4)),
+    ("S5", "…LR has published Helios text",  "Drop LRs with no text (cannot be judged)",                      _stage(s5)),
+    ("S6", "…alert in scope (160)",          "Restrict to scoped alerts = pairs sent to the LLM",             _stage(s6)),
+]
+
+# Reconciliation: rebuilt S6 must equal the verdicts' pair set exactly
+rebuilt = set(map(tuple, s6[["_rec", "_lr"]].values))
+judged  = set(map(tuple, v[["_rec", "_lr"]].values))
+only_rebuilt, only_judged = len(rebuilt - judged), len(judged - rebuilt)
+
+# =============================================================================
+# TABLE B — per-alert candidate pool size (answers the top-k=40 comment)
+# =============================================================================
+per_rec = s6.groupby("_rec").size().reindex(sorted(SCOPE), fill_value=0)
+BINS   = [(0, 0), (1, 5), (6, 10), (11, 15), (16, 20), (21, 30), (31, 40), (41, 10**9)]
+LABELS = ["0", "1–5", "6–10", "11–15", "16–20", "21–30", "31–40", ">40"]
+bin_counts = [int(((per_rec >= lo) & (per_rec <= hi)).sum()) for lo, hi in BINS]
+
+# =============================================================================
+# TABLE C — golden reachability through the same funnel (validation only)
+# =============================================================================
+g = (pd.DataFrame({"_rec": _nid(GOLD[g_rec]), "_lr": _nid(GOLD[g_lr])})
+       .dropna().drop_duplicates())
+g = g[g["_rec"].isin(SCOPE)]                           # expect 1,229
+g["_reach"] = [tuple(x) in rebuilt for x in g[["_rec", "_lr"]].values]
+
+# Classify every UNREACHABLE golden pair by the first reason it falls out.
+recs_with_rsm  = set(s1["_rec"])
+lrs_with_rsm   = set(e3["_lr"])
+rec_lr_any_rsm = set(map(tuple, s4[["_rec", "_lr"]].values))   # before Helios filter
+def _why(rec, lr):
+    if rec not in recs_with_rsm:       return "Alert has no linked RSM at all"
+    if lr not in lrs_with_rsm:         return "LR has no RSM parent in Extract3"
+    if (rec, lr) in rec_lr_any_rsm:    return "Reachable but LR has no Helios text"
+    return "LR's parent RSMs not among this alert's linked RSMs"
+unreach = g[~g["_reach"]].copy()
+unreach["_why"] = [_why(r, l) for r, l in unreach[["_rec", "_lr"]].values]
+WHY_ORDER = ["Alert has no linked RSM at all",
+             "LR has no RSM parent in Extract3",
+             "Reachable but LR has no Helios text",
+             "LR's parent RSMs not among this alert's linked RSMs"]
+why_counts = unreach["_why"].value_counts().reindex(WHY_ORDER, fill_value=0)
+
+# Model outcome on the reachable golden pairs
+gr = g[g["_reach"]].merge(v, on=["_rec", "_lr"], how="left")
+n_valid = int(gr["_linked"].eq(True).sum())
+n_jnl   = int(gr["_linked"].eq(False).sum())
+n_nover = int(gr["_linked"].isna().sum())
+n_disc  = int(v["_linked"].sum()) - n_valid     # linked, not in golden
+
+# =============================================================================
+# TABLE D — counterfactual: RSM -> RGL -> ALL RSMs of that RGL -> LRs
+# =============================================================================
+# The reviewer described approach 1 this way. If the lane really did this it
+# would re-create the golden's whole-regulation over-mapping. Compute it, so the
+# sheet can show which construction produced 2,409.
+alt = (s1.merge(e2, on="_rsm")[["_rec", "_rgl"]].drop_duplicates()
+         .merge(e2, on="_rgl")[["_rec", "_rsm"]].drop_duplicates()
+         .merge(e3, on="_rsm")[["_rec", "_lr"]].drop_duplicates())
+alt = alt[alt["_lr"].isin(HEL_IDS) & alt["_rec"].isin(SCOPE)]
+alt_golden_reach = int(pd.Series([tuple(x) in set(map(tuple, alt[["_rec", "_lr"]].values))
+                                  for x in g[["_rec", "_lr"]].values]).sum())
+
+# ---- console summary + soft checks against the handoff numbers ---------------
+print(f"{'Stage':<4} {'rows':>7} {'recs':>6} {'RSMs':>6} {'LRs':>5}")
+for sid, name, _, st in STAGES:
+    print(f"{sid:<4} {st['rows']:>7} {st['records']:>6} {st['rsms']:>6} {st['lrs']:>5}  {name}")
+print(f"\nReconcile vs verdicts: only_rebuilt={only_rebuilt} only_judged={only_judged}")
+print(f"Per-alert pool: min={per_rec.min()} median={per_rec.median():.0f} "
+      f"mean={per_rec.mean():.2f} max={per_rec.max()}  alerts>40={int((per_rec>40).sum())}")
+print(f"Golden in scope={len(g)} reachable={int(g['_reach'].sum())} "
+      f"unreachable={len(unreach)} -> {why_counts.to_dict()}")
+print(f"Validated={n_valid} JNL={n_jnl} no-verdict={n_nover} discoveries={n_disc}")
+print(f"RGL-rollup counterfactual: {len(alt)} pairs, reaches {alt_golden_reach} golden pairs")
+EXPECT = {"S6 pairs": (len(s6), 2409), "golden": (len(g), 1229),
+          "reachable": (int(g["_reach"].sum()), 1098), "validated": (n_valid, 259),
+          "JNL": (n_jnl, 839), "distinct LRs offered": (s6["_lr"].nunique(), 62)}
+for k, (got, exp) in EXPECT.items():
+    print(f"  {'✓' if got == exp else '✗ CHECK'} {k}: {got} (handoff {exp})")
+
+# =============================================================================
+# WRITE SHEET — blue = run output, black = formula (workbook convention)
+# =============================================================================
+wb = load_workbook(WB_IN)
+if SHEET in wb.sheetnames:
+    del wb[SHEET]
+ws = wb.create_sheet(SHEET)
+
+F_BASE  = "Arial"
+BLUE    = Font(name=F_BASE, color="0000FF")
+BLACK   = Font(name=F_BASE, color="000000")
+BOLD    = Font(name=F_BASE, bold=True)
+TITLE   = Font(name=F_BASE, bold=True, size=13)
+HDR     = Font(name=F_BASE, bold=True, color="FFFFFF")
+HDRFILL = PatternFill("solid", start_color="404040")
+KEYFILL = PatternFill("solid", start_color="FFF2CC")
+WRAP    = Alignment(wrap_text=True, vertical="top")
+THIN    = Side(style="thin", color="BFBFBF")
+BOX     = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
+NUM, PCT, DEC = "#,##0", "0.0%", "0.0"
+
+def hdr(row, labels, col0=1):
+    for i, t in enumerate(labels):
+        c = ws.cell(row=row, column=col0 + i, value=t)
+        c.font, c.fill, c.alignment, c.border = HDR, HDRFILL, WRAP, BOX
+
+def put(row, col, val, font=BLUE, fmt=None, fill=None):
+    c = ws.cell(row=row, column=col, value=val)
+    c.font, c.border, c.alignment = font, BOX, WRAP
+    if fmt:  c.number_format = fmt
+    if fill: c.fill = fill
+    return c
+
+def section(row, text):
+    ws.cell(row=row, column=1, value=text).font = TITLE
+
+ws["A1"] = "Routed lane (Approach 1) — how the candidate set is built"
+ws["A1"].font = Font(name=F_BASE, bold=True, size=15)
+ws["A2"] = (f"Source: {RUN_LABEL}. Blue = run output, black = calculated in-sheet. "
+            "Golden is used only in Table C (validation) — it never builds candidates.")
+ws["A2"].font = Font(name=F_BASE, italic=True, color="595959")
+
+# ---- Table 0: the universe (fixes the '18,560 under Routed' confusion) -------
+r = 4
+section(r, "0. Candidate universe — shared ceiling vs what each lane actually judges"); r += 1
+hdr(r, ["Item", "Value", "How"]); r += 1
+R_ALERTS = r; put(r, 1, "Alerts in scope", BOLD); put(r, 2, len(SCOPE), fmt=NUM); put(r, 3, "Records in routed verdicts", BLACK); r += 1
+R_LRS    = r; put(r, 1, "Published Library Risks with text", BOLD); put(r, 2, len(HEL_IDS), fmt=NUM); put(r, 3, "Helios, 1 row per LR", BLACK); r += 1
+R_CROSS  = r; put(r, 1, "Cross-join ceiling (both lanes)", BOLD); put(r, 2, f"=B{R_ALERTS}*B{R_LRS}", BLACK, NUM, KEYFILL)
+put(r, 3, "Every alert × every LR. Direct lane judges ALL of these. It is a ceiling, not the routed count.", BLACK); r += 1
+R_ROUTED = r; put(r, 1, "Routed pairs sent to LLM", BOLD)   # filled after Table A exists
+put(r, 3, "Linked from Table A, stage S6", BLACK); r += 1
+R_PRUNE  = r; put(r, 1, "Pruned by routing (never judged)", BOLD); put(r, 2, f"=B{R_CROSS}-B{R_ROUTED}", BLACK, NUM)
+put(r, 3, "Pairs with no path alert → linked RSM → LR", BLACK); r += 1
+put(r, 1, "Share of ceiling judged", BOLD); put(r, 2, f"=B{R_ROUTED}/B{R_CROSS}", BLACK, PCT); r += 1
+put(r, 1, "Avg candidates per alert", BOLD); put(r, 2, f"=B{R_ROUTED}/B{R_ALERTS}", BLACK, DEC); r += 1
+
+# ---- Table A ------------------------------------------------------------------
+r += 1
+section(r, "A. Derivation of the routed candidate set (pure joins, no LLM)"); r += 1
+hdr(r, ["Stage", "Step", "What happens", "Rows", "Alerts", "Distinct RSMs",
+        "Distinct LRs", "Change in rows vs previous"]); r += 1
+A_FIRST = r
+for i, (sid, name, what, st) in enumerate(STAGES):
+    put(r, 1, sid, BOLD); put(r, 2, name, BLACK); put(r, 3, what, BLACK)
+    put(r, 4, st["rows"], fmt=NUM)
+    put(r, 5, None if pd.isna(st["records"]) else int(st["records"]), fmt=NUM)
+    put(r, 6, None if pd.isna(st["rsms"]) else int(st["rsms"]), fmt=NUM)
+    put(r, 7, None if pd.isna(st["lrs"]) else int(st["lrs"]), fmt=NUM)
+    put(r, 8, "—" if i < 2 else f"=D{r}-D{r-1}", BLACK, '#,##0;(#,##0);"-"')
+    if sid == "S6":
+        for cc in range(1, 9): ws.cell(row=r, column=cc).fill = KEYFILL
+    r += 1
+A_S3, A_S4, A_S6 = A_FIRST + 3, A_FIRST + 4, A_FIRST + 6
+put(R_ROUTED, 2, f"=D{A_S6}", Font(name=F_BASE, color="008000"), NUM, KEYFILL)   # green = link
+put(r, 2, "Avg RSM paths per judged pair", BOLD); put(r, 4, f"=D{A_S3}/D{A_S4}", BLACK, "0.00")
+put(r, 3, "S3 ÷ S4 — why the SME pack shows '1 of 2' path rows per pair", BLACK); r += 1
+put(r, 2, "Rebuilt pairs not in verdicts", BOLD); put(r, 4, only_rebuilt, fmt=NUM); r += 1
+put(r, 2, "Verdict pairs not rebuilt", BOLD);     put(r, 4, only_judged, fmt=NUM)
+put(r, 3, "Both must be 0: the rebuilt S6 is exactly what the LLM judged", BLACK); r += 1
+
+# ---- Table B ------------------------------------------------------------------
+r += 1
+section(r, "B. Candidate pool size per alert — why a top-k cap of 40 removes nothing"); r += 1
+hdr(r, ["Candidates per alert", "Alerts", "Share"]); r += 1
+B_FIRST = r
+for lab, n in zip(LABELS, bin_counts):
+    put(r, 1, lab, BLACK); put(r, 2, n, fmt=NUM); r += 1
+B_LAST = r - 1
+for rr in range(B_FIRST, B_LAST + 1):
+    put(rr, 3, f"=B{rr}/SUM($B${B_FIRST}:$B${B_LAST})", BLACK, PCT)
+put(r, 1, "Total", BOLD); put(r, 2, f"=SUM(B{B_FIRST}:B{B_LAST})", BLACK, NUM); r += 1
+for lab, val, fmt in [("Min", int(per_rec.min()), NUM), ("Median", float(per_rec.median()), DEC),
+                      ("Mean", float(per_rec.mean()), "0.00"), ("Max", int(per_rec.max()), NUM)]:
+    put(r, 1, lab, BOLD); put(r, 2, val, fmt=fmt); r += 1
+put(r, 1, "Reading", BOLD)
+put(r, 2, ("Top-k ranks candidates WITHIN each alert's pool. When no pool exceeds 40, "
+           "k=40 keeps every candidate — the pair count is set by routing (Table A), not by k. "
+           "The 89.3% 'highest attainable' is Table C's reachability ceiling."), BLACK)
+ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=8); r += 1
+
+# ---- Table C ------------------------------------------------------------------
+r += 1
+section(r, "C. Golden reachability through the same funnel (validation only)"); r += 1
+hdr(r, ["Item", "Pairs", "Note"]); r += 1
+C_TOT = r;  put(r, 1, "Golden pairs, 160 scoped alerts", BOLD); put(r, 2, len(g), fmt=NUM)
+put(r, 3, "Record→Regulation→LR; RSM level missing ⇒ structurally over-mapped", BLACK); r += 1
+C_REACH = r; put(r, 1, "Reachable via routed candidates", BOLD); put(r, 2, int(g["_reach"].sum()), fmt=NUM); r += 1
+C_UN = r;   put(r, 1, "Not reachable (never judged)", BOLD); put(r, 2, f"=B{C_TOT}-B{C_REACH}", BLACK, NUM); r += 1
+C_W1 = r
+for w in WHY_ORDER:
+    put(r, 1, f"   of which: {w}", BLACK); put(r, 2, int(why_counts[w]), fmt=NUM); r += 1
+put(r, 1, "   check (must be 0)", BLACK); put(r, 2, f"=B{C_UN}-SUM(B{C_W1}:B{r-1})", BLACK, NUM); r += 1
+C_VAL = r;  put(r, 1, "Model LINKED (validated)", BOLD); put(r, 2, n_valid, fmt=NUM); r += 1
+put(r, 1, "Model NOT LINKED", BOLD); put(r, 2, n_jnl, fmt=NUM); r += 1
+put(r, 1, "Reachable but no verdict returned", BOLD); put(r, 2, n_nover, fmt=NUM); r += 1
+put(r, 1, "Upstream ceiling (reachable ÷ golden)", BOLD); put(r, 2, f"=B{C_REACH}/B{C_TOT}", BLACK, PCT, KEYFILL)
+put(r, 3, "The '89%' — max recall any judge could hit inside the routed pool", BLACK); r += 1
+put(r, 1, "Addressable recall (validated ÷ golden)", BOLD); put(r, 2, f"=B{C_VAL}/B{C_TOT}", BLACK, PCT, KEYFILL)
+put(r, 3, "Compare lanes on THIS row only", BLACK); r += 1
+put(r, 1, "Recall on judged pairs (validated ÷ reachable)", BOLD); put(r, 2, f"=B{C_VAL}/B{C_REACH}", BLACK, PCT)
+put(r, 3, "Different denominator — do not place beside the direct lane's addressable recall", BLACK); r += 1
+put(r, 1, "Discoveries (LINKED, not in golden)", BOLD); put(r, 2, n_disc, fmt=NUM)
+put(r, 3, "Golden is hand-picked and non-exhaustive ⇒ not false positives; precision/F1 not computed", BLACK); r += 1
+
+# ---- Table D ------------------------------------------------------------------
+r += 1
+section(r, "D. Which construction is Approach 1? RSM routing vs whole-regulation (RGL) rollup"); r += 1
+hdr(r, ["Construction", "Pairs", "Golden pairs reached", "Matches verdicts?"]); r += 1
+D_RSM = r
+put(r, 1, "Alert → linked RSM → child LRs (Table A)", BLACK); put(r, 2, f"=D{A_S6}", BLACK, NUM)
+put(r, 3, f"=B{C_REACH}", BLACK, NUM); put(r, 4, "Yes" if only_rebuilt == only_judged == 0 else "No — investigate", BLACK); r += 1
+put(r, 1, "Alert → linked RSM → its RGL → ALL RSMs of RGL → LRs", BLACK); put(r, 2, len(alt), fmt=NUM)
+put(r, 3, alt_golden_reach, fmt=NUM)
+put(r, 4, "Yes" if set(map(tuple, alt[["_rec", "_lr"]].values)) == judged else "No", BLACK); r += 1
+put(r, 1, "Reading", BOLD)
+put(r, 2, ("The RGL rollup would reproduce the golden's whole-regulation sweep: more pairs and "
+           "more golden 'reach', but only because it copies the over-mapping. Routing stays at the "
+           "RSM the alert was actually linked to."), BLACK)
+ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=8)
+
+for col, w in zip("ABCDEFGH", [44, 30, 62, 12, 10, 14, 12, 16]):
+    ws.column_dimensions[col].width = w
+ws.freeze_panes = "A4"
+wb.save(WB_OUT)
+print(f"\nWrote sheet '{SHEET}' -> {WB_OUT.resolve()}")
