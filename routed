@@ -1551,7 +1551,17 @@ alert_text_by_id = dict(zip(_al.RECORD_ID, _al.alert_text))
 risk_vecs = embed_cache(risk_pool, [risk_text_by_id[c] for c in risk_pool], "helios_library_risks")
 rpos = {r: i for i, r in enumerate(risk_pool)}
 order_by_alert = {}
+_dropped_ids = set()
 for rid, pool in cand_pool.items():
+    # Extract3 (the RSM->LR map) can reference a LIB_RISK that is not in
+    # helios -- retired, draft, or simply absent from the published register.
+    # Those ids have no embedding, so drop them here rather than crash on
+    # the rpos lookup below. This is itself a finding: it means Extract3
+    # points the routed lane at risks it can never actually judge.
+    _before = len(pool)
+    pool = [p for p in pool if p in rpos]
+    if len(pool) < _before:
+        _dropped_ids.update(set(cand_pool[rid]) - set(pool))
     if rid not in alert_text_by_id or not pool:
         order_by_alert[rid] = []
         continue
@@ -1563,6 +1573,12 @@ for rid, pool in cand_pool.items():
 
 print(f"[H] order_by_alert built for {len(order_by_alert):,} alerts "
       f"(RSM-cascade pool, not the full 116)")
+if _dropped_ids:
+    print(f"[H] WARNING {len(_dropped_ids):,} distinct LIB_RISK ids appear in the RSM->LR map "
+          f"(Extract3) but have no published text in Helios -- dropped from every candidate "
+          f"pool they appeared in. e.g. {sorted(_dropped_ids)[:5]}")
+    print("    These are structurally unreachable by this lane regardless of top-k, same as a")
+    print("    retired risk. Worth cross-checking against the '(TO BE RETIRED)' list from [A2].")
 
 # ---- 2. golden dataset stats + the 1,229 reconciliation ---------------------
 g_valid = golden[~_norm_id(golden.LIB_RISK).isin(_BLANK)]
