@@ -1,0 +1,706 @@
+# ============================================================
+# GPPS SME Questions -- Illustrative Data Examples
+#
+# For each question going to the Policy SME team, this pulls a
+# small, concrete example straight from the data so you can show
+# (not just describe) what the finding means. Run top to bottom,
+# or copy individual Q-blocks into their own cells.
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 200)
+
+
+# ============================================================
+# Shared helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def load_table_df(table_short_name, extra_cols=""):
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table_short_name}"
+    query = f"SELECT policy_core_id, version_num, snapshot_time, json_data{extra_cols} FROM `{full_table}`"
+    df = bq_client.query(query).to_dataframe()
+    df["parsed"] = df["json_data"].apply(safe_json_loads)
+    return df
+
+
+def iterate_segments(df):
+    """Yields (row, segment_dict) for every segment across every row."""
+    for _, row in df.iterrows():
+        segments = get_nested(row["parsed"], "policyApplication", "segment")
+        if not isinstance(segments, list):
+            continue
+        for seg in segments:
+            if isinstance(seg, dict):
+                yield row, seg
+
+
+def print_header(n, question):
+    print("\n" + "=" * 78)
+    print(f"Q{n}. {question}")
+    print("=" * 78)
+
+
+# ============================================================
+# Q1 -- Canada query failure
+# ============================================================
+
+print_header(1, "Canada (ca_hsbc_gpps_gpps_policy) query FAILED -- is this an empty "
+                 "table, a permissions issue, or a schema difference?")
+
+def q1_example():
+    table_short_name = "ca_hsbc_gpps_gpps_policy"
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table_short_name}"
+
+    schema_query = f"""
+        SELECT column_name, data_type, is_nullable
+        FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE table_name = '{table_short_name}'
+        ORDER BY ordinal_position
+    """
+    try:
+        schema_df = bq_client.query(schema_query).to_dataframe()
+        print("Declared column schema for", table_short_name)
+        display(schema_df)
+    except Exception as e:
+        print("Could not read schema:", e)
+
+    count_query = f"""
+        SELECT
+            COUNT(*) AS total_rows,
+            COUNTIF(json_data IS NULL) AS null_json_rows,
+            COUNTIF(json_data = '') AS empty_string_json_rows
+        FROM `{full_table}`
+    """
+    try:
+        count_df = bq_client.query(count_query).to_dataframe()
+        print("\nRow / null check (this query avoids the pandas type-inference crash):")
+        display(count_df)
+        print("\nIf null_json_rows == total_rows, that's exactly why pandas couldn't "
+              "infer a type for an all-NULL column -- the table isn't necessarily "
+              "empty, just json_data may be unpopulated for every row.")
+    except Exception as e:
+        print("Could not run count query either:", e)
+
+q1_example()
+
+
+# ============================================================
+# Q2 -- RSM linkage found only in the US table
+# ============================================================
+
+print_header(2, "RSM (regulatory) linkage was found ONLY in the US table -- is RSM "
+                "tagging US-specific, or just not populated elsewhere yet?")
+
+def q2_example():
+    df_us = load_table_df("us_hsbc_gpps_gpps_policy")
+    for row, seg in iterate_segments(df_us):
+        obj_rel = seg.get("objRel")
+        if not isinstance(obj_rel, list):
+            continue
+        for obj in obj_rel:
+            if isinstance(obj, dict) and obj.get("plcyObjTypeCde") == "REG":
+                print("US example -- segment WITH an RSM (REG) objRel entry:")
+                print(f"  policy_core_id = {row['policy_core_id']}, version = {row['version_num']}")
+                print(f"  segment title  = {seg.get('sgmntTitlText')}")
+                print(f"  objRel entry   = {json.dumps(obj, indent=2)}")
+                break
+        else:
+            continue
+        break
+
+    print("\nContrast -- same check run on Global and UAE (both have real segment "
+          "volume, but zero REG entries):")
+    for table, label in [("aa_hsbc_gpps_gpps_policy", "Global"), ("ae_hsbc_gpps_gpps_policy", "UAE")]:
+        df = load_table_df(table)
+        reg_count = sum(
+            1 for _, seg in iterate_segments(df)
+            if isinstance(seg.get("objRel"), list)
+            and any(isinstance(o, dict) and o.get("plcyObjTypeCde") == "REG" for o in seg["objRel"])
+        )
+        print(f"  {label}: {reg_count} REG/RSM objRel entries found")
+
+q2_example()
+
+
+# ============================================================
+# Q3 -- sgmntTypeCde populated only in the Global table
+# ============================================================
+
+print_header(3, "segment sgmntTypeCde carries the L1C control code directly ONLY in "
+                "the Global table -- should country tables populate it too, or is "
+                "objRel[CNTRL] the intended path there?")
+
+def q3_example():
+    df_global = load_table_df("aa_hsbc_gpps_gpps_policy")
+    for row, seg in iterate_segments(df_global):
+        code = seg.get("sgmntTypeCde")
+        if isinstance(code, str) and code.startswith("L1C-"):
+            print("GLOBAL example -- sgmntTypeCde carries the control code directly:")
+            print(f"  policy_core_id = {row['policy_core_id']}")
+            print(f"  sgmntTypeCde    = {code}")
+            print(f"  sgmntTitlText   = {seg.get('sgmntTitlText')}")
+            break
+
+    df_au = load_table_df("au_hsbc_gpps_gpps_policy")
+    for row, seg in iterate_segments(df_au):
+        obj_rel = seg.get("objRel")
+        if not isinstance(obj_rel, list):
+            continue
+        for obj in obj_rel:
+            if isinstance(obj, dict) and obj.get("plcyObjTypeCde") == "CNTRL":
+                print("\nAUSTRALIA example (contrast) -- sgmntTypeCde is null, control "
+                      "lives inside objRel instead:")
+                print(f"  policy_core_id      = {row['policy_core_id']}")
+                print(f"  segment sgmntTypeCde = {seg.get('sgmntTypeCde')!r}  (null, as expected)")
+                print(f"  objRel entry         = {json.dumps(obj, indent=2)}")
+                return
+
+q3_example()
+
+
+# ============================================================
+# Q4 -- the separate curated table a colleague shared
+# ============================================================
+
+print_header(4, "A colleague shared a separate, already-flattened segment-level table "
+                "(plcy_core_id, sgmnt_type_cde, plcy_obj_id, plcy_obj_type_cde, cntl_id, "
+                "risk_txnmy_l1/l2/l3_text) -- is this the authoritative table we should "
+                "join against?")
+
+def q4_example():
+    # Table name/dataset not yet confirmed -- shown here as the illustrative shape
+    # shared over chat, not a live query. Swap in the real table once known.
+    example_rows = pd.DataFrame([
+        {"plcy_core_id": 3011, "sgmnt_type_cde": "L1C-00000937", "plcy_obj_id": "RSM-00030304",
+         "plcy_obj_type_cde": "REG", "rec_start_dt_tm": "2026-09-18 05:31:43.110000",
+         "rec_end_dt_tm": "9999-12-31 00:00:00"},
+        {"plcy_core_id": 3011, "sgmnt_type_cde": "L1C-00000937", "plcy_obj_id": "RSM-00030313",
+         "plcy_obj_type_cde": "REG", "rec_start_dt_tm": "2026-09-18 05:31:43.110000",
+         "rec_end_dt_tm": "9999-12-31 00:00:00"},
+    ])
+    print("Illustrative shape of the table shared by colleague (not a live query -- "
+          "table name/dataset not yet confirmed):")
+    display(example_rows)
+    print(
+        "\nOnce the SME confirms the table name, run:\n"
+        "  curated_table = f'{DATA_PROJECT}.{DATASET}.<confirmed_table_name>'\n"
+        "  display(bq_client.query(f'SELECT * FROM `{curated_table}` LIMIT 10').to_dataframe())"
+    )
+
+q4_example()
+
+
+# ============================================================
+# Q5 -- degenerate ("1-char") segment text
+# ============================================================
+
+print_header(5, "Brazil, China, Taiwan, Hong Kong and Indonesia show a segment-text "
+                "median of ~1 character despite '100% segments with text' -- likely "
+                "whitespace-only placeholders passing a non-empty check.")
+
+def q5_example():
+    tables = [
+        ("br_hsbc_gpps_gpps_policy", "Brazil"),
+        ("cn_hsbc_gpps_gpps_policy", "China"),
+        ("tw_hsbc_gpps_gpps_policy", "Taiwan"),
+        ("hk_hsbc_gpps_gpps_policy", "Hong Kong"),
+        ("id_hsbc_gpps_gpps_policy", "Indonesia"),
+    ]
+    for table, label in tables:
+        df = load_table_df(table)
+        shown = 0
+        for row, seg in iterate_segments(df):
+            text = seg.get("sgmntText")
+            if isinstance(text, str) and 0 < len(text) <= 3:
+                print(f"[{label}] policy_core_id={row['policy_core_id']}, "
+                      f"version={row['version_num']}")
+                print(f"    sgmntTitlText = {seg.get('sgmntTitlText')!r}")
+                print(f"    sgmntText     = {text!r}  (length={len(text)})")
+                shown += 1
+                if shown >= 2:
+                    break
+        if shown == 0:
+            print(f"[{label}] no <=3-char segment found in this pass -- widen the "
+                  f"threshold if needed")
+
+q5_example()
+
+
+# ============================================================
+# Q6 -- no RSM/control linkage across 12 tables
+# ============================================================
+
+print_header(6, "No RSM or L1 control linkage found in any segment across 12 tables "
+                "(Bangladesh, Brazil, Hong Kong, Indonesia, Japan, Korea, New Zealand, "
+                "Philippines, Singapore, Taiwan, Thailand, Vietnam) -- contrasted with "
+                "a table that does carry it.")
+
+def q6_example():
+    no_linkage_tables = [
+        ("bd_hsbc_gpps_gpps_policy", "Bangladesh"),
+        ("vn_hsbc_gpps_gpps_policy", "Vietnam"),
+    ]
+    for table, label in no_linkage_tables:
+        df = load_table_df(table)
+        shown = 0
+        for row, seg in iterate_segments(df):
+            print(f"[{label}] policy_core_id={row['policy_core_id']}, "
+                  f"segment={seg.get('sgmntTitlText')!r}, objRel={seg.get('objRel')}")
+            shown += 1
+            if shown >= 1:
+                break
+
+    print("\nContrast -- Qatar, which DOES carry control linkage:")
+    df_qa = load_table_df("qa_hsbc_gpps_gpps_policy")
+    for row, seg in iterate_segments(df_qa):
+        obj_rel = seg.get("objRel")
+        if not isinstance(obj_rel, list):
+            continue
+        for obj in obj_rel:
+            if isinstance(obj, dict) and obj.get("plcyObjTypeCde") == "CNTRL":
+                print(f"[Qatar] policy_core_id={row['policy_core_id']}, "
+                      f"segment={seg.get('sgmntTitlText')!r}")
+                print(f"    objRel entry = {json.dumps(obj, indent=2)}")
+                return
+
+q6_example()
+
+
+# ============================================================
+# Q7 -- Australia policy missing policyText entirely
+# ============================================================
+
+print_header(7, "1 of 11 Australian policies has no top-level policyText at all "
+                "(90.91% present, vs. 100% everywhere else) -- expected, or a gap?")
+
+def q7_example():
+    df = load_table_df("au_hsbc_gpps_gpps_policy")
+    for _, row in df.iterrows():
+        text = get_nested(row["parsed"], "policyText", "sgmntText")
+        if not text or not str(text).strip():
+            parsed = row["parsed"]
+            print(f"policy_core_id = {row['policy_core_id']}, version = {row['version_num']}")
+            print(f"policyTitle    = {parsed.get('policyTitle') if isinstance(parsed, dict) else None}")
+            print(f"policyDocType  = {parsed.get('policyDocType') if isinstance(parsed, dict) else None}")
+            print(f"policyText.sgmntText = {text!r}")
+            return
+    print("No policy with missing policyText found in this pass")
+
+q7_example()
+
+
+# ============================================================
+# Q8 -- very small policy populations
+# ============================================================
+
+print_header(8, "Bangladesh, Brazil, Japan, New Zealand, Philippines, Thailand, "
+                "Vietnam (2 policies each) and Korea (3) have very small populations "
+                "-- is this the true universe for these markets?")
+
+def q8_example():
+    tables = [
+        ("bd_hsbc_gpps_gpps_policy", "Bangladesh"),
+        ("jp_hsbc_gpps_gpps_policy", "Japan"),
+        ("kr_hsbc_gpps_gpps_policy", "Korea"),
+    ]
+    for table, label in tables:
+        df = load_table_df(table)
+        df["policyTitle"] = df["parsed"].apply(
+            lambda p: p.get("policyTitle") if isinstance(p, dict) else None
+        )
+        print(f"\n[{label}] full policy list ({df['policy_core_id'].nunique()} distinct policies):")
+        display(
+            df[["policy_core_id", "version_num", "policyTitle"]]
+            .sort_values(["policy_core_id", "version_num"])
+        )
+
+q8_example()
+
+
+
+
+
+
+
+
+
+
+
+# ============================================================
+# GPPS Alert-to-Policy Linkage DataFrames (per table)
+#
+# Builds one DataFrame per in-scope country table containing only
+# the fields agreed for embedding / alert-to-policy linkage:
+#   policy_core_id, version_num, versn.versStatCde,
+#   versn.versActlPublDt, snapshot_time, policyRiskTypePrimary,
+#   policyApplication.riskTxnmyL2Text, region, policyDocType,
+#   policyTitle, policyPurpose_clean, policyText_clean,
+#   segment_text, termdef_text
+#
+# One row per policy: the latest PUBLISHED (versStatCde == 'PUBL')
+# version. If a policy has no PUBL version at all, it falls back to
+# its latest version regardless of status, flagged via
+# `used_fallback_non_publ` so nothing is silently dropped.
+#
+# Requires: pip install beautifulsoup4 lxml --break-system-packages
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+
+
+# ============================================================
+# In-scope country tables
+# ============================================================
+
+COUNTRY_TABLES = {
+    "Global": "aa_hsbc_gpps_gpps_policy",
+    "Algeria": "dz_hsbc_gpps_gpps_policy",
+    "Australia": "au_hsbc_gpps_gpps_policy",
+    "Bahrain": "bh_hsbc_gpps_gpps_policy",
+    "Bangladesh": "bd_hsbc_gpps_gpps_policy",
+    "Brazil": "br_hsbc_gpps_gpps_policy",
+    "Canada": "ca_hsbc_gpps_gpps_policy",
+    "China": "cn_hsbc_gpps_gpps_policy",
+    "Hong Kong": "hk_hsbc_gpps_gpps_policy",
+    "India": "in_hsbc_gpps_gpps_policy",
+    "Indonesia": "id_hsbc_gpps_gpps_policy",
+    "Japan": "jp_hsbc_gpps_gpps_policy",
+    "Korea, Republic of (South)": "kr_hsbc_gpps_gpps_policy",
+    "New Zealand": "nz_hsbc_gpps_gpps_policy",
+    "Philippines": "ph_hsbc_gpps_gpps_policy",
+    "Qatar": "qa_hsbc_gpps_gpps_policy",
+    "Singapore": "sg_hsbc_gpps_gpps_policy",
+    "Taiwan": "tw_hsbc_gpps_gpps_policy",
+    "Thailand": "th_hsbc_gpps_gpps_policy",
+    "United Arab Emirates": "ae_hsbc_gpps_gpps_policy",
+    "United Kingdom": "gb_hsbc_gpps_gpps_policy",
+    "United States of America": "us_hsbc_gpps_gpps_policy",
+    "Vietnam": "vn_hsbc_gpps_gpps_policy",
+    "South Africa": "za_hsbc_gpps_gpps_policy",
+}
+
+LINKAGE_COLUMNS = [
+    "policy_core_id",
+    "version_num",
+    "versn.versStatCde",
+    "versn.versActlPublDt",
+    "snapshot_time",
+    "policyRiskTypePrimary",
+    "policyApplication.riskTxnmyL2Text",
+    "region",
+    "policyDocType",
+    "policyTitle",
+    "policyPurpose_clean",
+    "policyText_clean",
+    "segment_text",
+    "termdef_text",
+    "used_fallback_non_publ",
+]
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def build_segment_text(parsed_json):
+    """Concatenate every segment's cleaned sgmntText, prefixed by its
+    sgmntTitlText where present, into one block of text per policy."""
+    segments = get_nested(parsed_json, "policyApplication", "segment")
+    if not isinstance(segments, list):
+        return ""
+    parts = []
+    for seg in segments:
+        if not isinstance(seg, dict):
+            continue
+        text = strip_html(seg.get("sgmntText"))
+        if not text:
+            continue
+        title = seg.get("sgmntTitlText")
+        if isinstance(title, str) and title.strip():
+            parts.append(f"{title.strip()}: {text}")
+        else:
+            parts.append(text)
+    return "\n\n".join(parts)
+
+
+def build_termdef_text(parsed_json):
+    """Concatenate the policy's glossary (termDefin[]) into one block,
+    kept separate from the main text fields as agreed."""
+    term_defs = get_nested(parsed_json, "policyApplication", "termDefin")
+    if not isinstance(term_defs, list):
+        return ""
+    parts = []
+    for td in term_defs:
+        if not isinstance(td, dict):
+            continue
+        definition = strip_html(td.get("termDefinText"))
+        if not definition:
+            continue
+        term = td.get("termText")
+        if isinstance(term, str) and term.strip():
+            parts.append(f"{term.strip()}: {definition}")
+        else:
+            parts.append(definition)
+    return "\n\n".join(parts)
+
+
+# ============================================================
+# Per-table builder
+# ============================================================
+
+def build_linkage_dataframe(country, table_short_name):
+    full_table_name = f"{DATA_PROJECT}.{DATASET}.{table_short_name}"
+    query = f"SELECT * FROM `{full_table_name}`"
+
+    try:
+        df_raw = bq_client.query(query).to_dataframe()
+    except Exception as error:
+        print(f"  -> FAILED: {error}")
+        return None
+
+    if len(df_raw) == 0:
+        print("  -> EMPTY table")
+        return pd.DataFrame(columns=LINKAGE_COLUMNS)
+
+    required = {"policy_core_id", "version_num", "json_data"}
+    if not required.issubset(df_raw.columns):
+        print(f"  -> Unexpected schema, missing {required - set(df_raw.columns)}")
+        return pd.DataFrame(columns=LINKAGE_COLUMNS)
+
+    df_raw["json_parsed"] = df_raw["json_data"].apply(safe_json_loads)
+    df_raw["versStatCde"] = df_raw["json_parsed"].apply(
+        lambda p: get_nested(p, "versn", "versStatCde")
+    )
+
+    status_counts = df_raw["versStatCde"].value_counts(dropna=False).to_dict()
+    print(f"  versStatCde distribution: {status_counts}")
+
+    published = df_raw[df_raw["versStatCde"] == "PUBL"]
+    published_policy_ids = set(published["policy_core_id"].unique())
+    all_policy_ids = set(df_raw["policy_core_id"].unique())
+    unpublished_policy_ids = all_policy_ids - published_policy_ids
+
+    latest_published = (
+        published.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+        .assign(used_fallback_non_publ=False)
+    )
+
+    if unpublished_policy_ids:
+        fallback_rows = df_raw[df_raw["policy_core_id"].isin(unpublished_policy_ids)]
+        fallback_latest = (
+            fallback_rows.sort_values("version_num")
+            .groupby("policy_core_id", as_index=False)
+            .tail(1)
+            .assign(used_fallback_non_publ=True)
+        )
+        print(f"  {len(unpublished_policy_ids)} polic(y/ies) had no PUBL version -- "
+              f"falling back to latest version_num regardless of status")
+        latest_rows = pd.concat([latest_published, fallback_latest], ignore_index=True)
+    else:
+        latest_rows = latest_published
+
+    if len(latest_rows) == 0:
+        print("  -> No rows survived the version selection")
+        return pd.DataFrame(columns=LINKAGE_COLUMNS)
+
+    records = []
+    for _, row in latest_rows.iterrows():
+        parsed = row["json_parsed"]
+        if not isinstance(parsed, dict):
+            continue
+
+        policy_text_raw = get_nested(parsed, "policyText", "sgmntText")
+        policy_purpose_raw = get_nested(parsed, "policyPurpose", "sgmntText")
+
+        records.append({
+            "policy_core_id": row["policy_core_id"],
+            "version_num": row["version_num"],
+            "versn.versStatCde": get_nested(parsed, "versn", "versStatCde"),
+            "versn.versActlPublDt": get_nested(parsed, "versn", "versActlPublDt"),
+            "snapshot_time": row.get("snapshot_time"),
+            "policyRiskTypePrimary": parsed.get("policyRiskTypePrimary"),
+            "policyApplication.riskTxnmyL2Text": get_nested(parsed, "policyApplication", "riskTxnmyL2Text"),
+            "region": parsed.get("region"),
+            "policyDocType": parsed.get("policyDocType"),
+            "policyTitle": parsed.get("policyTitle"),
+            "policyPurpose_clean": strip_html(policy_purpose_raw),
+            "policyText_clean": strip_html(policy_text_raw),
+            "segment_text": build_segment_text(parsed),
+            "termdef_text": build_termdef_text(parsed),
+            "used_fallback_non_publ": row["used_fallback_non_publ"],
+        })
+
+    df_linkage = pd.DataFrame(records, columns=LINKAGE_COLUMNS)
+    print(f"  -> Built linkage dataframe: {len(df_linkage)} policies "
+          f"({df_linkage['used_fallback_non_publ'].sum()} via fallback)")
+    return df_linkage
+
+
+# ============================================================
+# Run across all in-scope tables
+# ============================================================
+
+policy_linkage_frames = {}
+
+for country, table in COUNTRY_TABLES.items():
+    print(f"\n{'='*70}\nBuilding linkage dataframe: {country} ({table})\n{'='*70}")
+    df_linkage = build_linkage_dataframe(country, table)
+    if df_linkage is not None:
+        policy_linkage_frames[table] = df_linkage
+
+print("\n\n" + "=" * 70)
+print("SUMMARY")
+print("=" * 70)
+for table, df in policy_linkage_frames.items():
+    print(f"  {table}: {len(df)} policies")
+
+print(
+    "\nAccess an individual table's dataframe via, e.g.:\n"
+    "  policy_linkage_frames['us_hsbc_gpps_gpps_policy']\n"
+    "  policy_linkage_frames['aa_hsbc_gpps_gpps_policy']"
+)
+
+
+# ============================================================
+# Master dataframe: every table appended together
+#
+# policy_core_id is NOT unique across tables -- the same id can
+# independently exist in, say, the UAE table and the Singapore
+# table referring to two unrelated policies. source_country /
+# source_table preserve provenance, and global_policy_key gives a
+# safe composite key if you need one downstream.
+# ============================================================
+
+master_frames = []
+for country, table in COUNTRY_TABLES.items():
+    df = policy_linkage_frames.get(table)
+    if df is None or len(df) == 0:
+        continue
+    df = df.copy()
+    df.insert(0, "source_table", table)
+    df.insert(0, "source_country", country)
+    master_frames.append(df)
+
+master_policy_linkage_df = (
+    pd.concat(master_frames, ignore_index=True) if master_frames else pd.DataFrame()
+)
+
+if len(master_policy_linkage_df):
+    master_policy_linkage_df.insert(
+        2, "global_policy_key",
+        master_policy_linkage_df["source_table"] + "_"
+        + master_policy_linkage_df["policy_core_id"].astype(str)
+    )
+
+print("\n\n" + "=" * 70)
+print("MASTER DATAFRAME")
+print("=" * 70)
+print(f"Total rows: {len(master_policy_linkage_df)}")
+if len(master_policy_linkage_df):
+    print(f"Source tables represented: {master_policy_linkage_df['source_table'].nunique()}")
+    print(f"Rows via fallback (no PUBL version): {master_policy_linkage_df['used_fallback_non_publ'].sum()}")
+    print("\nRows per source table:")
+    print(master_policy_linkage_df["source_table"].value_counts())
+
+display(master_policy_linkage_df.head(20))
+
+# Optional: persist to disk for downstream steps
+# master_policy_linkage_df.to_parquet("gpps_policy_linkage_master.parquet", index=False)
+# master_policy_linkage_df.to_csv("gpps_policy_linkage_master.csv", index=False)
