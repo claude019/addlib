@@ -1,109 +1,58 @@
 # ============================================================
-# GPPS - FULL JSON PARSER + VARIABLE / SCHEMA PROFILING
+# GPPS - EXTRACT ONE TABLE AND FULLY PARSE JSON
 # ============================================================
 
-import os
 import json
 import pandas as pd
 import numpy as np
 
-from google.cloud import bigquery
-
 
 # ============================================================
-# 1. GCP CONFIGURATION
+# 1. TABLE DETAILS
 # ============================================================
 
-ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
-DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
 DATASET = "rnc_curated_prod"
 
-# If bq_client already exists in your notebook, this will reuse it.
-try:
-    bq_client
-except NameError:
+TABLE = "in_hsbc_gpps_gpps_policy"
 
-    try:
-        from google.cloud import bigquery
-
-        os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
-
-        # Your existing environment uses ADC
-        # Uncomment only if your environment requires this explicitly:
-        #
-        # os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
-        #     "/home/jovyan/.config/gcloud/application_default_credentials.json"
-        # )
-
-        bq_client = bigquery.Client(
-            project=ANALYTICS_PROJECT
-        )
-
-    except Exception as e:
-        print("Could not create BigQuery client.")
-        print(e)
-        raise
+FULL_TABLE_NAME = f"{PROJECT}.{DATASET}.{TABLE}"
 
 
 # ============================================================
-# 2. COUNTRY TABLE MAPPING
+# 2. EXTRACT DATA FROM BIGQUERY
 # ============================================================
 
-COUNTRY_TABLES = {
-    "Global": "aa_hsbc_gpps_gpps_policy",
-    "Algeria": "dz_hsbc_gpps_gpps_policy",
-    "Australia": "au_hsbc_gpps_gpps_policy",
-    "Bahrain": "bh_hsbc_gpps_gpps_policy",
-    "Bangladesh": "bd_hsbc_gpps_gpps_policy",
-    "Brazil": "br_hsbc_gpps_gpps_policy",
-    "Canada": "ca_hsbc_gpps_gpps_policy",
-    "China": "cn_hsbc_gpps_gpps_policy",
-    "Hong Kong": "hk_hsbc_gpps_gpps_policy",
-    "India": "in_hsbc_gpps_gpps_policy",
-    "Indonesia": "id_hsbc_gpps_gpps_policy",
-    "Japan": "jp_hsbc_gpps_gpps_policy",
-    "Korea, Republic of (South)": "kr_hsbc_gpps_gpps_policy",
-    "New Zealand": "nz_hsbc_gpps_gpps_policy",
-    "Philippines": "ph_hsbc_gpps_gpps_policy",
-    "Qatar": "qa_hsbc_gpps_gpps_policy",
-    "Singapore": "sg_hsbc_gpps_gpps_policy",
-    "Taiwan": "tw_hsbc_gpps_gpps_policy",
-    "Thailand": "th_hsbc_gpps_gpps_policy",
-    "United Arab Emirates": "ae_hsbc_gpps_gpps_policy",
-    "United Kingdom": "gb_hsbc_gpps_gpps_policy",
-    "United States of America": "us_hsbc_gpps_gpps_policy",
-    "Vietnam": "vn_hsbc_gpps_gpps_policy",
-    "South Africa": "za_hsbc_gpps_gpps_policy",
-}
+query = f"""
+SELECT
+    *
+FROM `{FULL_TABLE_NAME}`
+"""
+
+print(f"Reading table: {FULL_TABLE_NAME}")
+
+df_raw = bq_client.query(query).to_dataframe()
+
+print(f"Rows extracted: {len(df_raw):,}")
+print(f"Columns extracted: {len(df_raw.columns):,}")
 
 
 # ============================================================
-# 3. HELPER - SAFE JSON PARSER
+# 3. FUNCTION TO SAFELY PARSE JSON
 # ============================================================
 
-def safe_json_loads(x):
-    """
-    Safely convert a value into a Python JSON object.
+def parse_json(x):
 
-    Handles:
-        - None
-        - dict
-        - list
-        - JSON string
-        - invalid JSON
-    """
-
-    if x is None:
-        return None
-
+    # Already parsed
     if isinstance(x, (dict, list)):
         return x
 
+    # JSON stored as string
     if isinstance(x, str):
 
         x = x.strip()
 
-        if x == "":
+        if not x:
             return None
 
         try:
@@ -116,70 +65,65 @@ def safe_json_loads(x):
 
 
 # ============================================================
-# 4. HELPER - DETERMINE DATA TYPE
+# 4. FUNCTION TO CONVERT ANY JSON VALUE TO A STRING
 # ============================================================
 
-def get_value_type(value):
+def value_to_string(value):
 
     if value is None:
-        return "null"
+        return None
 
-    if isinstance(value, bool):
-        return "bool"
-
-    if isinstance(value, int):
-        return "int"
-
-    if isinstance(value, float):
-        return "float"
-
-    if isinstance(value, str):
-        return "str"
-
+    # Dictionary
     if isinstance(value, dict):
-        return "dict"
+        return json.dumps(
+            value,
+            ensure_ascii=False
+        )
 
+    # List
     if isinstance(value, list):
-        return "list"
+        return json.dumps(
+            value,
+            ensure_ascii=False
+        )
 
-    return type(value).__name__
+    return str(value)
 
 
 # ============================================================
-# 5. RECURSIVE JSON FLATTENER
+# 5. FULL RECURSIVE JSON FLATTENER
 # ============================================================
 
-def flatten_json(
-    obj,
-    parent_path="",
-    array_mode="generic"
-):
+def flatten_json(obj, path=""):
     """
-    Recursively walks through the COMPLETE JSON object.
+    Recursively walks through the complete JSON object.
 
     Example:
 
-        {
-            "policyApplication": {
-                "segment": [
-                    {
-                        "sgmntText": "ABC",
-                        "sgmntTypeCode": "01"
-                    }
-                ]
-            }
+    {
+        "policyApplication": {
+            "segment": [
+                {
+                    "sgmntText": "ABC",
+                    "sgmntTypeCode": "01"
+                },
+                {
+                    "sgmntText": "XYZ",
+                    "sgmntTypeCode": "02"
+                }
+            ]
         }
+    }
 
     becomes:
 
-        policyApplication.segment[].sgmntText
-        policyApplication.segment[].sgmntTypeCode
+    policyApplication.segment[].sgmntText
+    policyApplication.segment[].sgmntTypeCode
 
-    Arrays use [] instead of [0], [1], etc.
-    This makes it possible to compare schema across countries.
+    Multiple values for the same path are stored together.
     """
 
-    records = []
+    result = {}
 
     # --------------------------------------------------------
     # DICTIONARY
@@ -187,37 +131,37 @@ def flatten_json(
 
     if isinstance(obj, dict):
 
-        if len(obj) == 0:
-
-            records.append({
-                "json_path": parent_path,
-                "value": None,
-                "value_type": "empty_dict"
-            })
-
-            return records
-
         for key, value in obj.items():
 
-            if parent_path:
-
-                current_path = (
-                    f"{parent_path}.{key}"
-                )
-
+            if path:
+                current_path = f"{path}.{key}"
             else:
-
                 current_path = str(key)
 
-            records.extend(
-                flatten_json(
-                    value,
-                    parent_path=current_path,
-                    array_mode=array_mode
-                )
+            child_result = flatten_json(
+                value,
+                current_path
             )
 
-        return records
+            for k, v in child_result.items():
+
+                if k in result:
+
+                    # Multiple values for same path
+                    if not isinstance(result[k], list):
+                        result[k] = [result[k]]
+
+                    if isinstance(v, list):
+                        result[k].extend(v)
+                    else:
+                        result[k].append(v)
+
+                else:
+
+                    result[k] = v
+
+        return result
+
 
     # --------------------------------------------------------
     # LIST / ARRAY
@@ -225,31 +169,45 @@ def flatten_json(
 
     elif isinstance(obj, list):
 
+        # Empty array
         if len(obj) == 0:
 
-            records.append({
-                "json_path": parent_path + "[]",
-                "value": None,
-                "value_type": "empty_list"
-            })
+            return {
+                path + "[]": None
+            }
 
-            return records
+        combined = {}
 
         for item in obj:
 
-            current_path = (
-                parent_path + "[]"
+            child_result = flatten_json(
+                item,
+                path + "[]"
             )
 
-            records.extend(
-                flatten_json(
-                    item,
-                    parent_path=current_path,
-                    array_mode=array_mode
-                )
-            )
+            for k, v in child_result.items():
 
-        return records
+                if k not in combined:
+
+                    combined[k] = v
+
+                else:
+
+                    if not isinstance(
+                        combined[k],
+                        list
+                    ):
+                        combined[k] = [
+                            combined[k]
+                        ]
+
+                    if isinstance(v, list):
+                        combined[k].extend(v)
+                    else:
+                        combined[k].append(v)
+
+        return combined
+
 
     # --------------------------------------------------------
     # LEAF VALUE
@@ -257,1069 +215,168 @@ def flatten_json(
 
     else:
 
-        records.append({
-            "json_path": parent_path,
-            "value": obj,
-            "value_type": get_value_type(obj)
-        })
-
-        return records
+        return {
+            path: value_to_string(obj)
+        }
 
 
 # ============================================================
-# 6. PARSE ONE BIGQUERY TABLE
+# 6. FULL PARSING
 # ============================================================
 
-def parse_gpps_table(
-    country,
-    table_short_name,
-    max_rows=None
-):
-    """
-    Reads one GPPS country table and completely parses json_data.
-    """
+parsed_records = []
 
-    full_table_name = (
-        f"{DATA_PROJECT}.{DATASET}.{table_short_name}"
-    )
+invalid_json_count = 0
 
-    print()
-    print("=" * 80)
-    print(f"COUNTRY : {country}")
-    print(f"TABLE   : {full_table_name}")
-    print("=" * 80)
+print("Parsing JSON...")
+
+for index, row in df_raw.iterrows():
 
     # --------------------------------------------------------
     # IMPORTANT:
-    # Do NOT SELECT *.
-    # Only retrieve columns required for JSON analysis.
+    # Change 'json_data' here if your JSON column
+    # has a different name.
     # --------------------------------------------------------
 
-    limit_clause = ""
-
-    if max_rows is not None:
-        limit_clause = f"LIMIT {int(max_rows)}"
-
-    query = f"""
-        SELECT
-            policy_core_id,
-            version_num,
-            json_data
-        FROM `{full_table_name}`
-        {limit_clause}
-    """
-
-    try:
-
-        df_raw = bq_client.query(
-            query
-        ).to_dataframe()
-
-    except Exception as e:
-
-        print("ERROR READING TABLE")
-        print(e)
-
-        return None, None
-
-    print(
-        f"Rows read: {len(df_raw):,}"
-    )
-
-    if len(df_raw) == 0:
-
-        print("Table is empty.")
-
-        return df_raw, pd.DataFrame()
-
-    parsed_rows = []
-
-    invalid_json_count = 0
-
-    # --------------------------------------------------------
-    # PARSE EACH JSON RECORD
-    # --------------------------------------------------------
-
-    for row_number, row in df_raw.iterrows():
-
-        parsed_json = safe_json_loads(
-            row["json_data"]
-        )
-
-        if parsed_json is None:
-
-            invalid_json_count += 1
-
-            continue
-
-        flattened = flatten_json(
-            parsed_json
-        )
-
-        for item in flattened:
-
-            parsed_rows.append({
-
-                "country":
-                    country,
-
-                "table_name":
-                    table_short_name,
-
-                "policy_core_id":
-                    row["policy_core_id"],
-
-                "version_num":
-                    row["version_num"],
-
-                "json_path":
-                    item["json_path"],
-
-                "value":
-                    item["value"],
-
-                "value_type":
-                    item["value_type"]
-
-            })
-
-    df_parsed = pd.DataFrame(
-        parsed_rows
-    )
-
-    print(
-        f"Invalid / empty JSON records: "
-        f"{invalid_json_count:,}"
-    )
-
-    if len(df_parsed) > 0:
-
-        print(
-            f"JSON variables found: "
-            f"{df_parsed['json_path'].nunique():,}"
-        )
-
-        print(
-            f"Flattened records: "
-            f"{len(df_parsed):,}"
-        )
-
-    return df_raw, df_parsed
-
-
-# ============================================================
-# 7. VARIABLE PROFILE
-# ============================================================
-
-def create_variable_profile(
-    df_parsed
-):
-    """
-    Creates one row per JSON variable/path.
-
-    Gives:
-        - occurrence count
-        - number of records containing variable
-        - non-null count
-        - distinct values
-        - data types
-        - example value
-    """
-
-    if df_parsed is None or len(df_parsed) == 0:
-
-        return pd.DataFrame()
-
-    grouped = []
-
-    # --------------------------------------------------------
-    # GROUP BY COUNTRY + TABLE + JSON PATH
-    # --------------------------------------------------------
-
-    for (
-        country,
-        table_name,
-        json_path
-    ), grp in df_parsed.groupby(
-        [
-            "country",
-            "table_name",
-            "json_path"
-        ],
-        dropna=False
-    ):
-
-        values = grp["value"]
-
-        # Number of non-null values
-        non_null_values = values[
-            values.notna()
-        ]
-
-        # Convert to string for distinct count
-        distinct_count = (
-            values
-            .dropna()
-            .astype(str)
-            .nunique()
-        )
-
-        # Data types observed
-        types = sorted(
-            grp["value_type"]
-            .dropna()
-            .astype(str)
-            .unique()
-            .tolist()
-        )
-
-        # Find sample value
-        sample_value = None
-
-        for value in values:
-
-            if pd.notna(value):
-
-                try:
-                    sample_value = str(value)
-
-                except Exception:
-                    sample_value = repr(value)
-
-                break
-
-        if sample_value is not None:
-            sample_value = sample_value[:500]
-
-        grouped.append({
-
-            "country":
-                country,
-
-            "table_name":
-                table_name,
-
-            "json_path":
-                json_path,
-
-            "occurrences":
-                len(grp),
-
-            "non_null_count":
-                len(non_null_values),
-
-            "null_count":
-                len(grp) - len(non_null_values),
-
-            "distinct_values":
-                distinct_count,
-
-            "data_types":
-                ", ".join(types),
-
-            "sample_value":
-                sample_value
-
-        })
-
-    profile = pd.DataFrame(
-        grouped
-    )
-
-    if len(profile) > 0:
-
-        profile["null_pct"] = (
-            profile["null_count"]
-            /
-            profile["occurrences"]
-            * 100
-        ).round(2)
-
-    return profile
-
-
-# ============================================================
-# 8. RUN ALL COUNTRY TABLES
-# ============================================================
-
-all_parsed_tables = []
-
-all_profiles = []
-
-table_summary = []
-
-# ------------------------------------------------------------
-# Set this to an integer if you want to test first.
-#
-# Example:
-# TEST_MAX_ROWS = 100
-#
-# Set to None for the FULL tables.
-# ------------------------------------------------------------
-
-TEST_MAX_ROWS = None
-
-
-for country, table_short_name in COUNTRY_TABLES.items():
-
-    df_raw, df_parsed = parse_gpps_table(
-        country=country,
-        table_short_name=table_short_name,
-        max_rows=TEST_MAX_ROWS
+    json_object = parse_json(
+        row["json_data"]
     )
 
     # --------------------------------------------------------
-    # Save parsed data
+    # Keep ALL original columns except json_data.
     # --------------------------------------------------------
 
-    if df_parsed is not None and len(df_parsed) > 0:
+    record = row.drop(
+        labels=["json_data"]
+    ).to_dict()
 
-        all_parsed_tables.append(
-            df_parsed
+    # --------------------------------------------------------
+    # Invalid / empty JSON
+    # --------------------------------------------------------
+
+    if json_object is None:
+
+        invalid_json_count += 1
+
+        parsed_records.append(
+            record
         )
 
-        # ----------------------------------------------------
-        # Create variable profile
-        # ----------------------------------------------------
+        continue
 
-        profile = create_variable_profile(
-            df_parsed
-        )
+    # --------------------------------------------------------
+    # Flatten COMPLETE JSON
+    # --------------------------------------------------------
 
-        if len(profile) > 0:
+    flattened = flatten_json(
+        json_object
+    )
 
-            all_profiles.append(
-                profile
+    # --------------------------------------------------------
+    # Add flattened JSON variables
+    # --------------------------------------------------------
+
+    for key, value in flattened.items():
+
+        # If multiple values exist for a JSON path,
+        # combine them into one readable cell.
+
+        if isinstance(value, list):
+
+            value = " | ".join(
+                [
+                    str(v)
+                    for v in value
+                    if v is not None
+                ]
             )
 
-        # ----------------------------------------------------
-        # Table summary
-        # ----------------------------------------------------
+        record[key] = value
 
-        table_summary.append({
-
-            "country":
-                country,
-
-            "table_name":
-                table_short_name,
-
-            "raw_rows":
-                len(df_raw),
-
-            "flattened_rows":
-                len(df_parsed),
-
-            "unique_variables":
-                df_parsed[
-                    "json_path"
-                ].nunique()
-
-        })
-
-    else:
-
-        table_summary.append({
-
-            "country":
-                country,
-
-            "table_name":
-                table_short_name,
-
-            "raw_rows":
-                0 if df_raw is None else len(df_raw),
-
-            "flattened_rows":
-                0,
-
-            "unique_variables":
-                0
-
-        })
+    parsed_records.append(
+        record
+    )
 
 
 # ============================================================
-# 9. COMBINE EVERYTHING
+# 7. CREATE FINAL DATAFRAME
 # ============================================================
 
-if all_parsed_tables:
-
-    full_json_parsed = pd.concat(
-        all_parsed_tables,
-        ignore_index=True
-    )
-
-else:
-
-    full_json_parsed = pd.DataFrame()
-
-
-if all_profiles:
-
-    variable_profile = pd.concat(
-        all_profiles,
-        ignore_index=True
-    )
-
-else:
-
-    variable_profile = pd.DataFrame()
-
-
-table_summary = pd.DataFrame(
-    table_summary
+df_parsed = pd.DataFrame(
+    parsed_records
 )
 
 
 # ============================================================
-# 10. DISPLAY TABLE SUMMARY
+# 8. FINAL CLEANUP
 # ============================================================
 
-print()
-print("=" * 80)
-print("TABLE SUMMARY")
-print("=" * 80)
-
-display(
-    table_summary
+# Replace empty strings with NaN
+df_parsed = df_parsed.replace(
+    "",
+    np.nan
 )
 
 
 # ============================================================
-# 11. DISPLAY VARIABLE PROFILE
+# 9. RESULTS
 # ============================================================
 
 print()
 print("=" * 80)
-print("FULL JSON VARIABLE PROFILE")
+print("JSON PARSING COMPLETE")
 print("=" * 80)
 
 print(
-    f"Total unique JSON paths across all tables: "
-    f"{variable_profile['json_path'].nunique():,}"
-)
-
-display(
-    variable_profile.head(100)
-)
-
-
-# ============================================================
-# 12. COUNTRY x JSON VARIABLE MATRIX
-# ============================================================
-
-print()
-print("=" * 80)
-print("COUNTRY x JSON VARIABLE PRESENCE")
-print("=" * 80)
-
-if len(variable_profile) > 0:
-
-    variable_presence = (
-        variable_profile
-        .assign(present=1)
-        .pivot_table(
-            index="json_path",
-            columns="country",
-            values="present",
-            aggfunc="max",
-            fill_value=0
-        )
-        .reset_index()
-    )
-
-else:
-
-    variable_presence = pd.DataFrame()
-
-
-if len(variable_presence) > 0:
-
-    country_columns = [
-        c for c in variable_presence.columns
-        if c != "json_path"
-    ]
-
-    variable_presence[
-        "number_of_countries"
-    ] = (
-        variable_presence[
-            country_columns
-        ]
-        .sum(axis=1)
-    )
-
-    variable_presence = (
-        variable_presence
-        .sort_values(
-            "number_of_countries",
-            ascending=False
-        )
-        .reset_index(drop=True)
-    )
-
-display(
-    variable_presence.head(100)
-)
-
-
-# ============================================================
-# 13. VARIABLES COMMON TO ALL COUNTRIES
-# ============================================================
-
-if len(variable_presence) > 0:
-
-    number_of_countries = len(
-        COUNTRY_TABLES
-    )
-
-    common_variables = (
-        variable_presence[
-            variable_presence[
-                "number_of_countries"
-            ]
-            == number_of_countries
-        ]
-        .copy()
-    )
-
-else:
-
-    common_variables = pd.DataFrame()
-
-
-print()
-print("=" * 80)
-print("VARIABLES PRESENT IN ALL COUNTRY TABLES")
-print("=" * 80)
-
-print(
-    f"Number of common variables: "
-    f"{len(common_variables):,}"
-)
-
-display(
-    common_variables
-)
-
-
-# ============================================================
-# 14. COUNTRY-SPECIFIC VARIABLES
-# ============================================================
-
-if len(variable_presence) > 0:
-
-    country_specific_variables = (
-        variable_presence[
-            variable_presence[
-                "number_of_countries"
-            ]
-            == 1
-        ]
-        .copy()
-    )
-
-else:
-
-    country_specific_variables = pd.DataFrame()
-
-
-print()
-print("=" * 80)
-print("COUNTRY-SPECIFIC VARIABLES")
-print("=" * 80)
-
-print(
-    f"Number of country-specific variables: "
-    f"{len(country_specific_variables):,}"
-)
-
-display(
-    country_specific_variables
-)
-
-
-# ============================================================
-# 15. VARIABLES PRESENT IN SOME BUT NOT ALL COUNTRIES
-# ============================================================
-
-if len(variable_presence) > 0:
-
-    partially_shared_variables = (
-        variable_presence[
-            (
-                variable_presence[
-                    "number_of_countries"
-                ] > 1
-            )
-            &
-            (
-                variable_presence[
-                    "number_of_countries"
-                ] < len(COUNTRY_TABLES)
-            )
-        ]
-        .copy()
-    )
-
-else:
-
-    partially_shared_variables = pd.DataFrame()
-
-
-print()
-print("=" * 80)
-print("VARIABLES PRESENT IN SOME BUT NOT ALL COUNTRIES")
-print("=" * 80)
-
-print(
-    f"Number of variables: "
-    f"{len(partially_shared_variables):,}"
-)
-
-display(
-    partially_shared_variables.head(200)
-)
-
-
-# ============================================================
-# 16. FULL WIDE JSON TABLE
-# ============================================================
-#
-# IMPORTANT:
-#
-# This converts every JSON PATH into a column.
-#
-# Arrays such as:
-#
-# policyApplication.segment[]
-#
-# are represented using their JSON path.
-#
-# Multiple values for the same path within one record
-# are stored as a pipe-separated value.
-#
-# ============================================================
-
-print()
-print("=" * 80)
-print("CREATING FULL WIDE JSON TABLE")
-print("=" * 80)
-
-
-if len(full_json_parsed) > 0:
-
-    # --------------------------------------------------------
-    # Convert values to strings.
-    #
-    # This allows multiple values to be combined safely.
-    # --------------------------------------------------------
-
-    wide_source = (
-        full_json_parsed
-        .copy()
-    )
-
-    wide_source["value_string"] = (
-        wide_source["value"]
-        .apply(
-            lambda x:
-                None
-                if pd.isna(x)
-                else str(x)
-        )
-    )
-
-    # --------------------------------------------------------
-    # If the same JSON variable occurs multiple times
-    # for the same policy record, combine the values.
-    # --------------------------------------------------------
-
-    wide_source = (
-        wide_source
-        .groupby(
-            [
-                "country",
-                "table_name",
-                "policy_core_id",
-                "version_num",
-                "json_path"
-            ],
-            dropna=False
-        )[
-            "value_string"
-        ]
-        .apply(
-            lambda x:
-                " | ".join(
-                    pd.unique(
-                        x.dropna()
-                    )
-                )
-                if x.notna().any()
-                else None
-        )
-        .reset_index()
-    )
-
-    # --------------------------------------------------------
-    # Pivot JSON paths into columns
-    # --------------------------------------------------------
-
-    full_json_wide = (
-        wide_source
-        .pivot_table(
-            index=[
-                "country",
-                "table_name",
-                "policy_core_id",
-                "version_num"
-            ],
-            columns="json_path",
-            values="value_string",
-            aggfunc="first"
-        )
-        .reset_index()
-    )
-
-    # Remove pandas column index name
-    full_json_wide.columns.name = None
-
-else:
-
-    full_json_wide = pd.DataFrame()
-
-
-print(
-    f"Wide table rows: "
-    f"{len(full_json_wide):,}"
+    f"Original rows       : {len(df_raw):,}"
 )
 
 print(
-    f"Wide table columns: "
-    f"{len(full_json_wide.columns):,}"
+    f"Parsed rows         : {len(df_parsed):,}"
 )
 
+print(
+    f"Original columns    : {len(df_raw.columns):,}"
+)
+
+print(
+    f"Final columns       : {len(df_parsed.columns):,}"
+)
+
+print(
+    f"New JSON columns    : "
+    f"{len(df_parsed.columns) - len(df_raw.columns) + 1:,}"
+)
+
+print(
+    f"Invalid JSON rows   : {invalid_json_count:,}"
+)
+
+print("=" * 80)
+
+
+# ============================================================
+# 10. DISPLAY RESULT
+# ============================================================
+
 display(
-    full_json_wide.head()
+    df_parsed.head()
 )
 
 
 # ============================================================
-# 17. COLUMN NAME LIST
+# 11. LIST ALL COLUMNS
 # ============================================================
 
 print()
-print("=" * 80)
-print("ALL JSON COLUMNS")
-print("=" * 80)
+print("ALL COLUMNS:")
+print()
 
-json_columns = [
-    c
-    for c in full_json_wide.columns
-    if c not in [
-        "country",
-        "table_name",
-        "policy_core_id",
-        "version_num"
-    ]
-]
-
-print(
-    f"Total JSON columns: "
-    f"{len(json_columns):,}"
-)
-
-for i, col in enumerate(
-    json_columns,
+for i, column in enumerate(
+    df_parsed.columns,
     start=1
 ):
 
     print(
-        f"{i:4d}. {col}"
+        f"{i:4d}. {column}"
     )
-
-
-# ============================================================
-# 18. DATA TYPE PROFILE
-# ============================================================
-
-print()
-print("=" * 80)
-print("DATA TYPE PROFILE")
-print("=" * 80)
-
-if len(variable_profile) > 0:
-
-    datatype_profile = (
-        variable_profile
-        .groupby(
-            [
-                "json_path",
-                "data_types"
-            ],
-            dropna=False
-        )
-        .agg(
-            countries=(
-                "country",
-                "nunique"
-            ),
-
-            total_occurrences=(
-                "occurrences",
-                "sum"
-            ),
-
-            total_non_null=(
-                "non_null_count",
-                "sum"
-            )
-        )
-        .reset_index()
-        .sort_values(
-            [
-                "countries",
-                "total_occurrences"
-            ],
-            ascending=False
-        )
-    )
-
-else:
-
-    datatype_profile = pd.DataFrame()
-
-
-display(
-    datatype_profile.head(200)
-)
-
-
-# ============================================================
-# 19. VARIABLE FREQUENCY ACROSS ALL COUNTRIES
-# ============================================================
-
-print()
-print("=" * 80)
-print("MOST COMMON JSON VARIABLES")
-print("=" * 80)
-
-if len(variable_presence) > 0:
-
-    most_common_variables = (
-        variable_presence
-        .sort_values(
-            "number_of_countries",
-            ascending=False
-        )
-        .copy()
-    )
-
-    display(
-        most_common_variables.head(100)
-    )
-
-
-# ============================================================
-# 20. VARIABLES WITH LOW COVERAGE
-# ============================================================
-
-print()
-print("=" * 80)
-print("VARIABLES WITH LOW COUNTRY COVERAGE")
-print("=" * 80)
-
-if len(variable_presence) > 0:
-
-    low_coverage_variables = (
-        variable_presence[
-            variable_presence[
-                "number_of_countries"
-            ]
-            <= 3
-        ]
-        .sort_values(
-            "number_of_countries",
-            ascending=True
-        )
-        .copy()
-    )
-
-    display(
-        low_coverage_variables.head(200)
-    )
-
-
-# ============================================================
-# 21. SAVE RESULTS TO CSV
-# ============================================================
-#
-# These files will be created in your Jupyter working directory.
-#
-# ============================================================
-
-OUTPUT_DIR = "GPPS_JSON_EDA_OUTPUT"
-
-os.makedirs(
-    OUTPUT_DIR,
-    exist_ok=True
-)
-
-
-# ------------------------------------------------------------
-# Table summary
-# ------------------------------------------------------------
-
-table_summary.to_csv(
-    f"{OUTPUT_DIR}/01_table_summary.csv",
-    index=False
-)
-
-
-# ------------------------------------------------------------
-# Complete long JSON table
-# ------------------------------------------------------------
-
-if len(full_json_parsed) > 0:
-
-    full_json_parsed.to_csv(
-        f"{OUTPUT_DIR}/02_full_json_parsed.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# Variable profile
-# ------------------------------------------------------------
-
-if len(variable_profile) > 0:
-
-    variable_profile.to_csv(
-        f"{OUTPUT_DIR}/03_variable_profile.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# Country x variable matrix
-# ------------------------------------------------------------
-
-if len(variable_presence) > 0:
-
-    variable_presence.to_csv(
-        f"{OUTPUT_DIR}/04_country_variable_presence.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# Common variables
-# ------------------------------------------------------------
-
-if len(common_variables) > 0:
-
-    common_variables.to_csv(
-        f"{OUTPUT_DIR}/05_common_variables.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# Country-specific variables
-# ------------------------------------------------------------
-
-if len(country_specific_variables) > 0:
-
-    country_specific_variables.to_csv(
-        f"{OUTPUT_DIR}/06_country_specific_variables.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# Partial variables
-# ------------------------------------------------------------
-
-if len(partially_shared_variables) > 0:
-
-    partially_shared_variables.to_csv(
-        f"{OUTPUT_DIR}/07_partial_country_variables.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# FULL WIDE TABLE
-# ------------------------------------------------------------
-
-if len(full_json_wide) > 0:
-
-    full_json_wide.to_csv(
-        f"{OUTPUT_DIR}/08_full_json_wide.csv",
-        index=False
-    )
-
-
-# ------------------------------------------------------------
-# Datatype profile
-# ------------------------------------------------------------
-
-if len(datatype_profile) > 0:
-
-    datatype_profile.to_csv(
-        f"{OUTPUT_DIR}/09_datatype_profile.csv",
-        index=False
-    )
-
-
-# ============================================================
-# 22. FINAL SUMMARY
-# ============================================================
-
-print()
-print()
-print("=" * 80)
-print("GPPS JSON EDA COMPLETE")
-print("=" * 80)
-
-print(
-    f"Country tables processed : {len(COUNTRY_TABLES):,}"
-)
-
-print(
-    f"Total flattened records  : "
-    f"{len(full_json_parsed):,}"
-)
-
-print(
-    f"Unique JSON variables    : "
-    f"{full_json_parsed['json_path'].nunique():,}"
-    if len(full_json_parsed) > 0
-    else "0"
-)
-
-print(
-    f"Wide-table columns       : "
-    f"{len(full_json_wide.columns):,}"
-)
-
-print()
-print(
-    f"Output directory: {OUTPUT_DIR}"
-)
-
-print()
-print("Files created:")
-
-for filename in sorted(
-    os.listdir(OUTPUT_DIR)
-):
-
-    print(
-        f"  - {filename}"
-    )
-
-print()
-print("=" * 80)
