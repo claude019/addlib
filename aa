@@ -1,0 +1,787 @@
+# ============================================================
+# GPPS -- Comprehensive EDA
+#
+# Loads each in-scope table ONCE and builds three long-format
+# dataframes that every subsequent analysis derives from:
+#
+#   policy_level_df   -- one row per (country, policy_core_id, version)
+#   segment_level_df  -- one row per segment
+#   objrel_level_df   -- one row per objRel entry
+#
+# These stay in memory so you can slice them ad-hoc afterwards.
+#
+# SECTIONS
+#   0. Load + build the three base frames
+#   1. Table-level overview (volume, versions, policies)
+#   2. plcyObjTypeCde -- null vs populated, at every grain
+#   3. Distribution: country x policy_id x plcyObjTypeCde
+#   4. sgmntTypeCde -- null vs populated, format breakdown
+#   5. Relationship between the two code fields
+#   6. Identifier format inventory (plcyObjId / cntlId)
+#   7. Text field profile (policyText / policyPurpose / segment)
+#   8. Export to Excel
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+import numpy as np
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 300)
+pd.set_option("display.max_colwidth", 120)
+
+
+COUNTRY_TABLES = {
+    "Global": "aa_hsbc_gpps_gpps_policy",
+    "Algeria": "dz_hsbc_gpps_gpps_policy",
+    "Australia": "au_hsbc_gpps_gpps_policy",
+    "Bahrain": "bh_hsbc_gpps_gpps_policy",
+    "Bangladesh": "bd_hsbc_gpps_gpps_policy",
+    "Brazil": "br_hsbc_gpps_gpps_policy",
+    "Canada": "ca_hsbc_gpps_gpps_policy",
+    "China": "cn_hsbc_gpps_gpps_policy",
+    "Hong Kong": "hk_hsbc_gpps_gpps_policy",
+    "India": "in_hsbc_gpps_gpps_policy",
+    "Indonesia": "id_hsbc_gpps_gpps_policy",
+    "Japan": "jp_hsbc_gpps_gpps_policy",
+    "Korea, Republic of (South)": "kr_hsbc_gpps_gpps_policy",
+    "New Zealand": "nz_hsbc_gpps_gpps_policy",
+    "Philippines": "ph_hsbc_gpps_gpps_policy",
+    "Qatar": "qa_hsbc_gpps_gpps_policy",
+    "Singapore": "sg_hsbc_gpps_gpps_policy",
+    "Taiwan": "tw_hsbc_gpps_gpps_policy",
+    "Thailand": "th_hsbc_gpps_gpps_policy",
+    "United Arab Emirates": "ae_hsbc_gpps_gpps_policy",
+    "United Kingdom": "gb_hsbc_gpps_gpps_policy",
+    "United States of America": "us_hsbc_gpps_gpps_policy",
+    "Vietnam": "vn_hsbc_gpps_gpps_policy",
+    "South Africa": "za_hsbc_gpps_gpps_policy",
+}
+
+# Set False to profile every version rather than just the current one
+CURRENT_VERSION_ONLY = True
+
+MEANINGFUL_TEXT_LEN = 20  # chars after HTML stripping; below this is not real content
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def classify_code_format(value):
+    """Classify an identifier's shape. Deliberately does NOT split on
+    '-', so non-dashed codes are not mistaken for nulls."""
+    if value is None:
+        return "NULL"
+    s = str(value).strip()
+    if not s:
+        return "EMPTY_STRING"
+    if re.fullmatch(r"L1C-\d+", s):
+        return "L1C-<digits>"
+    if re.fullmatch(r"RSM-\d+", s):
+        return "RSM-<digits>"
+    if re.fullmatch(r"[A-Za-z]+-\d+", s):
+        return "OTHERPREFIX-<digits>"
+    if re.fullmatch(r"[A-Za-z]+\d+", s):
+        return "ALPHA<digits> (no dash)"
+    if re.fullmatch(r"\d+", s):
+        return "<digits only>"
+    return "OTHER"
+
+
+def value_state(value):
+    """Three-way state used for null-vs-populated counting."""
+    if value is None:
+        return "NULL"
+    if isinstance(value, str) and not value.strip():
+        return "EMPTY_STRING"
+    return "POPULATED"
+
+
+# ============================================================
+# SECTION 0 -- Load once, build three base frames
+# ============================================================
+
+print("=" * 80)
+print("SECTION 0 -- Loading tables and building base frames")
+print("=" * 80)
+
+policy_records = []
+segment_records = []
+objrel_records = []
+load_status = []
+
+for country, table in COUNTRY_TABLES.items():
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+    query = f"SELECT policy_core_id, version_num, snapshot_time, transfer_date, json_data FROM `{full_table}`"
+
+    try:
+        df_raw = bq_client.query(query).to_dataframe()
+    except Exception as e:
+        load_status.append({"country": country, "table": table,
+                            "status": "QUERY_FAILED", "rows": None, "error": str(e)[:150]})
+        print(f"  {country:30s} FAILED -- {str(e)[:70]}")
+        continue
+
+    if len(df_raw) == 0:
+        load_status.append({"country": country, "table": table,
+                            "status": "EMPTY", "rows": 0, "error": None})
+        print(f"  {country:30s} EMPTY")
+        continue
+
+    rows_all_versions = len(df_raw)
+
+    if CURRENT_VERSION_ONLY:
+        df_use = (df_raw.sort_values("version_num")
+                  .groupby("policy_core_id", as_index=False)
+                  .tail(1)
+                  .copy())
+    else:
+        df_use = df_raw.copy()
+
+    df_use["parsed"] = df_use["json_data"].apply(safe_json_loads)
+
+    load_status.append({
+        "country": country, "table": table, "status": "OK",
+        "rows": rows_all_versions, "error": None,
+    })
+
+    for _, row in df_use.iterrows():
+        parsed = row["parsed"]
+        pid = row["policy_core_id"]
+        ver = row["version_num"]
+
+        parse_ok = isinstance(parsed, dict)
+
+        policy_text_clean = strip_html(get_nested(parsed, "policyText", "sgmntText")) if parse_ok else ""
+        policy_purpose_clean = strip_html(get_nested(parsed, "policyPurpose", "sgmntText")) if parse_ok else ""
+
+        segments = get_nested(parsed, "policyApplication", "segment") if parse_ok else None
+        segments = segments if isinstance(segments, list) else []
+
+        policy_records.append({
+            "country": country,
+            "table": table,
+            "policy_core_id": pid,
+            "version_num": ver,
+            "snapshot_time": row.get("snapshot_time"),
+            "transfer_date": row.get("transfer_date"),
+            "json_parse_ok": parse_ok,
+            "policyTitle": parsed.get("policyTitle") if parse_ok else None,
+            "policyDocType": parsed.get("policyDocType") if parse_ok else None,
+            "region": parsed.get("region") if parse_ok else None,
+            "policyRiskTypePrimary": parsed.get("policyRiskTypePrimary") if parse_ok else None,
+            "riskTxnmyL2Text": get_nested(parsed, "policyApplication", "riskTxnmyL2Text") if parse_ok else None,
+            "versStatCde": get_nested(parsed, "versn", "versStatCde") if parse_ok else None,
+            "versActlPublDt": get_nested(parsed, "versn", "versActlPublDt") if parse_ok else None,
+            "policyText_len": len(policy_text_clean),
+            "policyPurpose_len": len(policy_purpose_clean),
+            "n_segments": len(segments),
+        })
+
+        for seg_idx, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
+
+            seg_text_clean = strip_html(seg.get("sgmntText"))
+
+            # --- sgmntTypeCde state, without splitting on '-' ---
+            if "sgmntTypeCde" not in seg:
+                sgmnt_state = "KEY_ABSENT"
+                sgmnt_value = None
+            else:
+                sgmnt_value = seg.get("sgmntTypeCde")
+                sgmnt_state = value_state(sgmnt_value)
+
+            # --- objRel state ---
+            obj_rel = seg.get("objRel")
+            if "objRel" not in seg:
+                objrel_state = "KEY_ABSENT"
+                objrel_entries = []
+            elif obj_rel is None:
+                objrel_state = "NULL"
+                objrel_entries = []
+            elif isinstance(obj_rel, list) and len(obj_rel) == 0:
+                objrel_state = "EMPTY_LIST"
+                objrel_entries = []
+            elif isinstance(obj_rel, list):
+                objrel_state = "POPULATED"
+                objrel_entries = [o for o in obj_rel if isinstance(o, dict)]
+            else:
+                objrel_state = "UNEXPECTED_TYPE"
+                objrel_entries = []
+
+            segment_records.append({
+                "country": country,
+                "table": table,
+                "policy_core_id": pid,
+                "version_num": ver,
+                "segment_index": seg_idx,
+                "sgmntTitlText": seg.get("sgmntTitlText"),
+                "sgmntTypeCde": sgmnt_value,
+                "sgmntTypeCde_state": sgmnt_state,
+                "sgmntTypeCde_format": classify_code_format(sgmnt_value) if sgmnt_state == "POPULATED" else sgmnt_state,
+                "objRel_state": objrel_state,
+                "n_objRel_entries": len(objrel_entries),
+                "segment_text_len": len(seg_text_clean),
+                "segment_text_meaningful": len(seg_text_clean) >= MEANINGFUL_TEXT_LEN,
+            })
+
+            for obj_idx, obj in enumerate(objrel_entries):
+                obj_type = obj.get("plcyObjTypeCde")
+                objrel_records.append({
+                    "country": country,
+                    "table": table,
+                    "policy_core_id": pid,
+                    "version_num": ver,
+                    "segment_index": seg_idx,
+                    "objrel_index": obj_idx,
+                    "sgmntTypeCde": sgmnt_value,
+                    "sgmntTypeCde_state": sgmnt_state,
+                    "plcyObjTypeCde": obj_type,
+                    "plcyObjTypeCde_state": value_state(obj_type),
+                    "plcyObjId": obj.get("plcyObjId"),
+                    "plcyObjId_state": value_state(obj.get("plcyObjId")),
+                    "plcyObjId_format": classify_code_format(obj.get("plcyObjId")),
+                    "cntlId": obj.get("cntlId"),
+                    "cntlId_state": value_state(obj.get("cntlId")),
+                    "cntlId_format": classify_code_format(obj.get("cntlId")),
+                    "cntlTitl": obj.get("cntlTitl"),
+                })
+
+    print(f"  {country:30s} OK -- {rows_all_versions} rows, "
+          f"{df_use['policy_core_id'].nunique()} policies profiled")
+
+policy_level_df = pd.DataFrame(policy_records)
+segment_level_df = pd.DataFrame(segment_records)
+objrel_level_df = pd.DataFrame(objrel_records)
+load_status_df = pd.DataFrame(load_status)
+
+print(f"\nBase frames built:")
+print(f"  policy_level_df  : {len(policy_level_df):,} rows")
+print(f"  segment_level_df : {len(segment_level_df):,} rows")
+print(f"  objrel_level_df  : {len(objrel_level_df):,} rows")
+print(f"\nLoad status:")
+display(load_status_df)
+
+
+# ============================================================
+# SECTION 1 -- Table-level overview
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 1 -- Table-level overview")
+print("=" * 80)
+
+if len(policy_level_df):
+    table_overview = (
+        policy_level_df.groupby(["country", "table"])
+        .agg(
+            policies=("policy_core_id", "nunique"),
+            max_version=("version_num", "max"),
+            avg_version=("version_num", "mean"),
+            json_parse_ok_pct=("json_parse_ok", lambda s: round(s.mean() * 100, 2)),
+            total_segments=("n_segments", "sum"),
+            avg_segments_per_policy=("n_segments", "mean"),
+            policyText_median_len=("policyText_len", "median"),
+            policies_with_no_policyText=("policyText_len", lambda s: int((s == 0).sum())),
+        )
+        .reset_index()
+    )
+    table_overview["avg_version"] = table_overview["avg_version"].round(2)
+    table_overview["avg_segments_per_policy"] = table_overview["avg_segments_per_policy"].round(1)
+    display(table_overview.sort_values("policies", ascending=False))
+
+
+# ============================================================
+# SECTION 2 -- plcyObjTypeCde: NULL vs POPULATED at every grain
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 2 -- plcyObjTypeCde: null vs populated")
+print("=" * 80)
+
+# ---- 2a. Segment grain: does the segment even have an objRel list? ----
+print("\n[2a] SEGMENT GRAIN -- objRel container state")
+print("     (a segment with no objRel can carry no plcyObjTypeCde at all)")
+
+if len(segment_level_df):
+    seg_objrel_state = pd.crosstab(
+        segment_level_df["country"], segment_level_df["objRel_state"]
+    )
+    seg_objrel_state["TOTAL"] = seg_objrel_state.sum(axis=1)
+    populated_col = "POPULATED" if "POPULATED" in seg_objrel_state.columns else None
+    if populated_col:
+        seg_objrel_state["POPULATED_PCT"] = (
+            seg_objrel_state[populated_col] / seg_objrel_state["TOTAL"] * 100
+        ).round(2)
+    display(seg_objrel_state)
+
+# ---- 2b. objRel entry grain: is plcyObjTypeCde itself null? ----
+print("\n[2b] OBJREL ENTRY GRAIN -- is plcyObjTypeCde populated within each entry?")
+
+if len(objrel_level_df):
+    objtype_state = pd.crosstab(
+        objrel_level_df["country"], objrel_level_df["plcyObjTypeCde_state"]
+    )
+    objtype_state["TOTAL_ENTRIES"] = objtype_state.sum(axis=1)
+    if "POPULATED" in objtype_state.columns:
+        objtype_state["POPULATED_PCT"] = (
+            objtype_state["POPULATED"] / objtype_state["TOTAL_ENTRIES"] * 100
+        ).round(2)
+    display(objtype_state)
+
+    print("\nOverall across all tables:")
+    display(
+        objrel_level_df["plcyObjTypeCde_state"]
+        .value_counts(dropna=False)
+        .rename_axis("plcyObjTypeCde_state")
+        .reset_index(name="objrel_entries")
+    )
+else:
+    print("     No objRel entries found in any table.")
+
+# ---- 2c. Value distribution where populated ----
+print("\n[2c] plcyObjTypeCde VALUE distribution (where populated)")
+
+if len(objrel_level_df):
+    value_dist = pd.crosstab(
+        objrel_level_df["country"],
+        objrel_level_df["plcyObjTypeCde"].fillna("<NULL>")
+    )
+    value_dist["TOTAL"] = value_dist.sum(axis=1)
+    display(value_dist)
+
+    print("\nOverall value counts:")
+    display(
+        objrel_level_df["plcyObjTypeCde"]
+        .fillna("<NULL>")
+        .value_counts()
+        .rename_axis("plcyObjTypeCde")
+        .reset_index(name="entries")
+    )
+
+# ---- 2d. Policy grain: does the policy have ANY populated type? ----
+print("\n[2d] POLICY GRAIN -- how many policies carry at least one populated plcyObjTypeCde?")
+
+if len(policy_level_df):
+    if len(objrel_level_df):
+        policies_with_type = (
+            objrel_level_df[objrel_level_df["plcyObjTypeCde_state"] == "POPULATED"]
+            .groupby("country")["policy_core_id"].nunique()
+            .rename("policies_with_populated_type")
+        )
+    else:
+        policies_with_type = pd.Series(dtype=int, name="policies_with_populated_type")
+
+    total_policies = policy_level_df.groupby("country")["policy_core_id"].nunique().rename("total_policies")
+
+    policy_coverage = pd.concat([total_policies, policies_with_type], axis=1).fillna(0)
+    policy_coverage["policies_without_any_type"] = (
+        policy_coverage["total_policies"] - policy_coverage["policies_with_populated_type"]
+    )
+    policy_coverage["coverage_pct"] = (
+        policy_coverage["policies_with_populated_type"] / policy_coverage["total_policies"] * 100
+    ).round(2)
+    display(policy_coverage.astype({"policies_with_populated_type": int,
+                                     "policies_without_any_type": int}))
+
+
+# ============================================================
+# SECTION 3 -- Distribution: country x policy_id x plcyObjTypeCde
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 3 -- Distribution: country x policy_core_id x plcyObjTypeCde")
+print("=" * 80)
+
+# ---- 3a. One row per (country, policy, objtype) ----
+print("\n[3a] Long format -- one row per country / policy / object type")
+
+if len(objrel_level_df):
+    country_policy_objtype = (
+        objrel_level_df
+        .assign(plcyObjTypeCde_filled=objrel_level_df["plcyObjTypeCde"].fillna("<NULL>"))
+        .groupby(["country", "policy_core_id", "plcyObjTypeCde_filled"])
+        .agg(
+            objrel_entries=("objrel_index", "size"),
+            distinct_segments=("segment_index", "nunique"),
+            distinct_plcyObjId=("plcyObjId", lambda s: s.dropna().nunique()),
+            distinct_cntlId=("cntlId", lambda s: s.dropna().nunique()),
+        )
+        .reset_index()
+        .rename(columns={"plcyObjTypeCde_filled": "plcyObjTypeCde"})
+    )
+    display(country_policy_objtype.head(60))
+    print(f"\n(showing first 60 of {len(country_policy_objtype):,} rows -- "
+          f"full frame in `country_policy_objtype`)")
+else:
+    country_policy_objtype = pd.DataFrame()
+    print("     No objRel entries to distribute.")
+
+# ---- 3b. Wide format: one row per policy, one column per type ----
+print("\n[3b] Wide format -- one row per policy, counts per object type, "
+      "including policies with none")
+
+if len(policy_level_df):
+    policy_base = policy_level_df[
+        ["country", "table", "policy_core_id", "version_num", "policyTitle", "n_segments"]
+    ].copy()
+
+    if len(country_policy_objtype):
+        wide = country_policy_objtype.pivot_table(
+            index=["country", "policy_core_id"],
+            columns="plcyObjTypeCde",
+            values="objrel_entries",
+            aggfunc="sum",
+            fill_value=0,
+        ).reset_index()
+    else:
+        wide = pd.DataFrame(columns=["country", "policy_core_id"])
+
+    policy_objtype_wide = policy_base.merge(
+        wide, on=["country", "policy_core_id"], how="left"
+    )
+
+    type_cols = [c for c in policy_objtype_wide.columns if c not in
+                 ["country", "table", "policy_core_id", "version_num", "policyTitle", "n_segments"]]
+    for c in type_cols:
+        policy_objtype_wide[c] = policy_objtype_wide[c].fillna(0).astype(int)
+
+    policy_objtype_wide["total_objrel_entries"] = policy_objtype_wide[type_cols].sum(axis=1)
+    policy_objtype_wide["has_any_objrel"] = policy_objtype_wide["total_objrel_entries"] > 0
+
+    display(policy_objtype_wide.head(60))
+    print(f"\n(showing first 60 of {len(policy_objtype_wide):,} policies -- "
+          f"full frame in `policy_objtype_wide`)")
+
+    print("\nPolicies with NO objRel entries at all, by country:")
+    no_link = (
+        policy_objtype_wide.groupby("country")
+        .agg(total_policies=("policy_core_id", "nunique"),
+             policies_with_objrel=("has_any_objrel", "sum"))
+        .reset_index()
+    )
+    no_link["policies_without_objrel"] = no_link["total_policies"] - no_link["policies_with_objrel"]
+    no_link["pct_without"] = (no_link["policies_without_objrel"] / no_link["total_policies"] * 100).round(2)
+    display(no_link.sort_values("pct_without", ascending=False))
+
+# ---- 3c. Country x type pivot, entries and policy coverage ----
+print("\n[3c] Country x object type pivots")
+
+if len(country_policy_objtype):
+    print("\nTotal objRel entries:")
+    display(country_policy_objtype.pivot_table(
+        index="country", columns="plcyObjTypeCde",
+        values="objrel_entries", aggfunc="sum", fill_value=0
+    ))
+
+    print("\nDistinct policies covered:")
+    display(country_policy_objtype.pivot_table(
+        index="country", columns="plcyObjTypeCde",
+        values="policy_core_id", aggfunc="nunique", fill_value=0
+    ))
+
+# ---- 3d. How many distinct types does a single policy carry? ----
+print("\n[3d] Number of distinct object types per policy")
+
+if len(country_policy_objtype):
+    types_per_policy = (
+        country_policy_objtype[country_policy_objtype["plcyObjTypeCde"] != "<NULL>"]
+        .groupby(["country", "policy_core_id"])["plcyObjTypeCde"]
+        .nunique().rename("distinct_types").reset_index()
+    )
+    display(pd.crosstab(types_per_policy["country"], types_per_policy["distinct_types"]))
+    print("(columns = how many distinct plcyObjTypeCde values that policy carries)")
+
+
+# ============================================================
+# SECTION 4 -- sgmntTypeCde: null vs populated + formats
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 4 -- sgmntTypeCde: null vs populated")
+print("=" * 80)
+
+print("\n[4a] SEGMENT GRAIN -- state breakdown")
+print("     KEY_ABSENT = field not present on the segment dict at all")
+
+if len(segment_level_df):
+    sgmnt_state_tab = pd.crosstab(
+        segment_level_df["country"], segment_level_df["sgmntTypeCde_state"]
+    )
+    sgmnt_state_tab["TOTAL"] = sgmnt_state_tab.sum(axis=1)
+    if "POPULATED" in sgmnt_state_tab.columns:
+        sgmnt_state_tab["POPULATED_PCT"] = (
+            sgmnt_state_tab["POPULATED"] / sgmnt_state_tab["TOTAL"] * 100
+        ).round(2)
+    else:
+        sgmnt_state_tab["POPULATED_PCT"] = 0.0
+    display(sgmnt_state_tab)
+
+    print("\n[4b] FORMAT breakdown where populated "
+          "(regex-classified -- does NOT split on '-')")
+    fmt_tab = pd.crosstab(
+        segment_level_df["country"], segment_level_df["sgmntTypeCde_format"]
+    )
+    display(fmt_tab)
+
+    print("\n[4c] Sample distinct sgmntTypeCde values per country:")
+    for country in segment_level_df["country"].unique():
+        vals = (segment_level_df.loc[
+            (segment_level_df["country"] == country) &
+            (segment_level_df["sgmntTypeCde_state"] == "POPULATED"),
+            "sgmntTypeCde"
+        ].dropna().astype(str).unique())
+        sample = sorted(vals)[:6]
+        print(f"  {country:30s} {sample if len(sample) else '-- none populated --'}")
+
+    print("\n[4d] POLICY GRAIN -- policies carrying at least one populated sgmntTypeCde")
+    pol_with_sgmnt = (
+        segment_level_df[segment_level_df["sgmntTypeCde_state"] == "POPULATED"]
+        .groupby("country")["policy_core_id"].nunique()
+        .rename("policies_with_sgmntTypeCde")
+    )
+    tot_pol = policy_level_df.groupby("country")["policy_core_id"].nunique().rename("total_policies")
+    sgmnt_cov = pd.concat([tot_pol, pol_with_sgmnt], axis=1).fillna(0)
+    sgmnt_cov["coverage_pct"] = (
+        sgmnt_cov["policies_with_sgmntTypeCde"] / sgmnt_cov["total_policies"] * 100
+    ).round(2)
+    display(sgmnt_cov.astype({"policies_with_sgmntTypeCde": int}))
+
+
+# ============================================================
+# SECTION 5 -- Relationship between the two code fields
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 5 -- sgmntTypeCde vs plcyObjTypeCde")
+print("=" * 80)
+
+if len(segment_level_df):
+    print("\n[5a] Do the two mechanisms co-occur, or are they alternatives?")
+    coexist = pd.crosstab(
+        segment_level_df["sgmntTypeCde_state"],
+        segment_level_df["objRel_state"],
+    )
+    display(coexist)
+    print(
+        "READ: if POPULATED sgmntTypeCde rows sit mostly under a non-POPULATED objRel\n"
+        "      column, the two fields are ALTERNATIVE encodings, not duplicates."
+    )
+
+    print("\n[5b] Same, Global table only:")
+    g = segment_level_df[segment_level_df["country"] == "Global"]
+    if len(g):
+        display(pd.crosstab(g["sgmntTypeCde_state"], g["objRel_state"]))
+
+    print("\n[5c] Same, country tables only (Global excluded):")
+    c = segment_level_df[segment_level_df["country"] != "Global"]
+    if len(c):
+        display(pd.crosstab(c["sgmntTypeCde_state"], c["objRel_state"]))
+
+if len(objrel_level_df):
+    print("\n[5d] sgmntTypeCde format vs plcyObjTypeCde, at objRel entry grain:")
+    display(pd.crosstab(
+        objrel_level_df["sgmntTypeCde_state"],
+        objrel_level_df["plcyObjTypeCde"].fillna("<NULL>")
+    ))
+
+
+# ============================================================
+# SECTION 6 -- Identifier format inventory
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 6 -- Identifier formats carried in objRel")
+print("=" * 80)
+
+if len(objrel_level_df):
+    print("\n[6a] plcyObjId state by object type:")
+    display(pd.crosstab(
+        objrel_level_df["plcyObjTypeCde"].fillna("<NULL>"),
+        objrel_level_df["plcyObjId_state"]
+    ))
+
+    print("\n[6b] plcyObjId FORMAT by object type:")
+    display(pd.crosstab(
+        objrel_level_df["plcyObjTypeCde"].fillna("<NULL>"),
+        objrel_level_df["plcyObjId_format"]
+    ))
+
+    print("\n[6c] cntlId state by object type:")
+    display(pd.crosstab(
+        objrel_level_df["plcyObjTypeCde"].fillna("<NULL>"),
+        objrel_level_df["cntlId_state"]
+    ))
+
+    print("\n[6d] cntlId FORMAT by object type:")
+    display(pd.crosstab(
+        objrel_level_df["plcyObjTypeCde"].fillna("<NULL>"),
+        objrel_level_df["cntlId_format"]
+    ))
+
+    print("\n[6e] Distinct identifier counts by country and type:")
+    id_inventory = (
+        objrel_level_df.groupby(["country", objrel_level_df["plcyObjTypeCde"].fillna("<NULL>")])
+        .agg(
+            entries=("objrel_index", "size"),
+            distinct_plcyObjId=("plcyObjId", lambda s: s.dropna().nunique()),
+            distinct_cntlId=("cntlId", lambda s: s.dropna().nunique()),
+        )
+        .reset_index()
+        .rename(columns={"plcyObjTypeCde": "plcyObjTypeCde"})
+    )
+    display(id_inventory)
+
+
+# ============================================================
+# SECTION 7 -- Text field profile
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 7 -- Text fields (HTML-stripped)")
+print("=" * 80)
+
+if len(policy_level_df):
+    print("\n[7a] policyText.sgmntText and policyPurpose.sgmntText, by country:")
+    text_profile = (
+        policy_level_df.groupby("country")
+        .agg(
+            policies=("policy_core_id", "nunique"),
+            policyText_median=("policyText_len", "median"),
+            policyText_empty=("policyText_len", lambda s: int((s == 0).sum())),
+            policyText_below_threshold=("policyText_len",
+                                        lambda s: int((s < MEANINGFUL_TEXT_LEN).sum())),
+            policyPurpose_median=("policyPurpose_len", "median"),
+            policyPurpose_empty=("policyPurpose_len", lambda s: int((s == 0).sum())),
+        )
+        .reset_index()
+    )
+    display(text_profile)
+
+if len(segment_level_df):
+    print(f"\n[7b] segment sgmntText, by country "
+          f"(meaningful = >= {MEANINGFUL_TEXT_LEN} chars after HTML stripping):")
+    seg_text_profile = (
+        segment_level_df.groupby("country")
+        .agg(
+            segments=("segment_index", "size"),
+            median_len=("segment_text_len", "median"),
+            mean_len=("segment_text_len", "mean"),
+            empty_segments=("segment_text_len", lambda s: int((s == 0).sum())),
+            below_threshold=("segment_text_meaningful", lambda s: int((~s).sum())),
+            meaningful=("segment_text_meaningful", "sum"),
+        )
+        .reset_index()
+    )
+    seg_text_profile["mean_len"] = seg_text_profile["mean_len"].round(1)
+    seg_text_profile["meaningful_pct"] = (
+        seg_text_profile["meaningful"] / seg_text_profile["segments"] * 100
+    ).round(2)
+    display(seg_text_profile.sort_values("meaningful_pct"))
+    print(
+        "\nNOTE: 'below_threshold' exposes the whitespace-placeholder problem that a\n"
+        "      naive length>0 check hides. Compare 'meaningful_pct' against the\n"
+        "      headline '100% segments with text' figure from the earlier EDA."
+    )
+
+    print("\n[7c] Segment text length buckets:")
+    bins = [-1, 0, MEANINGFUL_TEXT_LEN - 1, 100, 500, 2000, np.inf]
+    labels = ["empty", f"trivial(<{MEANINGFUL_TEXT_LEN})", "very_short(<100)",
+              "short(100-500)", "fair(500-2000)", "long(>2000)"]
+    segment_level_df["text_bucket"] = pd.cut(
+        segment_level_df["segment_text_len"], bins=bins, labels=labels
+    )
+    display(pd.crosstab(segment_level_df["country"], segment_level_df["text_bucket"]))
+
+
+# ============================================================
+# SECTION 8 -- Export
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 8 -- Export")
+print("=" * 80)
+
+output_path = "GPPS_Comprehensive_EDA.xlsx"
+
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    load_status_df.to_excel(writer, sheet_name="Load Status", index=False)
+    if len(policy_level_df):
+        table_overview.to_excel(writer, sheet_name="Table Overview", index=False)
+    if len(segment_level_df):
+        seg_objrel_state.to_excel(writer, sheet_name="objRel State by Country")
+        sgmnt_state_tab.to_excel(writer, sheet_name="sgmntTypeCde State")
+        fmt_tab.to_excel(writer, sheet_name="sgmntTypeCde Formats")
+    if len(objrel_level_df):
+        objtype_state.to_excel(writer, sheet_name="ObjTypeCde Null vs Pop")
+        value_dist.to_excel(writer, sheet_name="ObjTypeCde Values")
+    if len(country_policy_objtype):
+        country_policy_objtype.to_excel(writer, sheet_name="Country-Policy-ObjType", index=False)
+    if len(policy_level_df):
+        policy_objtype_wide.to_excel(writer, sheet_name="Policy ObjType Wide", index=False)
+        policy_coverage.to_excel(writer, sheet_name="Policy Coverage")
+        text_profile.to_excel(writer, sheet_name="Text Profile Policy", index=False)
+    if len(segment_level_df):
+        seg_text_profile.to_excel(writer, sheet_name="Text Profile Segment", index=False)
+
+print(f"\nWritten to: {output_path}")
+
+print(
+    "\nBase frames left in memory for ad-hoc slicing:\n"
+    "  policy_level_df        -- one row per policy/version\n"
+    "  segment_level_df       -- one row per segment\n"
+    "  objrel_level_df        -- one row per objRel entry\n"
+    "  country_policy_objtype -- country x policy x object type (long)\n"
+    "  policy_objtype_wide    -- one row per policy, one column per object type"
+)
