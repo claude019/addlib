@@ -1,0 +1,487 @@
+# ============================================================
+# GPPS -- Two checks
+#
+#   PART 1: Duplicate policies across tables, by policy_core_id
+#   PART 2: Discover ALL text fields in the JSON (recursive walk),
+#           so we can see what else is usable beyond the fields
+#           already on the keep-list
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 400)
+pd.set_option("display.max_colwidth", 120)
+
+
+COUNTRY_TABLES = {
+    "Global": "aa_hsbc_gpps_gpps_policy",
+    "Algeria": "dz_hsbc_gpps_gpps_policy",
+    "Australia": "au_hsbc_gpps_gpps_policy",
+    "Bahrain": "bh_hsbc_gpps_gpps_policy",
+    "Bangladesh": "bd_hsbc_gpps_gpps_policy",
+    "Brazil": "br_hsbc_gpps_gpps_policy",
+    "Canada": "ca_hsbc_gpps_gpps_policy",
+    "China": "cn_hsbc_gpps_gpps_policy",
+    "Hong Kong": "hk_hsbc_gpps_gpps_policy",
+    "India": "in_hsbc_gpps_gpps_policy",
+    "Indonesia": "id_hsbc_gpps_gpps_policy",
+    "Japan": "jp_hsbc_gpps_gpps_policy",
+    "Korea, Republic of (South)": "kr_hsbc_gpps_gpps_policy",
+    "New Zealand": "nz_hsbc_gpps_gpps_policy",
+    "Philippines": "ph_hsbc_gpps_gpps_policy",
+    "Qatar": "qa_hsbc_gpps_gpps_policy",
+    "Singapore": "sg_hsbc_gpps_gpps_policy",
+    "Taiwan": "tw_hsbc_gpps_gpps_policy",
+    "Thailand": "th_hsbc_gpps_gpps_policy",
+    "United Arab Emirates": "ae_hsbc_gpps_gpps_policy",
+    "United Kingdom": "gb_hsbc_gpps_gpps_policy",
+    "United States of America": "us_hsbc_gpps_gpps_policy",
+    "Vietnam": "vn_hsbc_gpps_gpps_policy",
+    "South Africa": "za_hsbc_gpps_gpps_policy",
+}
+
+MEANINGFUL_LEN = 20  # chars after HTML stripping
+
+# Fields already on the agreed keep-list, so Part 2 can flag what's NEW
+EXISTING_KEEP_LIST = {
+    "policyTitle",
+    "policyText.sgmntText",
+    "policyPurpose.sgmntText",
+    "policyApplication.segment[].sgmntText",
+    "policyApplication.termDefin[].termDefinText",
+    "policyRiskTypePrimary",
+    "policyApplication.riskTxnmyL2Text",
+    "region",
+    "policyDocType",
+}
+
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def load_current_version(table_short_name):
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table_short_name}"
+    query = f"SELECT policy_core_id, version_num, json_data FROM `{full_table}`"
+    df = bq_client.query(query).to_dataframe()
+    if len(df) == 0:
+        return df
+    latest = (df.sort_values("version_num")
+              .groupby("policy_core_id", as_index=False)
+              .tail(1).copy())
+    latest["parsed"] = latest["json_data"].apply(safe_json_loads)
+    return latest
+
+
+# ============================================================
+# Load everything once
+# ============================================================
+
+print("=" * 80)
+print("Loading tables")
+print("=" * 80)
+
+loaded = {}
+for country, table in COUNTRY_TABLES.items():
+    try:
+        df = load_current_version(table)
+    except Exception as e:
+        print(f"  {country:30s} FAILED -- {str(e)[:60]}")
+        continue
+    if len(df) == 0:
+        print(f"  {country:30s} EMPTY")
+        continue
+    loaded[country] = df
+    print(f"  {country:30s} {df['policy_core_id'].nunique()} policies")
+
+
+# ============================================================
+# PART 1 -- Duplicate policies across tables, by policy_core_id
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 1 -- policy_core_id appearing in more than one table")
+print("=" * 80)
+
+id_rows = []
+for country, df in loaded.items():
+    for _, row in df.iterrows():
+        parsed = row["parsed"]
+        id_rows.append({
+            "country": country,
+            "table": COUNTRY_TABLES[country],
+            "policy_core_id": row["policy_core_id"],
+            "version_num": row["version_num"],
+            "policyTitle": parsed.get("policyTitle") if isinstance(parsed, dict) else None,
+            "policyUniqueDocRef": parsed.get("policyUniqueDocRef") if isinstance(parsed, dict) else None,
+        })
+
+id_df = pd.DataFrame(id_rows)
+
+print(f"\nTotal policy rows across all tables: {len(id_df):,}")
+print(f"Distinct policy_core_id values:       {id_df['policy_core_id'].nunique():,}")
+
+# --- Which ids appear in multiple tables? ---
+id_summary = (
+    id_df.groupby("policy_core_id")
+    .agg(
+        n_tables=("country", "nunique"),
+        n_rows=("country", "size"),
+        countries=("country", lambda s: sorted(s.unique())),
+        distinct_titles=("policyTitle", lambda s: s.nunique(dropna=True)),
+        titles=("policyTitle", lambda s: sorted(set(x for x in s if x))),
+    )
+    .reset_index()
+)
+
+shared_ids = id_summary[id_summary["n_tables"] > 1].sort_values(
+    ["n_tables", "policy_core_id"], ascending=[False, True]
+)
+
+print(f"\npolicy_core_id values present in 2+ tables: {len(shared_ids):,}")
+print(f"Policy rows involved:                       {shared_ids['n_rows'].sum():,}")
+
+if len(shared_ids):
+    display(shared_ids.head(60))
+
+    print("\nHow many tables does a shared id span?")
+    display(
+        shared_ids["n_tables"].value_counts().sort_index()
+        .rename_axis("tables_spanned").reset_index(name="policy_core_ids")
+    )
+
+    # Same id + same title = likely genuinely the same policy
+    # Same id + different title = likely an id collision
+    shared_ids["same_title_everywhere"] = shared_ids["distinct_titles"] <= 1
+    same_title = int(shared_ids["same_title_everywhere"].sum())
+    diff_title = len(shared_ids) - same_title
+
+    print(f"\nOf the {len(shared_ids):,} shared ids:")
+    print(f"  {same_title:,} carry the SAME title in every table "
+          f"(likely genuinely the same policy)")
+    print(f"  {diff_title:,} carry DIFFERENT titles "
+          f"(likely coincidental id reuse, not duplication)")
+
+    if diff_title:
+        print("\nExamples of shared ids with conflicting titles:")
+        display(shared_ids[~shared_ids["same_title_everywhere"]].head(20))
+
+    print("\nPer-country: how many of this market's policies share an id elsewhere?")
+    shared_id_set = set(shared_ids["policy_core_id"])
+    per_country = (
+        id_df.assign(id_shared=id_df["policy_core_id"].isin(shared_id_set))
+        .groupby("country")
+        .agg(policies=("policy_core_id", "size"),
+             ids_shared_elsewhere=("id_shared", "sum"))
+        .reset_index()
+    )
+    per_country["pct_shared"] = (
+        per_country["ids_shared_elsewhere"] / per_country["policies"] * 100
+    ).round(2)
+    display(per_country.sort_values("pct_shared", ascending=False))
+
+    print("\nWhich pairs of countries overlap most on policy_core_id?")
+    pair_counts = defaultdict(int)
+    for _, r in shared_ids.iterrows():
+        cs = r["countries"]
+        for i in range(len(cs)):
+            for j in range(i + 1, len(cs)):
+                pair_counts[" <-> ".join(sorted([cs[i], cs[j]]))] += 1
+    if pair_counts:
+        display(
+            pd.DataFrame(sorted(pair_counts.items(), key=lambda x: -x[1]),
+                         columns=["country_pair", "shared_policy_core_ids"]).head(40)
+        )
+else:
+    print("  -> No policy_core_id is shared across any two tables.")
+    print("     Each market numbers its policies independently.")
+
+
+# ============================================================
+# PART 2 -- Discover ALL text fields (recursive JSON walk)
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 2 -- Full text field inventory (recursive)")
+print("=" * 80)
+
+# path -> accumulated stats
+field_stats = defaultdict(lambda: {
+    "occurrences": 0,
+    "populated": 0,
+    "lengths": [],
+    "samples": [],
+    "countries": set(),
+    "types": set(),
+    "looks_html": 0,
+})
+
+
+def walk(node, path, country):
+    """Recursively walk the JSON, recording every leaf path.
+    Lists are collapsed to '[]' so all elements aggregate together."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            walk(v, f"{path}.{k}" if path else k, country)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item, f"{path}[]", country)
+    else:
+        st = field_stats[path]
+        st["occurrences"] += 1
+        st["countries"].add(country)
+        st["types"].add(type(node).__name__)
+
+        if node is None:
+            return
+        if isinstance(node, str):
+            if not node.strip():
+                return
+            if "<" in node and ">" in node:
+                st["looks_html"] += 1
+            clean = strip_html(node)
+            if not clean:
+                return
+            st["populated"] += 1
+            st["lengths"].append(len(clean))
+            if len(st["samples"]) < 3:
+                st["samples"].append(clean[:180])
+        else:
+            st["populated"] += 1
+            st["lengths"].append(len(str(node)))
+            if len(st["samples"]) < 3:
+                st["samples"].append(str(node)[:180])
+
+
+for country, df in loaded.items():
+    for _, row in df.iterrows():
+        parsed = row["parsed"]
+        if isinstance(parsed, dict):
+            walk(parsed, "", country)
+
+# --- Build the inventory frame ---
+inventory = []
+for path, st in field_stats.items():
+    lengths = st["lengths"]
+    inventory.append({
+        "field_path": path,
+        "occurrences": st["occurrences"],
+        "populated": st["populated"],
+        "populated_pct": round(st["populated"] / st["occurrences"] * 100, 2) if st["occurrences"] else 0,
+        "countries_present": len(st["countries"]),
+        "python_types": ",".join(sorted(st["types"])),
+        "median_len": int(np.median(lengths)) if lengths else 0,
+        "mean_len": round(float(np.mean(lengths)), 1) if lengths else 0,
+        "max_len": int(np.max(lengths)) if lengths else 0,
+        "pct_meaningful": round(
+            sum(1 for L in lengths if L >= MEANINGFUL_LEN) / len(lengths) * 100, 2
+        ) if lengths else 0,
+        "html_instances": st["looks_html"],
+        "sample_1": st["samples"][0] if len(st["samples"]) > 0 else "",
+        "sample_2": st["samples"][1] if len(st["samples"]) > 1 else "",
+    })
+
+inv_df = pd.DataFrame(inventory)
+
+# Text fields = string-typed with some real length
+inv_df["is_text_field"] = (
+    inv_df["python_types"].str.contains("str") &
+    (inv_df["median_len"] >= MEANINGFUL_LEN)
+)
+inv_df["already_in_keeplist"] = inv_df["field_path"].isin(EXISTING_KEEP_LIST)
+
+print(f"\nTotal distinct field paths discovered: {len(inv_df):,}")
+print(f"Of which qualify as text fields (str, median >= {MEANINGFUL_LEN} chars): "
+      f"{int(inv_df['is_text_field'].sum()):,}")
+
+print("\n[2a] ALL text fields, ranked by usable content "
+      "(populated % x median length):")
+text_fields = inv_df[inv_df["is_text_field"]].copy()
+text_fields["usability_score"] = (
+    text_fields["populated_pct"] / 100 * text_fields["median_len"]
+).round(1)
+text_fields = text_fields.sort_values("usability_score", ascending=False)
+
+display(text_fields[[
+    "field_path", "populated_pct", "countries_present", "median_len", "mean_len",
+    "max_len", "pct_meaningful", "html_instances", "usability_score",
+    "already_in_keeplist",
+]])
+
+print("\n[2b] NEW text fields not currently on the keep-list:")
+new_fields = text_fields[~text_fields["already_in_keeplist"]]
+if len(new_fields):
+    display(new_fields[[
+        "field_path", "populated_pct", "countries_present", "median_len",
+        "pct_meaningful", "usability_score",
+    ]])
+    print("\nSample content from the top new candidates:")
+    for _, r in new_fields.head(12).iterrows():
+        print(f"\n  {r['field_path']}")
+        print(f"    populated {r['populated_pct']}% | median {r['median_len']} chars | "
+              f"present in {r['countries_present']} countries")
+        if r["sample_1"]:
+            print(f"    e.g. {r['sample_1']!r}")
+else:
+    print("  -> No text fields outside the existing keep-list.")
+
+print("\n[2c] Short / categorical string fields "
+      "(usable as metadata filters, not embedding text):")
+categorical = inv_df[
+    inv_df["python_types"].str.contains("str") &
+    (inv_df["median_len"] < MEANINGFUL_LEN) &
+    (inv_df["populated_pct"] > 20)
+].sort_values("populated_pct", ascending=False)
+display(categorical[[
+    "field_path", "populated_pct", "countries_present", "median_len",
+    "sample_1", "sample_2",
+]].head(40))
+
+print("\n[2d] Fields that are entirely or almost entirely empty "
+      "(populated < 5%) -- not worth carrying:")
+sparse = inv_df[inv_df["populated_pct"] < 5].sort_values("populated_pct")
+display(sparse[["field_path", "occurrences", "populated", "populated_pct"]].head(40))
+
+
+# ============================================================
+# PART 2e -- Per-country availability of the top text fields
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 2e -- Are the best text fields available in every market?")
+print("=" * 80)
+
+top_paths = text_fields.head(15)["field_path"].tolist()
+
+per_country_field = defaultdict(lambda: defaultdict(lambda: {"occ": 0, "pop": 0, "lens": []}))
+
+
+def walk_country(node, path, country):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            walk_country(v, f"{path}.{k}" if path else k, country)
+    elif isinstance(node, list):
+        for item in node:
+            walk_country(item, f"{path}[]", country)
+    else:
+        if path not in top_paths:
+            return
+        d = per_country_field[country][path]
+        d["occ"] += 1
+        if isinstance(node, str) and node.strip():
+            clean = strip_html(node)
+            if clean:
+                d["pop"] += 1
+                d["lens"].append(len(clean))
+
+
+for country, df in loaded.items():
+    for _, row in df.iterrows():
+        parsed = row["parsed"]
+        if isinstance(parsed, dict):
+            walk_country(parsed, "", country)
+
+avail_rows = []
+for country, paths in per_country_field.items():
+    for path, d in paths.items():
+        avail_rows.append({
+            "country": country,
+            "field_path": path,
+            "populated_pct": round(d["pop"] / d["occ"] * 100, 2) if d["occ"] else 0,
+            "median_len": int(np.median(d["lens"])) if d["lens"] else 0,
+        })
+
+avail_df = pd.DataFrame(avail_rows)
+
+if len(avail_df):
+    print("\nPopulated % by country and field:")
+    display(avail_df.pivot_table(
+        index="country", columns="field_path", values="populated_pct", fill_value=0
+    ))
+
+    print("\nMedian length by country and field:")
+    display(avail_df.pivot_table(
+        index="country", columns="field_path", values="median_len", fill_value=0
+    ))
+    print(
+        "\nREAD: a field with high global usability but 0% in several markets is not\n"
+        "      safe as a primary embedding source -- those markets would produce\n"
+        "      empty or degraded vectors."
+    )
+
+
+# ============================================================
+# Export
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("Export")
+print("=" * 80)
+
+output_path = "GPPS_PolicyId_Dupes_and_Text_Fields.xlsx"
+
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    id_df.to_excel(writer, sheet_name="All Policy Ids", index=False)
+    if len(shared_ids):
+        shared_ids.astype(str).to_excel(writer, sheet_name="Shared policy_core_ids", index=False)
+        per_country.to_excel(writer, sheet_name="Id Sharing by Country", index=False)
+    inv_df.drop(columns=["sample_1", "sample_2"]).to_excel(
+        writer, sheet_name="Full Field Inventory", index=False)
+    text_fields.to_excel(writer, sheet_name="Text Fields Ranked", index=False)
+    if len(new_fields):
+        new_fields.to_excel(writer, sheet_name="New Text Candidates", index=False)
+    categorical.to_excel(writer, sheet_name="Categorical Fields", index=False)
+    if len(avail_df):
+        avail_df.pivot_table(index="country", columns="field_path",
+                             values="populated_pct", fill_value=0).to_excel(
+            writer, sheet_name="Field Availability")
+
+print(f"\nWritten to: {output_path}")
+print(
+    "\nFrames in memory:\n"
+    "  id_df        -- every policy row with its id and title\n"
+    "  shared_ids   -- policy_core_ids appearing in 2+ tables\n"
+    "  inv_df       -- every field path discovered, with fill/length stats\n"
+    "  text_fields  -- text-qualifying fields ranked by usability\n"
+    "  new_fields   -- text fields not currently on the keep-list"
+)
