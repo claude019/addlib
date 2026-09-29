@@ -1,0 +1,516 @@
+# ============================================================
+# GPPS -- Risk Taxonomy at DISTINCT POLICY ID level, per country
+#
+# One row per (country, policy_core_id). objRel-level taxonomy is
+# rolled UP to the policy: a policy counts as classified at L1 if
+# ANY of its objRel entries carries an L1 value.
+#
+# Columns produced per policy:
+#   - policy-grain sources : policyRiskTypePrimary,
+#                            policyApplication.riskTxnmyL2Text,
+#                            multiRiskDetls[].risk
+#   - rolled-up objRel     : any/all L1, L2, L3 + distinct values
+#   - resolved taxonomy    : best available value per level,
+#                            with the source it came from
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+import numpy as np
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 500)
+pd.set_option("display.max_colwidth", 120)
+
+
+COUNTRY_TABLES = {
+    "Global": "aa_hsbc_gpps_gpps_policy",
+    "Algeria": "dz_hsbc_gpps_gpps_policy",
+    "Australia": "au_hsbc_gpps_gpps_policy",
+    "Bahrain": "bh_hsbc_gpps_gpps_policy",
+    "Bangladesh": "bd_hsbc_gpps_gpps_policy",
+    "Brazil": "br_hsbc_gpps_gpps_policy",
+    "Canada": "ca_hsbc_gpps_gpps_policy",
+    "China": "cn_hsbc_gpps_gpps_policy",
+    "Hong Kong": "hk_hsbc_gpps_gpps_policy",
+    "India": "in_hsbc_gpps_gpps_policy",
+    "Indonesia": "id_hsbc_gpps_gpps_policy",
+    "Japan": "jp_hsbc_gpps_gpps_policy",
+    "Korea, Republic of (South)": "kr_hsbc_gpps_gpps_policy",
+    "New Zealand": "nz_hsbc_gpps_gpps_policy",
+    "Philippines": "ph_hsbc_gpps_gpps_policy",
+    "Qatar": "qa_hsbc_gpps_gpps_policy",
+    "Singapore": "sg_hsbc_gpps_gpps_policy",
+    "Taiwan": "tw_hsbc_gpps_gpps_policy",
+    "Thailand": "th_hsbc_gpps_gpps_policy",
+    "United Arab Emirates": "ae_hsbc_gpps_gpps_policy",
+    "United Kingdom": "gb_hsbc_gpps_gpps_policy",
+    "United States of America": "us_hsbc_gpps_gpps_policy",
+    "Vietnam": "vn_hsbc_gpps_gpps_policy",
+    "South Africa": "za_hsbc_gpps_gpps_policy",
+}
+
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def clean_val(v):
+    """Return a stripped string, or None if not meaningfully populated."""
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else None
+    return str(v)
+
+
+def load_current_version(table_short_name):
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table_short_name}"
+    query = f"SELECT policy_core_id, version_num, json_data FROM `{full_table}`"
+    df = bq_client.query(query).to_dataframe()
+    if len(df) == 0:
+        return df
+    latest = (df.sort_values("version_num")
+              .groupby("policy_core_id", as_index=False)
+              .tail(1).copy())
+    latest["parsed"] = latest["json_data"].apply(safe_json_loads)
+    return latest
+
+
+# ============================================================
+# Build the policy-grain frame
+# ============================================================
+
+print("=" * 80)
+print("Building policy-grain risk taxonomy frame")
+print("=" * 80)
+
+rows = []
+
+for country, table in COUNTRY_TABLES.items():
+    try:
+        df = load_current_version(table)
+    except Exception as e:
+        print(f"  {country:30s} FAILED -- {str(e)[:60]}")
+        continue
+    if len(df) == 0:
+        print(f"  {country:30s} EMPTY")
+        continue
+
+    for _, row in df.iterrows():
+        parsed = row["parsed"]
+        if not isinstance(parsed, dict):
+            continue
+        pid = row["policy_core_id"]
+
+        # ---- policy-grain sources ----
+        risk_primary = clean_val(parsed.get("policyRiskTypePrimary"))
+        risk_l2_policy = clean_val(get_nested(parsed, "policyApplication", "riskTxnmyL2Text"))
+
+        multi = get_nested(parsed, "policyApplication", "multiRiskDetls")
+        multi = multi if isinstance(multi, list) else []
+        multi_risks = sorted({
+            clean_val(m.get("risk")) for m in multi
+            if isinstance(m, dict) and clean_val(m.get("risk"))
+        })
+
+        # ---- roll objRel taxonomy UP to the policy ----
+        segments = get_nested(parsed, "policyApplication", "segment")
+        segments = segments if isinstance(segments, list) else []
+
+        objrel_total = 0
+        objrel_with_l1 = 0
+        objrel_with_l2 = 0
+        objrel_with_l3 = 0
+        l1_vals, l2_vals, l3_vals = set(), set(), set()
+        objtypes = set()
+
+        for seg in segments:
+            if not isinstance(seg, dict):
+                continue
+            obj_rel = seg.get("objRel")
+            if not isinstance(obj_rel, list):
+                continue
+            for obj in obj_rel:
+                if not isinstance(obj, dict):
+                    continue
+                objrel_total += 1
+                ot = clean_val(obj.get("plcyObjTypeCde"))
+                if ot:
+                    objtypes.add(ot)
+
+                v1 = clean_val(obj.get("riskTxnmyL1Text"))
+                v2 = clean_val(obj.get("riskTxnmyL2Text"))
+                v3 = clean_val(obj.get("riskTxnmyL3Text"))
+                if v1:
+                    objrel_with_l1 += 1
+                    l1_vals.add(v1)
+                if v2:
+                    objrel_with_l2 += 1
+                    l2_vals.add(v2)
+                if v3:
+                    objrel_with_l3 += 1
+                    l3_vals.add(v3)
+
+        # ---- resolve a single taxonomy per level, with attribution ----
+        # L1 preference: objRel L1  ->  policyRiskTypePrimary  ->  multiRiskDetls
+        if l1_vals:
+            resolved_l1, l1_source = sorted(l1_vals)[0], "objRel.riskTxnmyL1Text"
+        elif risk_primary:
+            resolved_l1, l1_source = risk_primary, "policyRiskTypePrimary"
+        elif multi_risks:
+            resolved_l1, l1_source = multi_risks[0], "multiRiskDetls.risk"
+        else:
+            resolved_l1, l1_source = None, None
+
+        # L2 preference: objRel L2  ->  policyApplication.riskTxnmyL2Text
+        if l2_vals:
+            resolved_l2, l2_source = sorted(l2_vals)[0], "objRel.riskTxnmyL2Text"
+        elif risk_l2_policy:
+            resolved_l2, l2_source = risk_l2_policy, "policyApplication.riskTxnmyL2Text"
+        else:
+            resolved_l2, l2_source = None, None
+
+        resolved_l3 = sorted(l3_vals)[0] if l3_vals else None
+        l3_source = "objRel.riskTxnmyL3Text" if l3_vals else None
+
+        rows.append({
+            "country": country,
+            "table": table,
+            "policy_core_id": pid,
+            "version_num": row["version_num"],
+            "policyTitle": parsed.get("policyTitle"),
+
+            # policy-grain sources
+            "policyRiskTypePrimary": risk_primary,
+            "riskTxnmyL2Text_policy": risk_l2_policy,
+            "multiRiskDetls_risks": "; ".join(multi_risks) if multi_risks else None,
+            "multiRiskDetls_n_distinct": len(multi_risks),
+
+            # objRel rollup
+            "n_segments": len(segments),
+            "n_objrel_entries": objrel_total,
+            "objrel_types": "; ".join(sorted(objtypes)) if objtypes else None,
+            "objrel_with_L1": objrel_with_l1,
+            "objrel_with_L2": objrel_with_l2,
+            "objrel_with_L3": objrel_with_l3,
+            "policy_has_L1": len(l1_vals) > 0,
+            "policy_has_L2": len(l2_vals) > 0,
+            "policy_has_L3": len(l3_vals) > 0,
+            "policy_has_any_objrel_txnmy": bool(l1_vals or l2_vals or l3_vals),
+            "L1_distinct_values": len(l1_vals),
+            "L2_distinct_values": len(l2_vals),
+            "L3_distinct_values": len(l3_vals),
+            "L1_values": "; ".join(sorted(l1_vals)) if l1_vals else None,
+            "L2_values": "; ".join(sorted(l2_vals)) if l2_vals else None,
+            "L3_values": "; ".join(sorted(l3_vals)) if l3_vals else None,
+
+            # resolved
+            "resolved_L1": resolved_l1,
+            "resolved_L1_source": l1_source,
+            "resolved_L2": resolved_l2,
+            "resolved_L2_source": l2_source,
+            "resolved_L3": resolved_l3,
+            "resolved_L3_source": l3_source,
+            "has_any_risk_classification": bool(resolved_l1 or resolved_l2 or resolved_l3),
+        })
+
+    print(f"  {country:30s} {df['policy_core_id'].nunique()} policies")
+
+policy_taxonomy_df = pd.DataFrame(rows)
+
+print(f"\nPolicy-grain frame built: {len(policy_taxonomy_df):,} distinct policies "
+      f"across {policy_taxonomy_df['country'].nunique()} countries")
+
+
+# ============================================================
+# SECTION 1 -- The main table: one row per policy
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 1 -- Risk taxonomy per distinct policy id, per country")
+print("=" * 80)
+
+display_cols = [
+    "country", "policy_core_id", "policyTitle",
+    "policyRiskTypePrimary", "riskTxnmyL2Text_policy", "multiRiskDetls_risks",
+    "n_objrel_entries", "objrel_with_L1", "objrel_with_L2", "objrel_with_L3",
+    "L1_values", "L2_values", "L3_values",
+    "resolved_L1", "resolved_L2", "resolved_L3",
+]
+
+display(policy_taxonomy_df[display_cols].sort_values(["country", "policy_core_id"]))
+
+
+# ============================================================
+# SECTION 2 -- Coverage per country, at POLICY level
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 2 -- Policy-level taxonomy coverage by country")
+print("=" * 80)
+
+coverage = (
+    policy_taxonomy_df.groupby("country")
+    .agg(
+        policies=("policy_core_id", "nunique"),
+        with_policyRiskTypePrimary=("policyRiskTypePrimary", lambda s: int(s.notna().sum())),
+        with_riskTxnmyL2_policy=("riskTxnmyL2Text_policy", lambda s: int(s.notna().sum())),
+        with_multiRiskDetls=("multiRiskDetls_risks", lambda s: int(s.notna().sum())),
+        with_objrel_L1=("policy_has_L1", "sum"),
+        with_objrel_L2=("policy_has_L2", "sum"),
+        with_objrel_L3=("policy_has_L3", "sum"),
+        with_any_classification=("has_any_risk_classification", "sum"),
+    )
+    .reset_index()
+)
+
+for c in ["with_policyRiskTypePrimary", "with_riskTxnmyL2_policy", "with_multiRiskDetls",
+          "with_objrel_L1", "with_objrel_L2", "with_objrel_L3", "with_any_classification"]:
+    coverage[f"{c}_pct"] = (coverage[c] / coverage["policies"] * 100).round(1)
+
+print("\nCounts:")
+display(coverage[[
+    "country", "policies", "with_policyRiskTypePrimary", "with_riskTxnmyL2_policy",
+    "with_multiRiskDetls", "with_objrel_L1", "with_objrel_L2", "with_objrel_L3",
+    "with_any_classification",
+]])
+
+print("\nPercentages:")
+display(coverage[[
+    "country", "policies",
+    "with_policyRiskTypePrimary_pct", "with_riskTxnmyL2_policy_pct",
+    "with_multiRiskDetls_pct", "with_objrel_L1_pct", "with_objrel_L2_pct",
+    "with_objrel_L3_pct", "with_any_classification_pct",
+]].sort_values("with_any_classification_pct"))
+
+total_pol = len(policy_taxonomy_df)
+print(f"\nOVERALL across {total_pol:,} policies:")
+for label, col in [
+    ("policyRiskTypePrimary", "policyRiskTypePrimary"),
+    ("policyApplication.riskTxnmyL2Text", "riskTxnmyL2Text_policy"),
+    ("multiRiskDetls[].risk", "multiRiskDetls_risks"),
+]:
+    n = int(policy_taxonomy_df[col].notna().sum())
+    print(f"  {label:42s} {n:,} policies ({n / total_pol * 100:.1f}%)")
+for label, col in [
+    ("objRel L1 (rolled up)", "policy_has_L1"),
+    ("objRel L2 (rolled up)", "policy_has_L2"),
+    ("objRel L3 (rolled up)", "policy_has_L3"),
+    ("ANY risk classification", "has_any_risk_classification"),
+]:
+    n = int(policy_taxonomy_df[col].sum())
+    print(f"  {label:42s} {n:,} policies ({n / total_pol * 100:.1f}%)")
+
+
+# ============================================================
+# SECTION 3 -- objRel entry-level vs policy-level rollup
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 3 -- Why the rollup matters: entry-level vs policy-level")
+print("=" * 80)
+
+rollup_compare = (
+    policy_taxonomy_df.groupby("country")
+    .agg(
+        policies=("policy_core_id", "nunique"),
+        total_objrel=("n_objrel_entries", "sum"),
+        objrel_with_L1=("objrel_with_L1", "sum"),
+        policies_with_L1=("policy_has_L1", "sum"),
+    )
+    .reset_index()
+)
+rollup_compare["entry_level_L1_pct"] = (
+    rollup_compare["objrel_with_L1"] / rollup_compare["total_objrel"].replace(0, np.nan) * 100
+).round(1)
+rollup_compare["policy_level_L1_pct"] = (
+    rollup_compare["policies_with_L1"] / rollup_compare["policies"] * 100
+).round(1)
+display(rollup_compare)
+
+print(
+    "\nREAD: entry-level % understates coverage. A policy with 30 objRel entries where\n"
+    "      only 3 carry L1 still IS classifiable at L1. The policy-level column is the\n"
+    "      one that matters for linkage."
+)
+
+
+# ============================================================
+# SECTION 4 -- Which source resolves each policy?
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 4 -- Source attribution for the resolved taxonomy")
+print("=" * 80)
+
+print("\nL1 resolved from:")
+display(
+    policy_taxonomy_df["resolved_L1_source"].fillna("<unclassified>")
+    .value_counts().rename_axis("source").reset_index(name="policies")
+)
+
+print("\nL2 resolved from:")
+display(
+    policy_taxonomy_df["resolved_L2_source"].fillna("<unclassified>")
+    .value_counts().rename_axis("source").reset_index(name="policies")
+)
+
+print("\nL1 source by country:")
+display(pd.crosstab(
+    policy_taxonomy_df["country"],
+    policy_taxonomy_df["resolved_L1_source"].fillna("<unclassified>")
+))
+
+
+# ============================================================
+# SECTION 5 -- Taxonomy value inventory at policy grain
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 5 -- Distinct taxonomy values (policy grain)")
+print("=" * 80)
+
+print("\n[5a] resolved_L1 values:")
+display(
+    policy_taxonomy_df["resolved_L1"].dropna()
+    .value_counts().rename_axis("resolved_L1").reset_index(name="policies")
+)
+
+print("\n[5b] resolved_L2 values:")
+display(
+    policy_taxonomy_df["resolved_L2"].dropna()
+    .value_counts().rename_axis("resolved_L2").reset_index(name="policies")
+)
+
+print("\n[5c] resolved_L3 values:")
+display(
+    policy_taxonomy_df["resolved_L3"].dropna()
+    .value_counts().rename_axis("resolved_L3").reset_index(name="policies")
+)
+
+print("\n[5d] L1 -> L2 -> L3 hierarchy recovered at policy grain:")
+hier = (
+    policy_taxonomy_df[policy_taxonomy_df["resolved_L1"].notna()]
+    .groupby(["resolved_L1", "resolved_L2", "resolved_L3"], dropna=False)
+    .agg(policies=("policy_core_id", "nunique"),
+         countries=("country", lambda s: "; ".join(sorted(s.unique()))))
+    .reset_index()
+    .sort_values(["resolved_L1", "resolved_L2", "resolved_L3"])
+)
+display(hier)
+
+
+# ============================================================
+# SECTION 6 -- Policies carrying MULTIPLE taxonomy values
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 6 -- Policies with more than one distinct value per level")
+print("=" * 80)
+
+multi_tax = policy_taxonomy_df[
+    (policy_taxonomy_df["L1_distinct_values"] > 1) |
+    (policy_taxonomy_df["L2_distinct_values"] > 1) |
+    (policy_taxonomy_df["L3_distinct_values"] > 1)
+]
+print(f"\nPolicies where objRel entries disagree on taxonomy: {len(multi_tax):,}")
+if len(multi_tax):
+    display(multi_tax[[
+        "country", "policy_core_id", "policyTitle",
+        "L1_distinct_values", "L1_values",
+        "L2_distinct_values", "L2_values",
+        "L3_distinct_values", "L3_values",
+    ]].head(40))
+    print(
+        "\nNOTE: 'resolved_*' takes the alphabetically-first value for these. If a\n"
+        "      policy genuinely spans multiple risks, a one-value-per-policy model\n"
+        "      loses information -- consider a multi-valued risk field instead."
+    )
+
+
+# ============================================================
+# SECTION 7 -- Unclassified policies
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 7 -- Policies with NO risk classification from any source")
+print("=" * 80)
+
+unclassified = policy_taxonomy_df[~policy_taxonomy_df["has_any_risk_classification"]]
+print(f"\nUnclassified policies: {len(unclassified):,} of {total_pol:,} "
+      f"({len(unclassified) / total_pol * 100:.1f}%)")
+if len(unclassified):
+    display(unclassified[[
+        "country", "policy_core_id", "policyTitle", "n_objrel_entries", "objrel_types",
+    ]])
+    print("\nBy country:")
+    display(
+        unclassified.groupby("country")
+        .agg(unclassified_policies=("policy_core_id", "nunique"))
+        .reset_index()
+    )
+
+
+# ============================================================
+# Export
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("Export")
+print("=" * 80)
+
+output_path = "GPPS_Risk_Taxonomy_By_Policy.xlsx"
+
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    policy_taxonomy_df.to_excel(writer, sheet_name="Taxonomy by Policy", index=False)
+    coverage.to_excel(writer, sheet_name="Coverage by Country", index=False)
+    rollup_compare.to_excel(writer, sheet_name="Entry vs Policy Level", index=False)
+    hier.to_excel(writer, sheet_name="L1-L2-L3 Hierarchy", index=False)
+    if len(multi_tax):
+        multi_tax.to_excel(writer, sheet_name="Multi-Value Policies", index=False)
+    if len(unclassified):
+        unclassified.to_excel(writer, sheet_name="Unclassified Policies", index=False)
+
+print(f"\nWritten to: {output_path}")
+print(
+    "\nMain frame in memory: policy_taxonomy_df "
+    f"({len(policy_taxonomy_df):,} rows, one per country + policy_core_id)"
+)
