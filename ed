@@ -782,3 +782,289 @@ print(
     "a collapsible tree (click to expand/collapse nodes, matching the structure\n"
     "you've been inspecting manually)."
 )
+
+
+
+
+
+
+# ============================================================
+# GPPS -- JSON structure diagram
+#
+# Draws the CONTAINER structure of a policy JSON -- which objects
+# and arrays nest inside which -- as a left-to-right tree diagram
+# using plain matplotlib (no graphviz / system binary required).
+#
+# Design choice: only dict/list (container) values become their
+# own connected boxes. Scalar leaf fields are NOT drawn as separate
+# nodes (that would mean 80+ boxes and be unreadable) -- instead
+# each container's own leaf field names are listed as compact text
+# inside its box. This matches "how does one object fold into its
+# sub-objects" rather than a full field-by-field diagram.
+#
+# Since different policies populate different optional fields
+# (objRel sometimes null, sometimes a list, etc.), several sample
+# policies are MERGED into one structural union before drawing, so
+# the diagram reflects the fullest schema observed, not just
+# whichever single record happened to be sampled.
+# ============================================================
+
+import json
+import functools
+import textwrap
+import matplotlib.pyplot as plt
+from matplotlib.lines import Line2D
+
+try:
+    bq_client
+except NameError:
+    import os
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+
+# ============================================================
+# Step 1 -- Get a handful of sample policy objects to merge
+#
+# Reuses `viewer_lookup` from GPPS_Master_EDA.py if it's still in
+# your session. Falls back to a fresh small query otherwise.
+# ============================================================
+
+def get_sample_jsons(n=12):
+    try:
+        viewer_lookup  # noqa: F821
+        samples = []
+        for country, policies in viewer_lookup.items():  # noqa: F821
+            for pid, parsed in policies.items():
+                if isinstance(parsed, dict) and not parsed.get("_parse_error"):
+                    samples.append(parsed)
+                    break  # one per country is enough structural diversity
+            if len(samples) >= n:
+                break
+        if samples:
+            print(f"Using {len(samples)} sample(s) from viewer_lookup already in memory.")
+            return samples
+    except NameError:
+        pass
+
+    print("viewer_lookup not found -- querying a fresh sample from the Global table.")
+    query = f"""
+        SELECT json_data
+        FROM `{DATA_PROJECT}.{DATASET}.aa_hsbc_gpps_gpps_policy`
+        LIMIT {n}
+    """
+    df = bq_client.query(query).to_dataframe()
+    samples = []
+    for x in df["json_data"]:
+        try:
+            samples.append(json.loads(x) if isinstance(x, str) else x)
+        except Exception:
+            continue
+    return samples
+
+
+# ============================================================
+# Step 2 -- Merge samples into one structural union
+# ============================================================
+
+def merge_json(a, b):
+    """Merge two JSON values so every field seen in either shows up
+    in the result (handles fields that are null/absent in some
+    policies but populated in others)."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        merged = dict(a)
+        for k, v in b.items():
+            merged[k] = merge_json(merged[k], v) if k in merged else v
+        return merged
+    if isinstance(a, list) and isinstance(b, list):
+        if not a:
+            return b
+        if not b:
+            return a
+        return [merge_json(a[0], b[0])]
+    if a is None:
+        return b
+    if isinstance(a, list) and b is None:
+        return a
+    return a
+
+
+# ============================================================
+# Step 3 -- Build a tree of containers only
+# ============================================================
+
+def build_container_tree(node, name="root", max_leaf_fields_shown=8):
+    """Returns {name, type, children:[...], leaf_fields:[...]} where
+    children are only the dict/list sub-structures, and leaf_fields
+    are the scalar (or scalar-list) keys at this level, shown as text
+    rather than as separate connected boxes."""
+    if isinstance(node, list):
+        if not node:
+            return {"name": name, "type": "array[0]", "children": [], "leaf_fields": []}
+        inner = build_container_tree(node[0], name, max_leaf_fields_shown)
+        inner["type"] = f"array -> {inner['type']}"
+        return inner
+
+    if isinstance(node, dict):
+        children, leaf_fields = [], []
+        for k, v in node.items():
+            if isinstance(v, dict):
+                children.append(build_container_tree(v, k, max_leaf_fields_shown))
+            elif isinstance(v, list) and v and isinstance(v[0], (dict, list)):
+                children.append(build_container_tree(v, k, max_leaf_fields_shown))
+            elif isinstance(v, list):
+                leaf_fields.append(f"{k} (list)")
+            else:
+                leaf_fields.append(k)
+        return {"name": name, "type": "object", "children": children, "leaf_fields": leaf_fields}
+
+    return {"name": name, "type": type(node).__name__, "children": [], "leaf_fields": []}
+
+
+# ============================================================
+# Step 4 -- Layout (standard tree layout: x = depth, y = averaged
+# position of children, computed bottom-up)
+# ============================================================
+
+def compute_layout(tree, depth=0, y_counter=None, positions=None):
+    if y_counter is None:
+        y_counter = [0]
+    if positions is None:
+        positions = {}
+
+    if not tree["children"]:
+        y = y_counter[0]
+        y_counter[0] += 1
+    else:
+        child_ys = [
+            compute_layout(c, depth + 1, y_counter, positions)
+            for c in tree["children"]
+        ]
+        y = sum(child_ys) / len(child_ys)
+
+    positions[id(tree)] = (depth, y)
+    return y
+
+
+# ============================================================
+# Step 5 -- Draw
+# ============================================================
+
+TYPE_COLORS = {
+    "object": "#AED6F1",       # light blue
+    "array": "#F9E79F",        # light yellow
+}
+
+
+def _box_color(node_type):
+    return TYPE_COLORS["array"] if node_type.startswith("array") else TYPE_COLORS["object"]
+
+
+def draw_container_tree(tree, title="GPPS Policy JSON -- Container Structure",
+                        max_leaf_fields_shown=8, wrap_width=26):
+    positions = {}
+    compute_layout(tree, 0, [0], positions)
+
+    max_depth = max(p[0] for p in positions.values())
+    max_y = max(p[1] for p in positions.values())
+
+    x_gap = 4.6
+    y_gap = 1.0
+    fig_w = max(14, (max_depth + 1) * x_gap * 0.55)
+    fig_h = max(6, (max_y + 2) * y_gap * 0.45)
+
+    fig, ax = plt.subplots(figsize=(fig_w, fig_h))
+
+    def node_lines(node):
+        header = f"{node['name']}"
+        subheader = f"({node['type']})"
+        lines = [header, subheader]
+        if node["leaf_fields"]:
+            shown = node["leaf_fields"][:max_leaf_fields_shown]
+            extra = len(node["leaf_fields"]) - len(shown)
+            field_text = ", ".join(shown) + (f"  +{extra} more" if extra > 0 else "")
+            lines.append("")
+            lines.extend(textwrap.wrap(field_text, width=wrap_width) or [""])
+        return "\n".join(lines)
+
+    def draw(node, parent_xy=None):
+        depth, y = positions[id(node)]
+        x = depth * x_gap
+        y_plot = y * y_gap
+
+        if parent_xy is not None:
+            px, py = parent_xy
+            ax.add_line(Line2D([px, x], [py, y_plot], color="#888888",
+                               linewidth=1.0, zorder=1))
+
+        ax.text(
+            x, y_plot, node_lines(node),
+            fontsize=7.5, ha="left", va="center", zorder=2,
+            bbox=dict(boxstyle="round,pad=0.4", facecolor=_box_color(node["type"]),
+                      edgecolor="#555555", linewidth=0.8),
+        )
+
+        for child in node["children"]:
+            draw(child, (x + 0.05, y_plot))
+
+    draw(tree)
+
+    ax.set_xlim(-0.5, (max_depth + 1) * x_gap)
+    ax.set_ylim(-1, max_y * y_gap + 1)
+    ax.invert_yaxis()
+    ax.axis("off")
+    ax.set_title(title, fontsize=13, fontweight="bold", loc="left")
+
+    legend_elems = [
+        plt.Rectangle((0, 0), 1, 1, facecolor=TYPE_COLORS["object"], edgecolor="#555555",
+                      label="object (dict)"),
+        plt.Rectangle((0, 0), 1, 1, facecolor=TYPE_COLORS["array"], edgecolor="#555555",
+                      label="array (list)"),
+    ]
+    ax.legend(handles=legend_elems, loc="lower right", fontsize=8, framealpha=0.9)
+
+    plt.tight_layout()
+    plt.show()
+
+
+# ============================================================
+# Run it
+# ============================================================
+
+samples = get_sample_jsons(n=12)
+print(f"\nMerging {len(samples)} sample policy object(s) into one structural union...")
+
+merged = functools.reduce(merge_json, samples) if samples else {}
+
+tree = build_container_tree(merged, name="policy")
+
+n_containers = 1 + sum(1 for _ in [])  # placeholder, real count below
+
+
+def count_nodes(node):
+    return 1 + sum(count_nodes(c) for c in node["children"])
+
+
+print(f"Container nodes in the merged structure: {count_nodes(tree)}")
+print("Drawing...")
+
+draw_container_tree(tree, title="GPPS Policy JSON -- Container Structure (merged sample)")
+
+
+# ============================================================
+# Optional: draw just ONE specific policy's structure instead of
+# the merged union -- uncomment and point at a real country/id
+# ============================================================
+
+# single = viewer_lookup["United States of America"][some_policy_core_id]
+# single_tree = build_container_tree(single, name="policy")
+# draw_container_tree(single_tree, title="US policy <id> -- Container Structure")
