@@ -1,0 +1,71 @@
+
+Purpose and context
+This note records Naresh's walkthrough of the RegMap data model, held 30 Sep 2026 and recorded as "RegMap_Data_Understanding". The goal was to understand how regulation, RGL/RSM, risk taxonomy, library risks, library controls, risk instances and control instances connect logically, since RegMap shows them flattened in one row.
+How a regulation record works
+Every regulation in RegMap moves through six stages: Draft, Draft Pending Approval, Draft Approved, Published, Retirement Pending Approval and Retired. On creation the user fills in the title, jurisdiction, regulator, record administrator and control mapping approach, along with the effective and review dates. The L1, L2 and L3 risk taxonomy is chosen on the RTCL tab of the summary record, while applicability and risk and controls each have their own tab.
+Choosing the Detailed approach carries extra work: the Risk Steward population has to keep the control instance mapping up to date, because control owners maintain their own controls.
+Regulation and regulator
+When a regulation is created, the user picks the jurisdiction first, and that unlocks the list of regulators. Both come from reference tables, and a relationship table ties the regulator to the regulation.
+Today the regulator data comes from a spreadsheet that is maintained by hand and loaded into the reference table. The person who keeps it can no longer do so, so from Q1 or Q2 2027 RegMap will take regulators from RDH, which Rapid 2 already updates. Changes are rare, since a regulator is seldom added or retired.
+Regulator codes match Rapid 2 except for a handful of entities in Macau, Hong Kong and Singapore. For a sense of how entity-specific codes look, Hong Kong HASE is HKMA1 and Hong Kong HSBC is HKMA. The differences sit in about 158 older regulations created through a utility Rapid 2 used to create regulations in RegMap. They can't be edited, and Rapid 2 no longer creates RegMap records, so the list won't grow. US codes are consistent across both systems.
+Risk taxonomy
+The risk taxonomy has three levels, L1, L2 and L3. RegMap's copy is populated from a Helios table, and Helios is its golden source. Naresh didn't know where Rapid 2 gets its taxonomy, so alignment with Rapid 2 isn't confirmed.
+Each distinct L1, L2, L3 combination has a taxonomy ID and a library risk ID. The library risk ID exists only in the database; users never see it in the UI.
+Library controls
+The library risk ID leads, through a relationship table, to the L1 and L2 library controls that apply to that taxonomy. The user sees those applicable controls and decides which to keep, but how much they can change depends on the control mapping approach.
+With the Standard approach the controls are fixed. With Detailed, the user can select and deselect them, and once the record is approved the selection counts as reviewed and validated. The approach is stored on the regulation and on the regulation summary (rglt_cntl_map_aprch_cde and summ_cntl_map_aprch_cde).
+Naresh also pointed out that the taxonomy relationship table has no approach code, and that no join tells you which library controls a user actually kept.
+Applicability
+Applicability covers location, business and legal entity, and it has no relationship with the risk taxonomy in the data. Each unique combination of the three has a single 19-digit key. RegMap calls it the OPR entity mapper ID and Helios calls it the OPR key, but it is the same value.
+There is one catch. The geo, business and legal hierarchy IDs do not combine into that key, so those three IDs together are not unique on their own. That is why finding a risk instance takes a four-column match, shown below. The three hierarchy tables are also not available in the analytics layer today.
+From taxonomy to control instances
+The accurate route to control instances goes through the risk instance, not straight from library controls. Naresh's order is below.
+Step 3 needs all four columns because the hierarchy IDs aren't unique on their own. Control instances hang off risk instances. Naresh warned that joining library controls directly to risks is possible but gives the wrong mapping.
+Table reference
+Concept
+Table
+Key columns
+Regulation
+srm.srm_rglt
+rglt_id_num, rglt_vers_num, rgltr_cde, rglt_jris_cde, rglt_cntl_map_aprch_cde
+Jurisdiction
+REFDATA.ref_juris
+jris_code, jris_name
+Regulator
+REFDATA.ref_rgltr
+jris_code, jris_name
+Regulator to regulation
+SRM.SRM_RGLTR_RGLT_REL
+rgltr_cde, rglt_id_num, rglt_vers_num
+Regulation to summary
+srm.srm_rglt_summ_rel
+rglt_id_num, summ_id_num
+Regulation summary
+srm.srm_rglt_summ
+summ_id_num, summ_vers_num, summ_cntl_map_aprch_cde
+Summary to taxonomy
+srm.srm_rglt_summ_rsk_txnmy_rel
+summ_id_num, RISK_TXNMY_ID
+Risk taxonomy
+refdata.SRM_REF_RISK_TXNMY
+RISK_TXNMY_ID, risk_lib_id_num, risk_txnmy_l1_text, risk_txnmy_l2_text, risk_txnmy_l3_text
+Library controls by taxonomy
+REFDATA.ref_risk_txnmy_cntl_lib
+risk_lib_id_num, l1_cntl_id, l2_cntl_id, risk_txnmy_id
+Library controls on a summary
+SRM.SRM_RGLT_SUMM_LIB_CNTL
+summ_id_num, RISK_TXNMY_ID, l1_cntl_id, l2_cntl_id
+Helios control map
+HELIOS_RISKTXNMY_CNTL_MAP
+LIB_RISK_ID_NUM, CNTL_L1_ID_NUM, CNTL_L2_ID_NUM
+Helios geo hierarchy
+OPR_RISK_GEO_HIER
+GEO_HIER_ID, GEO_HIER_PATH_TEXT
+Open questions and next steps
+Naresh offered a follow-up session if we need one.
+[ ] Get the list of the roughly 158 regulations with differing regulator codes
+[ ] Request analytics access to the geo, business and legal hierarchy tables
+[ ] Ask Naresh for the control instance columns that link back to library risks and controls
+[ ] Confirm where Rapid 2 gets its risk taxonomy
+[ ] Clarify the difference between a library control and a control instance
+[ ] Re-listen to the applicability and L1 control sections, then book a follow-up if needed
