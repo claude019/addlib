@@ -1,0 +1,784 @@
+
+import os
+import re
+import json
+import hashlib
+import pandas as pd
+import numpy as np
+from collections import defaultdict
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 500)
+pd.set_option("display.max_colwidth", 120)
+
+MEANINGFUL_LEN = 20  # chars after HTML stripping; below this is not real content
+
+# Country-code -> name, for display only. Falls back to the raw
+# code itself for any prefix not in this map (e.g. a table added
+# after this script was written).
+COUNTRY_CODE_NAMES = {
+    "aa": "Global", "ae": "United Arab Emirates", "ar": "Argentina",
+    "au": "Australia", "bd": "Bangladesh", "be": "Belgium", "bh": "Bahrain",
+    "bm": "Bermuda", "br": "Brazil", "ca": "Canada", "cl": "Chile",
+    "cn": "China", "cz": "Czech Republic", "de": "Germany", "dz": "Algeria",
+    "es": "Spain", "fr": "France", "gb": "United Kingdom", "gg": "Guernsey",
+    "hk": "Hong Kong", "id": "Indonesia", "ie": "Ireland", "il": "Israel",
+    "im": "Isle of Man", "in": "India", "it": "Italy", "je": "Jersey",
+    "jp": "Japan", "kr": "Korea, Republic of (South)", "kw": "Kuwait",
+    "ky": "Cayman Islands", "lk": "Sri Lanka", "lu": "Luxembourg",
+    "mo": "Macau", "mt": "Malta", "mu": "Mauritius", "mv": "Maldives",
+    "my": "Malaysia", "nl": "Netherlands", "nz": "New Zealand", "om": "Oman",
+    "ph": "Philippines", "pl": "Poland", "qa": "Qatar", "sa": "Saudi Arabia",
+    "se": "Sweden", "sg": "Singapore", "th": "Thailand", "tr": "Turkey",
+    "tw": "Taiwan", "us": "United States of America", "uy": "Uruguay",
+    "vn": "Vietnam", "za": "South Africa",
+}
+
+EXISTING_KEEP_LIST = {
+    "policyTitle", "policyText.sgmntText", "policyPurpose.sgmntText",
+    "policyApplication.segment[].sgmntText",
+    "policyApplication.termDefin[].termDefinText",
+    "policyRiskTypePrimary", "policyApplication.riskTxnmyL2Text",
+    "region", "policyDocType",
+}
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def clean_val(v):
+    if v is None:
+        return None
+    if isinstance(v, str):
+        s = v.strip()
+        return s if s else None
+    return v
+
+
+def classify_code_format(value):
+    if value is None:
+        return "NULL"
+    s = str(value).strip()
+    if not s:
+        return "EMPTY_STRING"
+    if re.fullmatch(r"L1C-\d+", s):
+        return "L1C-<digits>"
+    if re.fullmatch(r"RSM-\d+", s):
+        return "RSM-<digits>"
+    if re.fullmatch(r"[A-Za-z]+-\d+", s):
+        return "OTHERPREFIX-<digits>"
+    if re.fullmatch(r"[A-Za-z]+\d+", s):
+        return "ALPHA<digits> (no dash)"
+    if re.fullmatch(r"\d+", s):
+        return "<digits only>"
+    return "OTHER"
+
+
+def value_state(value):
+    if value is None:
+        return "NULL"
+    if isinstance(value, str) and not value.strip():
+        return "EMPTY_STRING"
+    return "POPULATED"
+
+
+def content_hash(text):
+    if not text:
+        text = ""
+    t = re.sub(r"[^\w\s]", " ", text.lower())
+    t = re.sub(r"\s+", " ", t).strip()
+    return hashlib.sha256(t.encode("utf-8")).hexdigest()[:16]
+
+
+def country_name(code):
+    return COUNTRY_CODE_NAMES.get(code, code)
+
+
+print("=" * 80)
+print("GPPS MASTER COMPREHENSIVE EDA")
+print("=" * 80)
+
+
+# ============================================================
+# PART 1 -- Dynamic table discovery + access check
+# ============================================================
+
+print("\n" + "=" * 80)
+print("PART 1 -- Discovering GPPS policy tables and checking access")
+print("=" * 80)
+
+discovery_query = f"""
+    SELECT table_name
+    FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+    WHERE REGEXP_CONTAINS(table_name, r'^[a-z]{{2}}_hsbc_gpps_gpps_policy$')
+    ORDER BY table_name
+"""
+
+discovered_tables = []
+try:
+    disc_df = bq_client.query(discovery_query).to_dataframe()
+    discovered_tables = disc_df["table_name"].tolist()
+    print(f"\nDiscovered {len(discovered_tables)} policy table(s) via INFORMATION_SCHEMA.")
+except Exception as e:
+    print(f"\nCould not query INFORMATION_SCHEMA ({str(e)[:100]}).")
+    print("Falling back to the known 54-code candidate list.")
+    discovered_tables = [f"{c}_hsbc_gpps_gpps_policy" for c in sorted(COUNTRY_CODE_NAMES)]
+
+# Also show the broader '%gpps%' inventory for visibility (non-policy tables included)
+try:
+    broad_query = f"""
+        SELECT table_name
+        FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+        WHERE LOWER(table_name) LIKE '%gpps%'
+        ORDER BY table_name
+    """
+    broad_df = bq_client.query(broad_query).to_dataframe()
+    non_policy = sorted(set(broad_df["table_name"]) - set(discovered_tables))
+    if non_policy:
+        print(f"\nOther '%gpps%' tables found (not included in this EDA -- "
+              f"Procedure/other object types, per your instruction to skip them):")
+        for t in non_policy:
+            print(f"    {t}")
+except Exception:
+    pass
+
+# ---- Access check: cheap COUNT(*) per table ----
+access_rows = []
+for table in discovered_tables:
+    code = table.split("_")[0]
+    country = country_name(code)
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+    try:
+        cnt = bq_client.query(
+            f"SELECT COUNT(*) AS n FROM `{full_table}`"
+        ).to_dataframe()["n"].iloc[0]
+        status = "OK" if cnt > 0 else "EMPTY"
+        access_rows.append({"country": country, "table": table, "status": status,
+                            "row_count": int(cnt), "error": None})
+        print(f"  {country:30s} ({table:30s}) {status} -- {cnt} rows")
+    except Exception as e:
+        access_rows.append({"country": country, "table": table, "status": "FAILED",
+                            "row_count": None, "error": str(e)[:150]})
+        print(f"  {country:30s} ({table:30s}) FAILED -- {str(e)[:80]}")
+
+access_df = pd.DataFrame(access_rows)
+
+print(f"\nAccess summary: {len(access_df)} tables checked")
+display(access_df["status"].value_counts().rename_axis("status").reset_index(name="tables"))
+
+accessible_tables = access_df[access_df["status"] == "OK"][["country", "table"]]
+print(f"\nProceeding with {len(accessible_tables)} accessible, non-empty tables.")
+
+
+# ============================================================
+# PART 2 -- Load everything ONCE, build base frames
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 2 -- Loading accessible tables, building base frames")
+print("=" * 80)
+
+policy_records = []
+segment_records = []
+objrel_records = []
+viewer_lookup = defaultdict(dict)   # viewer_lookup[country][policy_core_id] = parsed json
+field_walk_records = []             # (country, policy_core_id, parsed) kept for PART 9
+
+for _, trow in accessible_tables.iterrows():
+    country, table = trow["country"], trow["table"]
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+    query = f"SELECT policy_core_id, version_num, snapshot_time, transfer_date, json_data FROM `{full_table}`"
+
+    try:
+        df_raw = bq_client.query(query).to_dataframe()
+    except Exception as e:
+        print(f"  {country:30s} load FAILED after access check -- {str(e)[:80]}")
+        continue
+
+    if len(df_raw) == 0:
+        continue
+
+    df_use = (df_raw.sort_values("version_num")
+              .groupby("policy_core_id", as_index=False)
+              .tail(1).copy())
+    df_use["parsed"] = df_use["json_data"].apply(safe_json_loads)
+
+    for _, row in df_use.iterrows():
+        parsed = row["parsed"]
+        pid = row["policy_core_id"]
+        ver = row["version_num"]
+        parse_ok = isinstance(parsed, dict)
+
+        viewer_lookup[country][pid] = parsed if parse_ok else {"_parse_error": True,
+                                                                  "_raw": str(row["json_data"])[:2000]}
+        field_walk_records.append((country, pid, parsed if parse_ok else None))
+
+        policy_text_clean = strip_html(get_nested(parsed, "policyText", "sgmntText")) if parse_ok else ""
+        policy_purpose_clean = strip_html(get_nested(parsed, "policyPurpose", "sgmntText")) if parse_ok else ""
+
+        segments = get_nested(parsed, "policyApplication", "segment") if parse_ok else None
+        segments = segments if isinstance(segments, list) else []
+
+        multi = get_nested(parsed, "policyApplication", "multiRiskDetls") if parse_ok else None
+        multi = multi if isinstance(multi, list) else []
+        multi_risks = sorted({clean_val(m.get("risk")) for m in multi
+                              if isinstance(m, dict) and clean_val(m.get("risk"))})
+
+        risk_primary = clean_val(parsed.get("policyRiskTypePrimary")) if parse_ok else None
+        risk_l2_policy = clean_val(get_nested(parsed, "policyApplication", "riskTxnmyL2Text")) if parse_ok else None
+        title = parsed.get("policyTitle") if parse_ok else None
+        doc_ref = parsed.get("policyUniqueDocRef") if parse_ok else None
+
+        segment_blob = "\n".join(
+            strip_html(s.get("sgmntText")) for s in segments if isinstance(s, dict)
+        )
+        full_blob = "\n".join([title or "", policy_purpose_clean, policy_text_clean, segment_blob])
+
+        policy_records.append({
+            "country": country, "table": table, "policy_core_id": pid, "version_num": ver,
+            "snapshot_time": row.get("snapshot_time"), "transfer_date": row.get("transfer_date"),
+            "json_parse_ok": parse_ok,
+            "policyTitle": title, "policyUniqueDocRef": doc_ref,
+            "policyDocType": parsed.get("policyDocType") if parse_ok else None,
+            "region": parsed.get("region") if parse_ok else None,
+            "policyRiskTypePrimary": risk_primary,
+            "riskTxnmyL2Text_policy": risk_l2_policy,
+            "multiRiskDetls_risks": "; ".join(multi_risks) if multi_risks else None,
+            "versStatCde": get_nested(parsed, "versn", "versStatCde") if parse_ok else None,
+            "versActlPublDt": get_nested(parsed, "versn", "versActlPublDt") if parse_ok else None,
+            "policyText_len": len(policy_text_clean),
+            "policyPurpose_len": len(policy_purpose_clean),
+            "n_segments": len(segments),
+            "full_content_hash": content_hash(full_blob),
+        })
+
+        objrel_l1, objrel_l2, objrel_l3 = set(), set(), set()
+        objrel_types_seen = set()
+
+        for seg_idx, seg in enumerate(segments):
+            if not isinstance(seg, dict):
+                continue
+            seg_text_clean = strip_html(seg.get("sgmntText"))
+
+            if "sgmntTypeCde" not in seg:
+                sgmnt_state, sgmnt_value = "KEY_ABSENT", None
+            else:
+                sgmnt_value = seg.get("sgmntTypeCde")
+                sgmnt_state = value_state(sgmnt_value)
+
+            obj_rel = seg.get("objRel")
+            if "objRel" not in seg:
+                objrel_state, objrel_entries = "KEY_ABSENT", []
+            elif obj_rel is None:
+                objrel_state, objrel_entries = "NULL", []
+            elif isinstance(obj_rel, list) and len(obj_rel) == 0:
+                objrel_state, objrel_entries = "EMPTY_LIST", []
+            elif isinstance(obj_rel, list):
+                objrel_state, objrel_entries = "POPULATED", [o for o in obj_rel if isinstance(o, dict)]
+            else:
+                objrel_state, objrel_entries = "UNEXPECTED_TYPE", []
+
+            segment_records.append({
+                "country": country, "table": table, "policy_core_id": pid, "version_num": ver,
+                "segment_index": seg_idx, "sgmntTitlText": seg.get("sgmntTitlText"),
+                "sgmntTypeCde": sgmnt_value, "sgmntTypeCde_state": sgmnt_state,
+                "sgmntTypeCde_format": classify_code_format(sgmnt_value) if sgmnt_state == "POPULATED" else sgmnt_state,
+                "objRel_state": objrel_state, "n_objRel_entries": len(objrel_entries),
+                "segment_text_len": len(seg_text_clean),
+                "segment_text_meaningful": len(seg_text_clean) >= MEANINGFUL_LEN,
+            })
+
+            for obj_idx, obj in enumerate(objrel_entries):
+                obj_type = obj.get("plcyObjTypeCde")
+                if obj_type:
+                    objrel_types_seen.add(obj_type)
+                v1, v2, v3 = (clean_val(obj.get("riskTxnmyL1Text")),
+                              clean_val(obj.get("riskTxnmyL2Text")),
+                              clean_val(obj.get("riskTxnmyL3Text")))
+                if v1:
+                    objrel_l1.add(v1)
+                if v2:
+                    objrel_l2.add(v2)
+                if v3:
+                    objrel_l3.add(v3)
+
+                objrel_records.append({
+                    "country": country, "table": table, "policy_core_id": pid, "version_num": ver,
+                    "segment_index": seg_idx, "objrel_index": obj_idx,
+                    "sgmntTypeCde_state": sgmnt_state,
+                    "plcyObjTypeCde": obj_type, "plcyObjTypeCde_state": value_state(obj_type),
+                    "plcyObjId": obj.get("plcyObjId"), "plcyObjId_format": classify_code_format(obj.get("plcyObjId")),
+                    "cntlId": obj.get("cntlId"), "cntlId_format": classify_code_format(obj.get("cntlId")),
+                    "cntlTitl": obj.get("cntlTitl"),
+                })
+
+        # stash the objRel-rolled-up risk values back onto the policy record
+        policy_records[-1]["objrel_L1_values"] = "; ".join(sorted(objrel_l1)) if objrel_l1 else None
+        policy_records[-1]["objrel_L2_values"] = "; ".join(sorted(objrel_l2)) if objrel_l2 else None
+        policy_records[-1]["objrel_L3_values"] = "; ".join(sorted(objrel_l3)) if objrel_l3 else None
+        policy_records[-1]["objrel_types"] = "; ".join(sorted(objrel_types_seen)) if objrel_types_seen else None
+
+    print(f"  {country:30s} {df_use['policy_core_id'].nunique()} policies loaded")
+
+policy_level_df = pd.DataFrame(policy_records)
+segment_level_df = pd.DataFrame(segment_records)
+objrel_level_df = pd.DataFrame(objrel_records)
+
+print(f"\nBase frames built:")
+print(f"  policy_level_df  : {len(policy_level_df):,} rows")
+print(f"  segment_level_df : {len(segment_level_df):,} rows")
+print(f"  objrel_level_df  : {len(objrel_level_df):,} rows")
+print(f"  viewer_lookup    : {sum(len(v) for v in viewer_lookup.values()):,} policies "
+      f"across {len(viewer_lookup)} countries")
+
+
+# ============================================================
+# PART 3 -- Volume & version overview
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 3 -- Volume & version overview")
+print("=" * 80)
+
+if len(policy_level_df):
+    table_overview = (
+        policy_level_df.groupby(["country", "table"])
+        .agg(
+            policies=("policy_core_id", "nunique"),
+            max_version=("version_num", "max"),
+            avg_version=("version_num", "mean"),
+            json_parse_ok_pct=("json_parse_ok", lambda s: round(s.mean() * 100, 2)),
+            total_segments=("n_segments", "sum"),
+            avg_segments_per_policy=("n_segments", "mean"),
+            policyText_median_len=("policyText_len", "median"),
+        )
+        .reset_index()
+    )
+    table_overview["avg_version"] = table_overview["avg_version"].round(2)
+    table_overview["avg_segments_per_policy"] = table_overview["avg_segments_per_policy"].round(1)
+    display(table_overview.sort_values("policies", ascending=False))
+
+
+# ============================================================
+# PART 4 -- Text field profile
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print(f"PART 4 -- Text field profile (meaningful = >= {MEANINGFUL_LEN} chars after HTML strip)")
+print("=" * 80)
+
+if len(policy_level_df):
+    text_profile = (
+        policy_level_df.groupby("country")
+        .agg(
+            policies=("policy_core_id", "nunique"),
+            policyText_median=("policyText_len", "median"),
+            policyText_empty=("policyText_len", lambda s: int((s == 0).sum())),
+            policyPurpose_median=("policyPurpose_len", "median"),
+            policyPurpose_empty=("policyPurpose_len", lambda s: int((s == 0).sum())),
+        )
+        .reset_index()
+    )
+    display(text_profile.sort_values("policyText_median"))
+
+if len(segment_level_df):
+    seg_text_profile = (
+        segment_level_df.groupby("country")
+        .agg(
+            segments=("segment_index", "size"),
+            median_len=("segment_text_len", "median"),
+            empty_segments=("segment_text_len", lambda s: int((s == 0).sum())),
+            meaningful=("segment_text_meaningful", "sum"),
+        )
+        .reset_index()
+    )
+    seg_text_profile["meaningful_pct"] = (
+        seg_text_profile["meaningful"] / seg_text_profile["segments"] * 100
+    ).round(2)
+    display(seg_text_profile.sort_values("meaningful_pct"))
+    print("\nNOTE: meaningful_pct uses a real threshold -- compare against a naive "
+          "'length > 0' check, which overstates completeness where whitespace-only "
+          "placeholders exist.")
+
+
+# ============================================================
+# PART 5 -- plcyObjTypeCde: null vs populated
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 5 -- plcyObjTypeCde: null vs populated")
+print("=" * 80)
+
+if len(objrel_level_df):
+    print("\n[5a] objRel entry grain:")
+    objtype_state = pd.crosstab(objrel_level_df["country"], objrel_level_df["plcyObjTypeCde_state"])
+    objtype_state["TOTAL"] = objtype_state.sum(axis=1)
+    if "POPULATED" in objtype_state.columns:
+        objtype_state["POPULATED_PCT"] = (objtype_state["POPULATED"] / objtype_state["TOTAL"] * 100).round(2)
+    display(objtype_state)
+
+    print("\n[5b] Value distribution where populated:")
+    display(pd.crosstab(objrel_level_df["country"], objrel_level_df["plcyObjTypeCde"].fillna("<NULL>")))
+
+if len(policy_level_df) and len(objrel_level_df):
+    print("\n[5c] Policy grain -- policies with >=1 populated plcyObjTypeCde:")
+    pol_with_type = (
+        objrel_level_df[objrel_level_df["plcyObjTypeCde_state"] == "POPULATED"]
+        .groupby("country")["policy_core_id"].nunique().rename("policies_with_type")
+    )
+    tot_pol = policy_level_df.groupby("country")["policy_core_id"].nunique().rename("total_policies")
+    pol_type_cov = pd.concat([tot_pol, pol_with_type], axis=1).fillna(0)
+    pol_type_cov["coverage_pct"] = (
+        pol_type_cov["policies_with_type"] / pol_type_cov["total_policies"] * 100
+    ).round(2)
+    display(pol_type_cov.astype({"policies_with_type": int}))
+
+
+# ============================================================
+# PART 6 -- sgmntTypeCde: null vs populated, format breakdown
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 6 -- sgmntTypeCde: null vs populated, by format (not just dash-split)")
+print("=" * 80)
+
+if len(segment_level_df):
+    sgmnt_state_tab = pd.crosstab(segment_level_df["country"], segment_level_df["sgmntTypeCde_state"])
+    sgmnt_state_tab["TOTAL"] = sgmnt_state_tab.sum(axis=1)
+    if "POPULATED" in sgmnt_state_tab.columns:
+        sgmnt_state_tab["POPULATED_PCT"] = (sgmnt_state_tab["POPULATED"] / sgmnt_state_tab["TOTAL"] * 100).round(2)
+    display(sgmnt_state_tab)
+
+    print("\nFormat breakdown where populated:")
+    display(pd.crosstab(segment_level_df["country"], segment_level_df["sgmntTypeCde_format"]))
+
+
+# ============================================================
+# PART 7 -- Risk taxonomy per policy per country
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 7 -- Risk taxonomy coverage: country | distinct_policy_id | "
+      "policies_with_L1/L2/L3")
+print("=" * 80)
+
+if len(policy_level_df):
+    rt = policy_level_df.copy()
+    rt["has_L1"] = (
+        rt["policyRiskTypePrimary"].notna() |
+        rt["multiRiskDetls_risks"].notna() |
+        rt["objrel_L1_values"].notna()
+    )
+    rt["has_L2"] = (
+        rt["riskTxnmyL2Text_policy"].notna() |
+        rt["objrel_L2_values"].notna()
+    )
+    rt["has_L3"] = rt["objrel_L3_values"].notna()
+
+    risk_summary = (
+        rt.groupby("country")
+        .agg(
+            distinct_policy_id=("policy_core_id", "nunique"),
+            policies_with_L1=("has_L1", "sum"),
+            policies_with_L2=("has_L2", "sum"),
+            policies_with_L3=("has_L3", "sum"),
+        )
+        .reset_index()
+    )
+    total_row = pd.DataFrame([{
+        "country": "TOTAL",
+        "distinct_policy_id": risk_summary["distinct_policy_id"].sum(),
+        "policies_with_L1": risk_summary["policies_with_L1"].sum(),
+        "policies_with_L2": risk_summary["policies_with_L2"].sum(),
+        "policies_with_L3": risk_summary["policies_with_L3"].sum(),
+    }])
+    risk_summary = pd.concat([risk_summary, total_row], ignore_index=True)
+    display(risk_summary)
+
+
+# ============================================================
+# PART 8 -- Duplicate check by policy_core_id + content hash
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 8 -- Duplicate policies: by policy_core_id, and by exact content")
+print("=" * 80)
+
+if len(policy_level_df):
+    print("\n[8a] policy_core_id appearing in more than one table:")
+    id_summary = (
+        policy_level_df.groupby("policy_core_id")
+        .agg(
+            n_tables=("country", "nunique"),
+            countries=("country", lambda s: sorted(s.unique())),
+            distinct_titles=("policyTitle", lambda s: s.nunique(dropna=True)),
+        )
+        .reset_index()
+    )
+    shared_ids = id_summary[id_summary["n_tables"] > 1].sort_values("n_tables", ascending=False)
+    print(f"  policy_core_id values in 2+ tables: {len(shared_ids):,}")
+    if len(shared_ids):
+        shared_ids["same_title_everywhere"] = shared_ids["distinct_titles"] <= 1
+        display(shared_ids.head(50))
+        print(f"\n  Same title everywhere (likely genuine dup): "
+              f"{int(shared_ids['same_title_everywhere'].sum()):,}")
+        print(f"  Different titles (likely coincidental id reuse): "
+              f"{int((~shared_ids['same_title_everywhere']).sum()):,}")
+
+    print("\n[8b] Exact content-hash duplicates (title + purpose + policyText + segments):")
+    hash_groups = (
+        policy_level_df.groupby("full_content_hash")
+        .agg(n_occurrences=("country", "size"), n_tables=("country", "nunique"),
+             countries=("country", lambda s: sorted(s.unique())),
+             policy_ids=("policy_core_id", lambda s: sorted(s.unique())),
+             title=("policyTitle", "first"))
+        .reset_index()
+    )
+    cross_table_hashes = hash_groups[hash_groups["n_tables"] > 1].sort_values("n_tables", ascending=False)
+    print(f"  Content hashes shared across tables: {len(cross_table_hashes):,}")
+    if len(cross_table_hashes):
+        display(cross_table_hashes.head(50))
+        redundant = cross_table_hashes["n_occurrences"].sum() - len(cross_table_hashes)
+        print(f"\n  Redundant rows removable by dedup: {redundant:,}")
+
+
+# ============================================================
+# PART 9 -- Comprehensive field dictionary (ALL fields, recursive)
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 9 -- Comprehensive field dictionary (every field path discovered)")
+print("=" * 80)
+
+field_stats = defaultdict(lambda: {
+    "occurrences": 0, "populated": 0, "lengths": [], "samples": [],
+    "countries": set(), "types": set(),
+})
+
+
+def walk(node, path, country):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            walk(v, f"{path}.{k}" if path else k, country)
+    elif isinstance(node, list):
+        for item in node:
+            walk(item, f"{path}[]", country)
+    else:
+        st = field_stats[path]
+        st["occurrences"] += 1
+        st["countries"].add(country)
+        st["types"].add(type(node).__name__)
+        if node is None:
+            return
+        if isinstance(node, str):
+            if not node.strip():
+                return
+            clean = strip_html(node) if ("<" in node and ">" in node) else node.strip()
+            if not clean:
+                return
+            st["populated"] += 1
+            st["lengths"].append(len(clean))
+            if len(st["samples"]) < 2:
+                st["samples"].append(clean[:150])
+        else:
+            st["populated"] += 1
+            st["lengths"].append(len(str(node)))
+            if len(st["samples"]) < 2:
+                st["samples"].append(str(node)[:150])
+
+
+for country, pid, parsed in field_walk_records:
+    if isinstance(parsed, dict):
+        walk(parsed, "", country)
+
+field_dict_rows = []
+for path, st in field_stats.items():
+    lengths = st["lengths"]
+    field_dict_rows.append({
+        "field_path": path,
+        "occurrences": st["occurrences"],
+        "populated": st["populated"],
+        "populated_pct": round(st["populated"] / st["occurrences"] * 100, 2) if st["occurrences"] else 0,
+        "countries_present": len(st["countries"]),
+        "python_types": ",".join(sorted(st["types"])),
+        "median_len": int(np.median(lengths)) if lengths else 0,
+        "max_len": int(np.max(lengths)) if lengths else 0,
+        "is_text_field": ("str" in st["types"]) and (int(np.median(lengths)) if lengths else 0) >= MEANINGFUL_LEN,
+        "already_in_keeplist": path in EXISTING_KEEP_LIST,
+        "sample_1": st["samples"][0] if len(st["samples"]) > 0 else "",
+        "sample_2": st["samples"][1] if len(st["samples"]) > 1 else "",
+    })
+
+field_dict_df = pd.DataFrame(field_dict_rows).sort_values(
+    ["is_text_field", "populated_pct"], ascending=[False, False]
+)
+
+print(f"\nTotal distinct field paths across the whole schema: {len(field_dict_df):,}")
+print(f"Of which qualify as usable text fields: {int(field_dict_df['is_text_field'].sum()):,}")
+
+print("\n[9a] Full field dictionary (sorted: text fields first, by fill rate):")
+display(field_dict_df)
+
+print("\n[9b] Text fields NOT currently on the keep-list:")
+new_text_fields = field_dict_df[field_dict_df["is_text_field"] & ~field_dict_df["already_in_keeplist"]]
+display(new_text_fields[["field_path", "populated_pct", "countries_present", "median_len", "sample_1"]])
+
+print("\n[9c] Fields that are almost entirely empty (populated < 5%) -- low value to carry:")
+sparse = field_dict_df[field_dict_df["populated_pct"] < 5].sort_values("populated_pct")
+display(sparse[["field_path", "occurrences", "populated", "populated_pct"]].head(40))
+
+
+# ============================================================
+# PART 10 -- Export everything
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 10 -- Export")
+print("=" * 80)
+
+output_path = "GPPS_Master_EDA.xlsx"
+
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    access_df.to_excel(writer, sheet_name="Table Access Status", index=False)
+    if len(policy_level_df):
+        table_overview.to_excel(writer, sheet_name="Volume Overview", index=False)
+        text_profile.to_excel(writer, sheet_name="Text Profile (Policy)", index=False)
+    if len(segment_level_df):
+        seg_text_profile.to_excel(writer, sheet_name="Text Profile (Segment)", index=False)
+        sgmnt_state_tab.to_excel(writer, sheet_name="sgmntTypeCde State")
+    if len(objrel_level_df):
+        objtype_state.to_excel(writer, sheet_name="plcyObjTypeCde State")
+    if len(policy_level_df):
+        risk_summary.to_excel(writer, sheet_name="Risk Taxonomy by Country", index=False)
+    if len(shared_ids):
+        shared_ids.astype(str).to_excel(writer, sheet_name="Shared policy_core_ids", index=False)
+    if len(cross_table_hashes):
+        cross_table_hashes.astype(str).to_excel(writer, sheet_name="Content Dup Hashes", index=False)
+    field_dict_df.to_excel(writer, sheet_name="Field Dictionary", index=False)
+
+print(f"\nWritten to: {output_path}")
+print(
+    "\nFrames in memory:\n"
+    "  policy_level_df, segment_level_df, objrel_level_df -- the three base frames\n"
+    "  field_dict_df   -- comprehensive field dictionary\n"
+    "  viewer_lookup   -- country -> policy_core_id -> parsed JSON, for PART 11 below"
+)
+
+
+# ============================================================
+# PART 11 -- Interactive JSON viewer
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("PART 11 -- Interactive JSON viewer")
+print("=" * 80)
+
+import ipywidgets as widgets
+from IPython.display import display as ipy_display, JSON, clear_output
+
+_countries_sorted = sorted(viewer_lookup.keys())
+
+country_dd = widgets.Dropdown(options=_countries_sorted, description="Country:",
+                              style={"description_width": "initial"},
+                              layout=widgets.Layout(width="400px"))
+policy_dd = widgets.Dropdown(options=[], description="Policy ID:",
+                             style={"description_width": "initial"},
+                             layout=widgets.Layout(width="400px"))
+info_label = widgets.Label()
+viewer_output = widgets.Output()
+
+
+def _policy_options_for(country):
+    return sorted(viewer_lookup.get(country, {}).keys())
+
+
+def _on_country_change(change):
+    pids = _policy_options_for(country_dd.value)
+    policy_dd.options = pids
+    if pids:
+        policy_dd.value = pids[0]
+    else:
+        with viewer_output:
+            clear_output()
+            print("No policies loaded for this country.")
+
+
+def _on_policy_change(change):
+    with viewer_output:
+        clear_output()
+        country = country_dd.value
+        pid = policy_dd.value
+        if country is None or pid is None:
+            return
+        data = viewer_lookup[country][pid]
+        n_policies_here = len(viewer_lookup[country])
+        info_label.value = f"{country} -- policy_core_id {pid} (1 of {n_policies_here} in this country)"
+        ipy_display(JSON(data, expanded=False))
+
+
+country_dd.observe(_on_country_change, names="value")
+policy_dd.observe(_on_policy_change, names="value")
+
+if _countries_sorted:
+    country_dd.value = _countries_sorted[0]  # triggers the cascade
+
+ipy_display(widgets.VBox([
+    widgets.HBox([country_dd, policy_dd]),
+    info_label,
+    viewer_output,
+]))
+
+print(
+    "\nUse the dropdowns above: selecting a country repopulates the policy_core_id\n"
+    "list for that country, and selecting a policy renders its full parsed JSON as\n"
+    "a collapsible tree (click to expand/collapse nodes, matching the structure\n"
+    "you've been inspecting manually)."
+)
