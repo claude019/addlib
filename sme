@@ -113,6 +113,18 @@ def classify_buckets():
     v = verdicts.copy()
     v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
     v["decision"] = v.decision.astype(str).str.strip().str.upper()
+
+    # Original model's one-line reasoning -- needed for Review's model_reasoning
+    # column. Resolve against whatever verdicts actually names it; previous
+    # version of this file never carried this column through at all, which is
+    # why model_reasoning showed up blank in the output.
+    _reason_col = next((c for c in ("reasoning", "model_reasoning",
+                                     "one_line_reasoning", "rationale")
+                         if c in v.columns), None)
+    v["reasoning"] = v[_reason_col] if _reason_col else ""
+    if _reason_col is None:
+        print("[I2] NOTE: verdicts has no reasoning/model_reasoning/rationale "
+              "column -- model_reasoning will be blank in the Review sheet.")
     rank = {"LINKED": 4, "INSUFFICIENT_EVIDENCE": 3, "NOT_LINKED": 2, "MISSING": 1, "ERROR": 0}
     v = (v.assign(_r=v.decision.map(rank).fillna(-1))
           .sort_values("_r", ascending=False)
@@ -226,12 +238,13 @@ async def build_answer_key():
     else:
         qa["max_score"] = None
 
-    # linked_rsm: the ACTUAL RSM id connecting this (alert, risk) pair -- real
-    # 8-digit ids like RSM-00030515, confirmed from the cell-reference bar in
-    # the photo. Derived from rwt's linked-RSM list for this record, filtered
-    # to the RSMs that Extract3 actually maps to this risk. Earlier version of
-    # this code wrote a placeholder string here instead of looking it up.
-    def _linked_rsm_for(rec, risk):
+    # linked_rsms: ALL the actual RSM ids connecting this (alert, risk) pair --
+    # real 8-digit ids like RSM-00030515, confirmed from the cell-reference bar
+    # in the photo. Derived from rwt's linked-RSM list for this record,
+    # filtered to the RSMs that Extract3 actually maps to this risk. Earlier
+    # version of this code wrote a placeholder string here instead of looking
+    # it up, and used the singular name linked_rsm.
+    def _linked_rsms_for(rec, risk):
         row_match = rwt[_norm_id(rwt.RECORD_ID) == rec]
         if row_match.empty:
             return ""
@@ -242,7 +255,21 @@ async def build_answer_key():
         hit = regmap_risk[regmap_risk.SUM_ID.isin(rsms)
                            & (_norm_id(regmap_risk.LIB_RISK) == risk)]
         return "|".join(sorted(set(hit.SUM_ID))) if len(hit) else ""
-    qa["linked_rsm"] = qa.apply(lambda r: _linked_rsm_for(r.REC, r.RISK), axis=1)
+    qa["linked_rsms"] = qa.apply(lambda r: _linked_rsms_for(r.REC, r.RISK), axis=1)
+
+    # model_all_summaries: decision broken down per RSM path this pair was
+    # reached through. There is only ever ONE judge call per (alert, risk)
+    # pair in this lane -- the decision does not vary per RSM -- so this is
+    # the same decision repeated once per linked RSM, not independently-judged
+    # per-summary verdicts. Matches how [F2]'s review_cases already handles a
+    # pair reachable via multiple RSM paths elsewhere in this project.
+    def _all_summaries_json(linked_rsms_str, decision):
+        rsms = [x for x in str(linked_rsms_str or "").split("|") if x]
+        if not rsms:
+            return "[]"
+        return json.dumps([{"rsm": r, "decision": decision} for r in rsms])
+    qa["model_all_summaries"] = qa.apply(
+        lambda r: _all_summaries_json(r.linked_rsms, r.decision), axis=1)
 
     # model_evidence_verified: the photos show this TRUE even on DISPUTED rows
     # where model_evidence_supports_decision=false in the same row's JSON --
@@ -301,25 +328,41 @@ async def build_answer_key():
         lambda t: f"Golden & missed - {t}" if t else "Golden & missed")
     missed["max_score"] = None
     missed["model_evidence_verified"] = ""
-    missed["linked_rsm"] = missed.apply(lambda r: _linked_rsm_for(r.REC, r.RISK), axis=1)
+    missed["linked_rsms"] = missed.apply(lambda r: _linked_rsms_for(r.REC, r.RISK), axis=1)
+    missed["model_all_summaries"] = missed.apply(
+        lambda r: _all_summaries_json(r.linked_rsms, r.decision), axis=1)
+    # No quote-audit ran on MISSED rows (they're folded in from [F]'s separate
+    # audit, which has no quote fields) -- alert_quote/risk_quote stay empty
+    # rather than fabricated.
+    missed["alert_quote"] = ""
+    missed["risk_quote"] = ""
 
     # NOT_JUDGED rows: confirmed from the photo -- selection still reads
     # "Golden &..." (golden-sourced), judge_response_json is the literal
-    # placeholder string, not a JSON blob.
+    # placeholder string, not a JSON blob. audit_verdict_final uses the
+    # "not audited" value from the confirmed enum, not "UNCERTAIN" -- those
+    # are two different things (uncertain = judged but inconclusive; not
+    # audited = never judged at all).
     never["audit_label"] = "NOT_AUDITED"
-    never["audit_verdict_final"] = "UNCERTAIN"
+    never["audit_verdict_final"] = "NOT_AUDITED"
     never["audit_error_type"] = "NOT_AUDITED"
     never["judge_response_json"] = "(not audited - no model output for this pair)"
     never["audit_confidence"] = 0
     never["selection_reason"] = "Golden & not judged - no model output for this pair"
     never["max_score"] = None
     never["model_evidence_verified"] = ""
-    never["linked_rsm"] = ""  # by definition: this is why it was never judged
+    never["linked_rsms"] = ""  # by definition: this is why it was never judged
+    never["model_all_summaries"] = "[]"
+    never["alert_quote"] = ""
+    never["risk_quote"] = ""
+    if "reasoning" not in never.columns:
+        never["reasoning"] = ""
 
     keep = ["REC", "RISK", "bucket", "golden", "model_linked", "decision",
-            "max_score", "linked_rsm", "model_evidence_verified", "audit_label",
+            "max_score", "linked_rsms", "model_evidence_verified", "audit_label",
             "audit_verdict_final", "audit_error_type", "audit_confidence",
-            "selection_reason", "judge_response_json"]
+            "selection_reason", "judge_response_json",
+            "reasoning", "alert_quote", "risk_quote", "model_all_summaries"]
     for df in (qa, missed, never):
         for c in keep:
             if c not in df.columns:
@@ -375,6 +418,47 @@ def build_manual_review_pack(answer_key_df, path=None):
     HDR_FONT = Font(color="FFFFFF", bold=True)
     WRAP = Alignment(wrap_text=True, vertical="top")
 
+    # alert_metadata: jurisdiction + risk taxonomy, best-effort. I don't have
+    # confirmed visibility into the exact column names your alerts frame or
+    # regmap_rsm use for these -- this tries the most likely candidates and
+    # degrades to an honest empty string rather than fabricating a value. If
+    # this comes back blank for every row, tell me the real column names and
+    # I'll fix the lookup directly instead of guessing further.
+    _jurisdiction_cols = ["jurisdiction", "record_jurisdiction", "JURISDICTION"]
+    _taxonomy_cols = ["taxonomy", "risk_taxonomy", "Taxonomy", "TAXONOMY"]
+    _meta_found_any = [False]
+
+    def _alert_metadata_for(rec):
+        parts = []
+        for df_name in ("_al", "alerts", "_alerts"):
+            df = globals().get(df_name)
+            if df is not None and "RECORD_ID" in getattr(df, "columns", []):
+                hit = df[_norm_id(df.RECORD_ID) == rec]
+                if len(hit):
+                    for c in _jurisdiction_cols:
+                        if c in df.columns and str(hit.iloc[0][c]).strip():
+                            parts.append(f"Jurisdiction: {hit.iloc[0][c]}")
+                            break
+                if parts:
+                    break
+        try:
+            row_match = rwt[_norm_id(rwt.RECORD_ID) == rec]
+            if len(row_match):
+                ids = str(row_match.iloc[0].get("linked_rsm_ids", "") or "")
+                rsms = [x.strip().upper() for x in re.split(r"[|,]", ids) if x.strip()]
+                if rsms and "regmap_rsm" in globals():
+                    tax_col = next((c for c in _taxonomy_cols if c in regmap_rsm.columns), None)
+                    if tax_col:
+                        tax_hit = regmap_rsm[regmap_rsm.SUM_ID.isin(rsms)]
+                        taxs = sorted(set(str(x) for x in tax_hit[tax_col].dropna().unique()))
+                        if taxs:
+                            parts.append(f"Taxonomy: {'; '.join(taxs[:3])}")
+        except Exception:
+            pass
+        if parts:
+            _meta_found_any[0] = True
+        return " | ".join(parts)
+
     wb = Workbook()
 
     # ---- Instructions -----------------------------------------------------
@@ -395,10 +479,20 @@ def build_manual_review_pack(answer_key_df, path=None):
         c.alignment = WRAP
 
     # ---- Review -------------------------------------------------------------
+    # Column names and content match your spec exactly. Two naming notes:
+    #   - "regulation_id"/"regulation_text"/"model_evidence_regulation" are
+    #     your literal column names, populated with this lane's actual
+    #     LIBRARY RISK data (RISK id / full risk_text / the risk-side quote
+    #     the audit extracted) -- this lane links alerts to Library Risks,
+    #     not Regulations, so that's what fills these columns.
+    #   - Q3_comments and Priority are kept even though your latest list
+    #     stops at Q2: the Instructions sheet text (unchanged) says "Q2/Q3
+    #     are optional", and Priority was confirmed present in the Review
+    #     sheet from the photos -- dropping either would contradict both.
     rv = wb.create_sheet("Review")
-    cols = ["review_id", "alert_id", "risk_id", "alert_meta", "alert_title",
-            "risk_title", "model_decision", "model_score", "model_reasoning",
-            "model_evidence_alert", "model_evidence_risk", "model_raw_json",
+    cols = ["review_id", "alert_id", "regulation_id", "alert_metadata", "alert_text",
+            "regulation_text", "model_decision", "model_score", "model_reasoning",
+            "model_evidence_regulation", "model_raw_json", "model_all_summaries",
             "Q1_is_decision_correct", "Q2_if_no_why", "Q3_comments", "Priority"]
     for j, h in enumerate(cols, start=1):
         c = rv.cell(1, j, h); c.fill = HDR_FILL; c.font = HDR_FONT
@@ -406,34 +500,44 @@ def build_manual_review_pack(answer_key_df, path=None):
     review_rows = ak.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffled
     _alert_text_by_id, _risk_text_by_id = _resolve_text_dicts()
     for i, row in review_rows.iterrows():
-        rtext = _risk_text_by_id.get(row.RISK, "")
-        atext = _alert_text_by_id.get(row.REC, "")
-        vals = [row.review_id, row.REC, row.RISK, "", atext[:300], rtext[:300],
-                row.decision, row.get("max_score", ""), "", "", "", row.judge_response_json,
-                "", "", "", row.Priority]
+        rtext = _risk_text_by_id.get(row.RISK, "")       # FULL text, not truncated
+        atext = _alert_text_by_id.get(row.REC, "")        # FULL text, not truncated
+        evidence = row.get("risk_quote", "") or ""
+        vals = [row.review_id, row.REC, row.RISK, _alert_metadata_for(row.REC),
+                atext, rtext, row.decision, row.get("max_score", ""),
+                row.get("reasoning", ""), evidence, row.judge_response_json,
+                row.get("model_all_summaries", "[]"), "", "", "", row.Priority]
         for j, v in enumerate(vals, start=1):
-            rv.cell(i + 2, j, v)
+            rv.cell(i + 2, j, v).alignment = WRAP
     for j in range(1, len(cols) + 1):
-        rv.column_dimensions[get_column_letter(j)].width = 22
+        rv.column_dimensions[get_column_letter(j)].width = 28
+    if not _meta_found_any[0]:
+        print("[I4] NOTE: alert_metadata came back empty for every row -- "
+              "the jurisdiction/taxonomy column-name guesses didn't match "
+              "anything in your kernel. Tell me the real column names on "
+              "the alerts frame and on regmap_rsm and I'll fix the lookup.")
 
     # ---- Answer key (hidden until review complete) -------------------------
-    # Column order matches the confirmed RGL layout exactly:
-    # Key | review_id | RID | RGL/RISK | bucket | golden | model_linked |
-    # max_score | linked_rsm | model_evidence_verified | audit_label |
-    # audit_verdict_final | audit_error_type | audit_confidence | selection |
-    # judge_response_json | Priority
+    # Column order matches your spec exactly. Internal pandas column names
+    # stay REC/RISK (so the rest of this file's logic doesn't need touching),
+    # but the written HEADER LABELS are your exact names -- RID and RGL --
+    # via the parallel akcols_header list below.
     akws = wb.create_sheet("Answer key")
-    akcols = ["Key", "review_id", "REC", "RISK", "bucket", "golden", "model_linked",
-              "max_score", "linked_rsm", "model_evidence_verified", "audit_label",
-              "audit_verdict_final", "audit_error_type", "audit_confidence",
-              "selection_reason", "judge_response_json", "Priority"]
-    for j, h in enumerate(akcols, start=1):
+    akcols_internal = ["Key", "review_id", "REC", "RISK", "bucket", "golden", "model_linked",
+                        "max_score", "linked_rsms", "model_evidence_verified", "audit_label",
+                        "audit_verdict_final", "audit_error_type", "audit_confidence",
+                        "selection_reason", "judge_response_json", "Priority"]
+    akcols_header = ["Key", "review_id", "RID", "RGL", "bucket", "golden", "model_linked",
+                      "max_score", "linked_rsms", "model_evidence_verified", "audit_label",
+                      "audit_verdict_final", "audit_error_type", "audit_confidence",
+                      "selection_reason", "judge_response_json", "Priority"]
+    for j, h in enumerate(akcols_header, start=1):
         c = akws.cell(1, j, h); c.fill = HDR_FILL; c.font = HDR_FONT
     for i, row in ak.iterrows():
-        for j, col in enumerate(akcols, start=1):
+        for j, col in enumerate(akcols_internal, start=1):
             akws.cell(i + 2, j, row.get(col, ""))
-        akws.cell(i + 2, 1, f"=C{i+2}&D{i+2}")  # Key = RID&RISK, live formula like the RGL sheet
-    for j in range(1, len(akcols) + 1):
+        akws.cell(i + 2, 1, f"=C{i+2}&D{i+2}")  # Key = RID&RGL, live formula like the RGL sheet
+    for j in range(1, len(akcols_internal) + 1):
         akws.column_dimensions[get_column_letter(j)].width = 20
 
     # ---- Manual Review - P0 (card view, point 4: 5 discovery cases) --------
@@ -448,20 +552,23 @@ def build_manual_review_pack(answer_key_df, path=None):
 
     mr = wb.create_sheet("Manual Review - P0")
     mr.cell(1, 2, "Part of New Discover and Audit Judge confirmed linked").font = Font(bold=True)
-    field_names = ["review_id", "alert_id", "risk_id", "bucket", "golden", "model_linked",
-                   "max_score", "linked_rsm", "model_evidence_verified", "audit_label",
+    field_names = ["review_id", "alert_id", "regulation_id", "bucket", "golden", "model_linked",
+                   "max_score", "linked_rsms", "model_evidence_verified", "audit_label",
                    "audit_verdict_final", "audit_error_type", "audit_confidence",
-                   "selection_reason", "judge_response_json"]
+                   "selection_reason", "model_reasoning", "model_all_summaries",
+                   "judge_response_json"]
     for col_idx, (_, row) in enumerate(sample5.iterrows(), start=2):
         for r_idx, fname in enumerate(field_names, start=7):
-            val = {"review_id": row.review_id, "alert_id": row.REC, "risk_id": row.RISK,
+            val = {"review_id": row.review_id, "alert_id": row.REC, "regulation_id": row.RISK,
                    "bucket": row.bucket, "golden": row.golden, "model_linked": row.model_linked,
-                   "max_score": row.get("max_score", ""), "linked_rsm": row.get("linked_rsm", ""),
+                   "max_score": row.get("max_score", ""), "linked_rsms": row.get("linked_rsms", ""),
                    "model_evidence_verified": row.get("model_evidence_verified", ""),
                    "audit_label": row.audit_label, "audit_verdict_final": row.audit_verdict_final,
                    "audit_error_type": row.audit_error_type,
                    "audit_confidence": row.audit_confidence,
                    "selection_reason": row.selection_reason,
+                   "model_reasoning": row.get("reasoning", ""),
+                   "model_all_summaries": row.get("model_all_summaries", "[]"),
                    "judge_response_json": row.judge_response_json}.get(fname, "")
             c = mr.cell(r_idx, col_idx, val)
             c.alignment = WRAP
