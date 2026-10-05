@@ -16,9 +16,10 @@
 # whichever low-level function `run_audit()` / `run_risk_linkage()` already
 # calls -- it needs the same signature (system prompt, user payload) -> dict.
 # =============================================================================
-import json, re
+import json, re, asyncio
 import pandas as pd
 import numpy as np
+from tqdm.auto import tqdm
 
 QUOTE_AUDIT_PROMPT = """You are an independent second reviewer. You are given:
 - an ALERT (regulatory text)
@@ -143,14 +144,37 @@ def classify_buckets():
 # [I3] BUILD THE ANSWER KEY -- runs [I] on CAUGHT+DISCOVERY, folds in [F]'s
 # existing output for MISSED, marks NOT_JUDGED.
 # =============================================================================
+def _resolve_text_dicts():
+    """[H] in this notebook builds these as alert_text_by_id/risk_text_by_id,
+    not alert_txt/risk_txt -- calling run_quote_audit with the bare wrong
+    names raises a NameError immediately and kills the whole cell before the
+    workbook is ever written. Resolve defensively against every naming
+    convention seen across this project's notebooks, and fail with a clear
+    message (not a bare NameError) if truly nothing matches."""
+    g = globals()
+    alert_candidates = ["alert_text_by_id", "alert_txt"]
+    risk_candidates = ["risk_text_by_id", "risk_txt"]
+    a = next((g[n] for n in alert_candidates if n in g), None)
+    r = next((g[n] for n in risk_candidates if n in g), None)
+    if a is None or r is None:
+        missing = [n for n, v in [("alert text dict", a), ("risk text dict", r)] if v is None]
+        raise NameError(
+            f"[I3] Cannot find {', '.join(missing)} under any known name "
+            f"({alert_candidates + risk_candidates}). Run [H] first in this "
+            f"session (it builds alert_text_by_id/risk_text_by_id), or define "
+            f"one of these names yourself before calling build_answer_key().")
+    return a, r
+
+
 async def build_answer_key():
     v, never = classify_buckets()
+    alert_text_by_id, risk_text_by_id = _resolve_text_dicts()
 
     to_quote_audit = v[v.bucket.isin(["CAUGHT", "DISCOVERY"])].copy()
     print(f"[I3] quote-auditing {len(to_quote_audit):,} LINKED pairs "
           f"({(to_quote_audit.bucket=='CAUGHT').sum():,} caught, "
           f"{(to_quote_audit.bucket=='DISCOVERY').sum():,} discoveries)")
-    qa = await run_quote_audit(to_quote_audit, alert_txt, risk_txt)
+    qa = await run_quote_audit(to_quote_audit, alert_text_by_id, risk_text_by_id)
 
     # Three-way label, not two -- confirmed from the photos (R023: AGREE but
     # verdict_after_quote_check=UNCERTAIN -> NEEDS_SME, not CONFIRMED/DISPUTED).
@@ -342,13 +366,11 @@ async def build_answer_key():
 # Manual Review - P0. Mirrors the RGL pack's structure.
 # =============================================================================
 def build_manual_review_pack(answer_key_df, path=None):
-    import random
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
     from openpyxl.utils import get_column_letter
 
     ak = answer_key_df.copy()
-    rid_to_alert = dict(zip(ak.REC, ak.REC))  # title text filled from alert_txt below
     HDR_FILL = PatternFill("solid", fgColor="1F3864")
     HDR_FONT = Font(color="FFFFFF", bold=True)
     WRAP = Alignment(wrap_text=True, vertical="top")
@@ -382,11 +404,12 @@ def build_manual_review_pack(answer_key_df, path=None):
         c = rv.cell(1, j, h); c.fill = HDR_FILL; c.font = HDR_FONT
 
     review_rows = ak.sample(frac=1, random_state=42).reset_index(drop=True)  # shuffled
+    _alert_text_by_id, _risk_text_by_id = _resolve_text_dicts()
     for i, row in review_rows.iterrows():
-        rtext = risk_txt.get(row.RISK, "") if "risk_txt" in globals() else ""
-        atext = alert_txt.get(row.REC, "") if "alert_txt" in globals() else ""
+        rtext = _risk_text_by_id.get(row.RISK, "")
+        atext = _alert_text_by_id.get(row.REC, "")
         vals = [row.review_id, row.REC, row.RISK, "", atext[:300], rtext[:300],
-                row.decision, "", "", "", "", row.judge_response_json,
+                row.decision, row.get("max_score", ""), "", "", "", row.judge_response_json,
                 "", "", "", row.Priority]
         for j, v in enumerate(vals, start=1):
             rv.cell(i + 2, j, v)
@@ -418,7 +441,7 @@ def build_manual_review_pack(answer_key_df, path=None):
     if len(p0) < 5:
         p0 = pd.concat([p0, ak[(ak.Priority.isin(["P0", "P1"])) & (ak.bucket == "DISCOVERY")]]) \
                .drop_duplicates("review_id")
-    sample5 = p0.head(5)
+    sample5 = p0.sample(n=min(5, len(p0)), random_state=42)
     if len(sample5) < 5:
         print(f"[I4] WARNING only {len(sample5)} P0/P1 discovery cases available for manual review "
               f"(wanted 5) -- widen Priority or review all discoveries instead.")
