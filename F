@@ -94,6 +94,8 @@ AUDIT_SCHEMA = {
 }
 
 
+# FIXED — was silently discarding the real exception on every failed call.
+# Now keeps the last one and puts it in the fallback's explanation field.
 async def _audit_one(alert_text, risk_text, golden_says_linked, model_decision, model_reasoning):
     payload = {"alert_text": alert_text, "risk_text": risk_text,
                "golden_says_linked": bool(golden_says_linked),
@@ -105,6 +107,8 @@ async def _audit_one(alert_text, risk_text, golden_says_linked, model_decision, 
         kw.update(temperature=0.0, seed=42, reasoning_effort="low", max_tokens=1200)
     else:
         kw.update(reasoning_effort="low", max_completion_tokens=1200)
+
+    last_err = None
     for attempt in range(1, 4):
         try:
             token = await tok.get()
@@ -114,10 +118,14 @@ async def _audit_one(alert_text, risk_text, golden_says_linked, model_decision, 
                                      "out": r.usage.completion_tokens, "ts": time.time()})
             return json.loads(r.choices[0].message.content)
         except Exception as e:
-            if "401" in str(e): await tok.invalidate()
+            last_err = f"{type(e).__name__}: {e}"
+            if "401" in str(e):
+                await tok.invalidate()
             await asyncio.sleep(1.5 ** attempt)
+
     return {"audit_category": "TEXT_TOO_THIN", "sub_reason": "THIN_risk_text",
-            "one_line_explanation": "audit failed", "is_model_fault": False}
+            "one_line_explanation": f"audit failed: {last_err}",
+            "is_model_fault": False}
 
 
 def select_audit_slice(perf_df, verdicts_df, which="false_negatives", sample=500, seed=42):
