@@ -1,0 +1,212 @@
+# %% ========================================================================
+# [F] LLM-AS-JUDGE AUDIT LAYER (the MRM story) — Library Risk
+# ============================================================================
+
+AUDIT_BUCKETS = ["TRUE_LINK_MISSED", "CORRECT_REJECTION", "SME_JUDGEMENT_REQUIRED",
+                  "STRUCTURAL_OVERMAPPING", "TEXT_TOO_THIN"]
+
+SUB_REASONS = {
+    "TRUE_LINK_MISSED": [
+        "MISS_paraphrase", "MISS_indirect_chain", "MISS_terminology_gap",
+        "MISS_thin_risk_statement", "MISS_conservative_judge",
+    ],
+    "CORRECT_REJECTION": [
+        "CR_different_risk_type", "CR_different_taxonomy_branch",
+        "CR_different_business_line", "CR_different_legal_entity", "CR_no_shared_obligation",
+    ],
+    "SME_JUDGEMENT_REQUIRED": [
+        "SME_external_mapping", "SME_implied_by_policy", "SME_cross_reference", "SME_domain_expertise",
+    ],
+    "STRUCTURAL_OVERMAPPING": [
+        "OVER_whole_rgl_swept", "OVER_broad_regulation",
+        "OVER_missing_rsm_granularity", "OVER_generic_risk",
+    ],
+    "TEXT_TOO_THIN": ["THIN_risk_text", "THIN_alert_text"],
+}
+ALL_SUB_REASONS = [s for subs in SUB_REASONS.values() for s in subs]
+
+AUDIT_SYSTEM_PROMPT = f"""ROLE:
+You are an independent Regulatory Model Auditor. A linkage model judged whether an
+incoming ALERT bears on a specific LIBRARY RISK -- a short, standing statement of a
+risk the bank runs. You are given the alert text, the risk text, whether the business
+golden SAYS they are linked, and the model's decision + reasoning. Do NOT re-judge the
+link. Explain, for management, WHY the model's decision differs from (or matches) the
+golden, by choosing (1) a top category and (2) a specific sub-reason within it.
+
+CONTEXT YOU MUST HOLD:
+- Library risk text is terse BY DESIGN. It will never cite the regulation. Shortness
+  alone is not a defect -- only classify TEXT_TOO_THIN when the statement carries no
+  taxonomy, business or descriptive content at all.
+- The golden has no RSM level, so every risk under a linked regulation was inherited
+  as 'golden-true', including risks the specific alert does not touch. That is
+  STRUCTURAL_OVERMAPPING, a data/label artefact, not a model error.
+
+TOP CATEGORIES:
+- TRUE_LINK_MISSED: the texts DO contain a clear, derivable link and the model wrongly
+  failed to link them. Our model's fault.
+- CORRECT_REJECTION: genuinely different risk type, taxonomy branch, business line or
+  legal entity; no text-derivable link. Model right; golden link questionable.
+- SME_JUDGEMENT_REQUIRED: a link may exist at policy level but is NOT derivable from
+  the supplied texts; needs expert/institutional knowledge outside the documents.
+- STRUCTURAL_OVERMAPPING: the risk is clearly unrelated, and the golden link exists only
+  because the risk sits under a regulation the alert touches (whole-regulation mapping).
+- TEXT_TOO_THIN: risk or alert text too sparse/generic to judge either way.
+
+SUB-REASONS (choose exactly one, and it MUST belong to the chosen top category):
+{json.dumps(SUB_REASONS, indent=2)}
+
+RETURN ONLY JSON (no markdown):
+{{"audit_category": "one of the top categories",
+  "sub_reason": "one sub-reason from the chosen category",
+  "one_line_explanation": "one plain sentence a non-technical leader understands",
+  "is_model_fault": true or false}}"""
+
+AUDIT_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {"name": "linkage_audit", "strict": True, "schema": {
+        "type": "object", "additionalProperties": False,
+        "required": ["audit_category", "sub_reason", "one_line_explanation", "is_model_fault"],
+        "properties": {
+            "audit_category":       {"type": "string", "enum": AUDIT_BUCKETS},
+            "sub_reason":           {"type": "string", "enum": ALL_SUB_REASONS},
+            "one_line_explanation": {"type": "string"},
+            "is_model_fault":       {"type": "boolean"}}}}
+}
+
+
+def _audit_call_kwargs():
+    kw = {"model": MODEL, "user": USE_CASE, "response_format": AUDIT_SCHEMA}
+    if "gemini" in MODEL.lower():
+        kw.update(temperature=0.0, seed=42, reasoning_effort="low", max_tokens=1200)
+    else:
+        kw.update(reasoning_effort="low", max_completion_tokens=1200)
+    return kw
+    # NOTE: policy's working version uses 4000 here, not 1200. If this still errors
+    # or truncates after the chat_with_cost swap, bump this first before anything else.
+
+
+# CHANGED — routes through chat_with_cost instead of hand-rolling tok.get() +
+# oai.chat.completions.create. That hand-rolled path is what was dying 965/965 times.
+async def _audit_one(alert_text, risk_text, golden_says_linked, model_decision,
+                      model_reasoning, rid=None, lrid=None):
+    payload = {"alert_text": alert_text, "risk_text": risk_text,
+               "golden_says_linked": bool(golden_says_linked),
+               "model_decision": model_decision, "model_reasoning": model_reasoning}
+    messages = [{"role": "system", "content": AUDIT_SYSTEM_PROMPT},
+                {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}]
+    last = None
+    for attempt in range(1, 3 + 1):
+        try:
+            parsed, _ = await chat_with_cost(
+                "audit", messages, _audit_call_kwargs(),
+                parse=lambda r: json.loads(r.choices[0].message.content),
+                record_id=rid, unit=f"audit:{rid}|{lrid}", attempt=attempt, n_items=1)
+            return parsed
+        except Exception as e:
+            last = e
+            if "401" in str(e) or "unauth" in str(e).lower():
+                try:
+                    await tok.invalidate()
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5 ** attempt)
+    return {"audit_category": "TEXT_TOO_THIN", "sub_reason": "THIN_risk_text",
+            "one_line_explanation": f"audit failed: {last}", "is_model_fault": False}
+
+
+# UNCHANGED from your screenshot — already correct (it's what produced the right n=965).
+def select_audit_slice(perf_df, verdicts_df, which="false_negatives", sample=500, seed=42):
+    """which : "all" | "false_negatives" | "false_positives" | "correct"
+       sample: an int (random sample of that size) or None (whole slice)"""
+    v = verdicts_df.copy()
+    v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
+    v["DEC"] = v.decision.astype(str).str.upper()
+    gsub = golden[~golden.LIB_RISK.isin(_BLANK)]
+    golden_pairs = set(gsub.RECORD_ID + "|" + gsub.LIB_RISK)
+    v["key"] = v.REC + "|" + v.RISK
+    v["golden_linked"] = v.key.isin(golden_pairs)
+
+    if   which == "false_negatives": sel = v[(v.golden_linked)  & (v.DEC != "LINKED")]
+    elif which == "false_positives": sel = v[(~v.golden_linked) & (v.DEC == "LINKED")]
+    elif which == "correct":         sel = v[(v.golden_linked)  & (v.DEC == "LINKED")]
+    else:                            sel = v[v.golden_linked]
+
+    sel = sel[["REC", "RISK", "decision", "reasoning", "golden_linked"]].reset_index(drop=True)
+    if sample is not None and len(sel) > sample:
+        sel = sel.sample(n=sample, random_state=seed).reset_index(drop=True)
+        print(f"[F] sampled {sample:,} of the slice for a fast, defensible estimate "
+              f"(set sample=None for the full slice)")
+    return sel   # still the same inferred closing line flagged last time — not reproduced
+                 # from any photo, just the only sensible return given sel exists
+
+
+# NEW — not in any screenshot; built on the policy template, adapted to how your
+# select_audit_slice already shapes audit_slice (decision/reasoning already embedded,
+# so no verdicts_df lookup needed, unlike the policy version).
+async def run_audit(slice_df, alert_text_by_id, risk_text_by_id, concurrency=20):
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(row):
+        async with sem:
+            out = await _audit_one(alert_text_by_id.get(row.REC, ""),
+                                    risk_text_by_id.get(row.RISK, ""),
+                                    row.golden_linked, row.decision, row.reasoning,
+                                    rid=row.REC, lrid=row.RISK)
+            return {"REC": row.REC, "RISK": row.RISK, "model_decision": row.decision, **out}
+
+    tasks = [asyncio.create_task(_one(r)) for r in slice_df.itertuples()]
+    out = []
+    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="audit"):
+        out.append(await fut)
+    write_team_cost_file()
+    return pd.DataFrame(out)
+
+
+# NEW — not in any screenshot; direct copy from the policy template, which is
+# column-agnostic, so nothing LR-specific to change.
+def audit_report(audited_df):
+    if not len(audited_df):
+        print("[F] nothing audited."); return None
+    bar = "=" * 70
+    print(bar); print("[F] AUDIT OF THE MISS PILE"); print(bar)
+    cat = audited_df.audit_category.value_counts()
+    for k, c in cat.items():
+        print(f"  {k:24s}: {c:,}  ({c/len(audited_df):.1%})")
+    print("-" * 60)
+    print(audited_df.sub_reason.value_counts().to_string())
+    return cat
+
+
+# summarise_miss_pattern — still same gap as last time: def line, docstring, and the
+# tlm=/empty-check above `examples =` are not in any photo. Internals updated to the
+# same chat_with_cost path for consistency, though this one wasn't part of the 965
+# failures (it already fails soft, with a message, rather than crashing).
+    examples = tlm.head(max_examples)[["sub_reason", "one_line_explanation"]].to_dict("records")
+    messages = [{"role": "system", "content":
+                   "You are a prompt engineer. Below are cases where a linkage model MISSED a real "
+                   "alert->library-risk link. Identify the 1-2 dominant patterns and the single "
+                   "highest-impact change to the linkage prompt that would fix most of them. "
+                   "4 sentences max, plain language for a non-technical reader."},
+                {"role": "user", "content": json.dumps(examples, ensure_ascii=False)}]
+    try:
+        text, _ = await chat_with_cost(
+            "audit_summary", messages, {"model": MODEL, "user": USE_CASE},
+            parse=lambda r: r.choices[0].message.content.strip())
+        return text
+    except Exception as e:
+        return f"(pattern digest unavailable: {e})"
+
+
+# ---- Execute: audit the false-negatives ------------------------------------
+AUDIT_SLICE  = "false_negatives"
+AUDIT_SAMPLE = 20   # CHANGED from None — sanity-check on 20 before spending on all 965
+
+audit_slice = select_audit_slice(perf, verdicts, which=AUDIT_SLICE, sample=AUDIT_SAMPLE)
+audited     = await run_audit(audit_slice, alert_txt, risk_txt)
+audited.to_excel(OUTPUT_DIR / f"risk_audit_{AUDIT_SLICE}_{MODEL}.xlsx", index=False)
+_ = audit_report(audited)
+
+print("\n" + "=" * 74)
+print("[F] TRUE_LINK_MISSED - dominant pattern & recommended prompt fix:")
+print("=" * 74)
+print(await summarise_miss_pattern(audited))
