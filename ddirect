@@ -1,23 +1,70 @@
-scope = set(rsm_v["RECORD_ID"])
-src = str(path)
-print(f"  source                           : {path.name}")
-print(f"  verdict rows (pairs judged)      : {len(rsm_v):,}")
-print(f"  distinct records  -> SCOPE       : {len(scope):,}")
-print(f"  distinct library risks           : {rsm_v['LIB_RISK'].nunique():,}")
-print(f"  LINKED verdicts                  : "
-      f"{int((rsm_v.decision.astype(str).str.upper()=='LINKED').sum()):,}")
-print("  (expect ~160 records / ~2,409 pairs / ~116 risks for iteration 1-2)")
+def recover_scope(rsm_verdicts_path=None, save=True):
+    """Return (scope_records, rsm_verdicts_df_or_None) and write the scope to csv."""
+    bar = "=" * 78
+    print(bar); print("[A1] SCOPE RECOVERY"); print(bar)
 
-# NEW — direct must not be capped at whatever subset routed reached.
-# Union rwt's full population back in so the RSM route's own drop
-# doesn't leak into the lane that's supposed to not depend on it.
-if "results_with_truth" in globals():
-    _rwt_all = set(_norm_id(globals()["results_with_truth"]["RECORD_ID"]))
-    added = _rwt_all - scope
-    if added:
-        print(f"  [A1] adding {len(added):,} record(s) rwt has but routed's "
-              f"parquet doesn't (routed's RSM-parent drop) : {sorted(added)}")
-        scope |= _rwt_all
+    path = rsm_verdicts_path or find_rsm_verdicts()
+    rsm_v = None
 
-elif SCOPE_CSV.exists():
-    ...
+    if path is not None:
+        rsm_v = _read_any(path)
+        rsm_v["RECORD_ID"] = _norm_id(rsm_v["RECORD_ID"])
+        rsm_v["LIB_RISK"]  = _norm_id(rsm_v["LIB_RISK"])
+        scope = set(rsm_v["RECORD_ID"])
+        src = str(path)
+        print(f"  source                           : {path.name}")
+        print(f"  verdict rows (pairs judged)      : {len(rsm_v):,}")
+        print(f"  distinct records  -> SCOPE       : {len(scope):,}")
+        print(f"  distinct library risks           : {rsm_v['LIB_RISK'].nunique():,}")
+        print(f"  LINKED verdicts                  : "
+              f"{int((rsm_v.decision.astype(str).str.upper()=='LINKED').sum()):,}")
+        print("  (expect ~160 records / ~2,409 pairs / ~116 risks for iteration 1-2)")
+
+        # NEW — direct must not be capped at whatever subset routed reached.
+        # Union rwt's full population back in so the RSM route's own drop
+        # doesn't leak into the lane that's supposed to not depend on it.
+        if "results_with_truth" in globals():
+            _rwt_all = set(_norm_id(globals()["results_with_truth"]["RECORD_ID"]))
+            added = _rwt_all - scope
+            if added:
+                print(f"  [A1] adding {len(added):,} record(s) rwt has but routed's "
+                      f"parquet doesn't (routed's RSM-parent drop) : {sorted(added)}")
+                scope |= _rwt_all
+
+    elif SCOPE_CSV.exists():
+        scope = set(_norm_id(pd.read_csv(SCOPE_CSV)["RECORD_ID"]))
+        src = str(SCOPE_CSV)
+        print(f"  RSM verdicts not found; reusing this lane's saved scope: {SCOPE_CSV.name}")
+        print(f"  records                           : {len(scope):,}")
+    elif "results_with_truth" in globals():
+        _rwt = globals()["results_with_truth"]
+        scope = set(_norm_id(
+            _rwt.loc[_rwt["final_decision"].astype(str).str.upper() == "LINKED", "RECORD_ID"]))
+        src = "results_with_truth (LINKED) -- kernel fallback"
+        print(f"  RSM verdicts not found; falling back to rwt LINKED records: {len(scope):,}")
+        print("  NOTE this may be WIDER than the records actually judged, because")
+        print("        build_risk_candidates dropped records with no candidates.")
+    else:
+        raise FileNotFoundError(
+            f"Cannot recover the scope. Looked for risk_verdicts_*.parquet in "
+            f"{RSM_OUTPUT_DIR}, then {SCOPE_CSV}, then `results_with_truth` in the "
+            f"kernel. Point RSM_OUTPUT_DIR at the previous run's output folder. "
+            f"Do NOT scope from golden -- it breaks the head-to-head.")
+
+    # --- reconciliation against rwt, when it happens to be in the kernel -----
+    if "results_with_truth" in globals() and path is not None:
+        _rwt = globals()["results_with_truth"]
+        rwt_linked = set(_norm_id(
+            _rwt.loc[_rwt["final_decision"].astype(str).str.upper() == "LINKED", "RECORD_ID"]))
+        dropped = rwt_linked - scope
+        print(f"  rwt LINKED records               : {len(rwt_linked):,}")
+        print(f"  ... never judged by RSM lane: {len(dropped):,}"
+              + (f"  e.g. {sorted(dropped)[:3]}" if dropped else ""))
+        if dropped:
+            print("        (no candidate risks or no alert text -- correctly excluded here too)")
+
+    if save:
+        pd.DataFrame({"RECORD_ID": sorted(scope)}).to_csv(SCOPE_CSV, index=False)
+        print(f"  scope saved                      : {SCOPE_CSV}")
+    print(f"  ==> SCOPE = {len(scope):,} records   (source: {src})")
+    return scope, rsm_v
