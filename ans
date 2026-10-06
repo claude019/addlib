@@ -1,13 +1,12 @@
 # ============================================================================
 # [M] MANUAL REVIEW PACK -- Direct lane, Alert -> Library Risk
-# Audit judge + answer-key builder, structure matched to the confirmed RGL
-# screenshots. Run top to bottom, one cell or several -- order matters, nothing
-# below depends on anything that comes after it.
+# Logic rewritten against the confirmed Method tab. Run top to bottom.
 # ============================================================================
 
 import re
 
-# ---- [M1] the audit judge ---------------------------------------------------
+# ---- [M1] the audit judge (unchanged -- quote-check logic already matched
+#            Method points 2 and 3) -----------------------------------------
 RISK_AUDIT_PROMPT = """ROLE:
 You are an independent reviewer checking a linkage model's decision on whether
 an ALERT bears on a specific LIBRARY RISK. You are given the alert text, the
@@ -85,6 +84,7 @@ def quote_check(quote, source_text):
     return bool(quote) and _norm_text(quote) in _norm_text(source_text)
 
 def verdict_after_quote_check(judge_out, alert_text, risk_text):
+    """Method point 3: an AGREE without verifiable quotes is downgraded to UNCERTAIN."""
     a_ok = quote_check(judge_out.get("alert_quote", ""), alert_text)
     r_ok = quote_check(judge_out.get("risk_quote", ""), risk_text)
     verified = a_ok and r_ok
@@ -94,7 +94,7 @@ def verdict_after_quote_check(judge_out, alert_text, risk_text):
     return verdict, verified
 
 
-# ---- [M2] bucket table: CAUGHT / MISSED / DISCOVERY / NOT_JUDGED -----------
+# ---- [M2] bucket table -------------------------------------------------------
 def build_bucket_table(verdicts_df, golden_df):
     v = verdicts_df.copy()
     v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
@@ -115,7 +115,7 @@ def build_bucket_table(verdicts_df, golden_df):
         if key not in judged_keys:
             rows.append({"RID": g.RECORD_ID, "RISK": g.LIB_RISK, "bucket": "NOT_JUDGED",
                          "golden": True, "model_linked": False, "max_score": None,
-                         "linked_risks": ""})   # Direct has no RSM parentage chain
+                         "linked_risks": ""})
     caught = v[v.golden_linked & (v.DEC == "LINKED")]
     missed = v[v.golden_linked & (v.DEC != "LINKED")]
     discov = v[~v.golden_linked & (v.DEC == "LINKED")]
@@ -132,7 +132,23 @@ def build_bucket_table(verdicts_df, golden_df):
     return bt, v
 
 
-# ---- [M3] run the audit over every row in the bucket table -----------------
+# ---- [M3] audit label -- rewritten per Method point 5 ------------------------
+# audit_label depends ONLY on (model_linked, judge verdict) -- NOT on bucket.
+#   model_linked=True  : AGREE->CONFIRMED | UNCERTAIN->NEEDS_SME | DISAGREE->DISPUTED
+#   model_linked=False : AGREE->GOLDEN_NOT_SUPPORTED_BY_TEXT | DISAGREE->MODEL_MISS
+#   never judged        : CANDIDATE_GAP (handled separately, no judge call made)
+# ASSUMPTION flagged: the Method tab doesn't name a 3rd outcome for
+# model_linked=False + UNCERTAIN. Folded into GOLDEN_NOT_SUPPORTED_BY_TEXT here
+# (conservative: don't claim MODEL_MISS without a clear DISAGREE) -- confirm
+# this against the real workbook if an UNCERTAIN-on-miss row ever shows up.
+def audit_label_for(model_linked, verdict):
+    if model_linked:
+        return {"AGREE": "CONFIRMED", "UNCERTAIN": "NEEDS_SME", "DISAGREE": "DISPUTED"}[verdict]
+    return {"AGREE": "GOLDEN_NOT_SUPPORTED_BY_TEXT",
+            "UNCERTAIN": "GOLDEN_NOT_SUPPORTED_BY_TEXT",   # ASSUMPTION -- see note above
+            "DISAGREE": "MODEL_MISS"}[verdict]
+
+
 async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, concurrency=20):
     sem = asyncio.Semaphore(concurrency)
     v = verdicts_enriched.set_index(["REC", "RISK"])
@@ -161,21 +177,18 @@ async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, c
             vfinal, verified = verdict_after_quote_check(out, a, rtxt)
             out["verdict_after_quote_check"] = vfinal
 
-            if vfinal == "AGREE":
-                label = "CONFIRMED"
-            elif vfinal == "DISAGREE" and row.bucket == "MISSED":
-                label = "GOLDEN_NOT_SUPPORTED_BY_TEXT"
-            elif vfinal == "DISAGREE":
-                label = "DISPUTED"
-            else:
-                label = "NEEDS_SME"
+            label = audit_label_for(row.model_linked, vfinal)
 
+            # selection_reason -- bucket-aware human-readable text, separate
+            # from audit_label. Still partly reconstructed from screenshots,
+            # not Method-tab-verified token for token.
             reason_map = {
                 ("CAUGHT", "DISAGREE"): "Golden & linked - judge disputes (is the judge too strict)?",
                 ("CAUGHT", "AGREE"): "Golden & linked - judge confirms (clear case)",
                 ("CAUGHT", "UNCERTAIN"): "Golden & linked - judge unsure",
                 ("MISSED", "AGREE"): "Golden & not linked - judge agrees with the model's rejection (golden over-mapping)?",
-                ("MISSED", "DISAGREE"): "Golden & linked - judge disputes: missed link",
+                ("MISSED", "DISAGREE"): "Golden & not linked - judge disagrees: model miss",
+                ("MISSED", "UNCERTAIN"): "Golden & not linked - judge unsure",
                 ("DISCOVERY", "AGREE"): "Discovery - judge confirms, evidence verified (candidate genuine new link)",
                 ("DISCOVERY", "DISAGREE"): f"Discovery - judge disputes: {out['error_type'].replace('FALSE_LINK_', '').replace('_', ' ').lower()}",
                 ("DISCOVERY", "UNCERTAIN"): "Discovery - judge unsure (SME judgement needed)",
@@ -194,7 +207,39 @@ async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, c
     return pd.DataFrame(results)
 
 
-# ---- [M4] assemble + write the answer key -----------------------------------
+# ---- [M4] LENIENCY TEST -- Method point 4, entirely new -----------------------
+# Plants pairs BOTH golden and the model reject (double-rejection -- definitely
+# not a real link), lies to the judge by presenting them as model_decision=
+# "LINKED", and measures what share it catches. A judge that's actually
+# checking evidence should DISAGREE; a judge that's just agreeing with
+# whatever label it's handed will wrongly AGREE. Planted rows are QA-only and
+# never enter bucket_table or the answer key.
+def plant_leniency_test(verdicts_enriched, n=20, seed=42):
+    v = verdicts_enriched
+    double_reject = v[(~v.golden_linked) & (v.DEC == "NOT_LINKED")]
+    if not len(double_reject):
+        print("[Leniency test] no double-rejection pairs available -- skipped.")
+        return double_reject
+    return double_reject.sample(n=min(n, len(double_reject)), random_state=seed)
+
+
+async def run_leniency_test(planted, alert_txt, risk_txt):
+    rows = []
+    for r in planted.itertuples():
+        a = alert_txt.get(r.REC, ""); rtxt = risk_txt.get(r.RISK, "")
+        out = await _risk_audit_one(a, rtxt, "LINKED", r.reasoning)   # LIE -- presented as LINKED
+        vfinal, verified = verdict_after_quote_check(out, a, rtxt)
+        rows.append({"REC": r.REC, "RISK": r.RISK, "judge_verdict": vfinal, "caught": vfinal == "DISAGREE"})
+    detail = pd.DataFrame(rows)
+    catch_rate = detail.caught.mean() if len(detail) else float("nan")
+    print(f"[Leniency test] {len(detail)} planted known-wrong pairs -- judge caught "
+          f"{int(detail.caught.sum())} ({catch_rate:.1%}).")
+    print("  Low catch rate => judge agrees with whatever decision it's handed,")
+    print("  rather than independently checking the evidence.")
+    return catch_rate, detail
+
+
+# ---- [M5] assemble + write the answer key ------------------------------------
 def build_answer_key(bucket_table, audited_results):
     ak = pd.concat([bucket_table.reset_index(drop=True),
                      audited_results.reset_index(drop=True)], axis=1)
@@ -211,3 +256,6 @@ audited_results = await run_risk_audit(bucket_table, alert_txt, risk_txt, v_enri
 answer_key = build_answer_key(bucket_table, audited_results)
 answer_key.to_excel(OUTPUT_DIR / "manual_review_pack_direct_answer_key.xlsx", index=False)
 print(f"[M] wrote {len(answer_key):,} rows -> manual_review_pack_direct_answer_key.xlsx")
+
+planted = plant_leniency_test(v_enriched, n=20)
+leniency_catch_rate, leniency_detail = await run_leniency_test(planted, alert_txt, risk_txt)
