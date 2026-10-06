@@ -1,0 +1,114 @@
+def honest_recall(scorecard_counts, audited_df):
+    """Recompute recall against a LEGITIMATE denominator, using the audit to remove
+    the golden links that are not real (over-mapping) or not text-derivable.
+    audited_df may cover every golden pair, including ones the model caught -- these
+    categories only describe miss scenarios, so restrict to the miss population here
+    before taking category shares, or a caught pair with no matching category dilutes
+    the proportions."""
+    fn              = audited_df[audited_df.decision.astype(str).str.upper() != "LINKED"]  # FIX
+    not_real        = fn.audit_category.isin(["CORRECT_REJECTION", "STRUCTURAL_OVERMAPPING"]).mean()
+    genuine_or_sme  = 1 - not_real        # TRUE_LINK_MISSED + SME + TEXT_TOO_THIN
+
+    v   = scorecard_counts
+    jnl = v["judged_not_linked"]
+    jnl_real      = jnl * genuine_or_sme
+    fixable_share = fn.audit_category.eq("TRUE_LINK_MISSED").mean()
+    jnl_fixable   = jnl * fixable_share
+
+    validated, insuff = v["validated"], v["insufficient"]
+
+    denom_textderivable  = validated + jnl_real + insuff
+    recall_textderivable = validated / max(denom_textderivable, 1)
+    denom_addressable    = validated + jnl_fixable + insuff
+    recall_addressable   = validated / max(denom_addressable, 1)
+
+    print("=" * 72); print("HONEST RECALL (denominator corrected using the audit)"); print("=" * 72)
+    print(f"  Reported (naive) recall        : {validated:,}/{v['addressable']:,} = "
+          f"{validated/max(v['addressable'],1):.1%}   <- inflated denominator, DO NOT USE")
+    print(f"  Audit says of NOT_LINKED, only : {genuine_or_sme:.0%} are plausibly real "
+          f"(rest = over-mapping / correct rejection)")
+    print("-" * 60)
+    print(f"  TEXT-DERIVABLE RECALL          : {validated:,}/{denom_textderivable:,.0f} = "
+          f"{recall_textderivable:.1%}")
+    print("      (of links the TEXT supports, how many we caught)")
+    print(f"  MODEL-ADDRESSABLE RECALL       : {validated:,}/{denom_addressable:,.0f} = "
+          f"{recall_addressable:.1%}")
+    print("      (excludes SME-only links no model can infer from text)")
+    print("-" * 60)
+    print("  USE THESE TWO. The naive number measures golden inflation, not the model.")
+    return {"text_derivable": recall_textderivable, "addressable": recall_addressable,
+            "denom_textderivable": denom_textderivable, "denom_addressable": denom_addressable}
+
+
+def draw_waterfall(golden_total, data_gap, not_judged, correct_rejection, overmapping,
+                    sme, true_missed, insufficient, validated, save_path=None):
+    """Volume waterfall: from raw golden links down to validated links."""
+    import matplotlib; matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    steps = [                                              # (label, delta, is_total)
+        ("Golden links\n(as handed)",            golden_total,        True),
+        ("- Data gap\n(no risk text)",            -data_gap,          False),
+        ("- Never judged\n(upstream RSM gap)",    -not_judged,        False),
+        ("- Over-mapping\n(whole-RGL swept)",     -overmapping,       False),
+        ("- Correct rejection\n(diff domain)",    -correct_rejection, False),
+        ("- SME-only\n(not in text)",             -sme,               False),
+        ("Text-derivable\ntruth",                  0,                 True),
+    ]
+
+    fig, ax = plt.subplots(figsize=(13, 6))
+    running = 0
+    for i, (label, delta, is_total) in enumerate(steps):
+        if is_total and delta != 0:
+            ax.bar(i, delta, color="#2c6fbb", edgecolor="black")
+            ax.text(i, delta, f"{int(delta):,}", ha="center", va="bottom", fontsize=9)
+            running = delta
+        elif is_total and delta == 0:
+            ax.bar(i, running, color="#2ca02c", edgecolor="black")
+            ax.text(i, running, f"{int(running):,}", ha="center", va="bottom",
+                    fontsize=9, weight="bold")
+        else:
+            ax.bar(i, delta, bottom=running, color="#d62728", edgecolor="black", alpha=0.85)
+            ax.text(i, running + delta/2, f"{int(delta):,}", ha="center", va="center",
+                    fontsize=8, color="white")
+            running += delta
+
+    ax.bar(len(steps), validated, color="#2ca02c", edgecolor="black")
+    ax.text(len(steps), validated, f"VALIDATED\n{int(validated):,}", ha="center",
+            va="bottom", fontsize=9, weight="bold")
+    ax.bar(len(steps)+1, true_missed + insufficient, color="#ff7f0e", edgecolor="black")
+    ax.text(len(steps)+1, true_missed + insufficient,
+            f"Fixable miss\n{int(true_missed+insufficient):,}",
+            ha="center", va="bottom", fontsize=9)
+
+    labels = [s[0] for s in steps] + ["VALIDATED\n(caught)", "Fixable\nmiss"]
+    ax.set_xticks(range(len(labels))); ax.set_xticklabels(labels, fontsize=8)
+    ax.set_ylabel("Golden linkages (volume)")
+    ax.set_title("Risk-Linkage Volume Waterfall: from inflated golden to text-derivable truth",
+                 fontsize=12)
+    ax.axhline(0, color="black", lw=0.8)
+    plt.tight_layout()
+    if save_path:
+        plt.savefig(save_path, dpi=140, bbox_inches="tight")
+        print("waterfall saved ->", save_path)
+    return fig
+
+# ---- USAGE (counts come from [D] automatically) ----------------------------
+counts = SCORECARD_COUNTS
+hr = honest_recall(counts, audited)
+
+jnl        = counts["judged_not_linked"]
+audited_fn = audited[audited.decision.astype(str).str.upper() != "LINKED"]   # FIX -- same filter as honest_recall
+shares     = audited_fn.audit_category.value_counts(normalize=True)
+draw_waterfall(
+    golden_total      = counts["golden_total"],
+    data_gap          = counts["data_gap"],
+    not_judged        = counts["not_judged"],
+    overmapping       = int(jnl * shares.get("STRUCTURAL_OVERMAPPING", 0)),
+    correct_rejection = int(jnl * shares.get("CORRECT_REJECTION", 0)),
+    sme               = int(jnl * shares.get("SME_JUDGEMENT_REQUIRED", 0)),
+    true_missed       = int(jnl * shares.get("TRUE_LINK_MISSED", 0)),
+    insufficient      = counts["insufficient"],
+    validated         = counts["validated"],
+    save_path         = str(OUTPUT_DIR / "risk_linkage_waterfall.png"),
+)
