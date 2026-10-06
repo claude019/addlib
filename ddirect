@@ -1,15 +1,9 @@
-print("'results_with_truth' in globals():", "results_with_truth" in globals())
-print("'rwt' in globals()               :", "rwt" in globals())
-
-if "results_with_truth" in globals():
-    print("results_with_truth distinct RECORD_IDs:", results_with_truth.RECORD_ID.nunique())
-if "rwt" in globals():
-    print("rwt distinct RECORD_IDs               :", rwt.RECORD_ID.nunique())
-
-if "results_with_truth" in globals() and "rwt" in globals():
-    print("same object:", results_with_truth is rwt)
-    same_ids = set(_norm_id(results_with_truth.RECORD_ID)) == set(_norm_id(rwt.RECORD_ID))
-    print("same ID sets:", same_ids)
-    if not same_ids:
-        only_in_rwt = set(_norm_id(rwt.RECORD_ID)) - set(_norm_id(results_with_truth.RECORD_ID))
-        print("in rwt but not in results_with_truth:", only_in_rwt)
+    if "rwt" in globals() and path is not None:
+        _rwt = globals()["rwt"]
+        rwt_ids = set(_norm_id(_rwt["RECORD_ID"]))
+        dropped = rwt_ids - scope
+        print(f"  rwt records                      : {len(rwt_ids):,}")
+        print(f"  ... never judged by RSM lane: {len(dropped):,}"
+              + (f"  e.g. {sorted(dropped)[:3]}" if dropped else ""))
+        if dropped:
+            print("        (no candidate risks or no alert text -- correctly excluded here too)")
