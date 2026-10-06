@@ -1,3 +1,100 @@
+# ============================================================================
+# [M] MANUAL REVIEW PACK -- Direct lane, Alert -> Library Risk
+# Audit judge + answer-key builder, structure matched to the confirmed RGL
+# screenshots. Run top to bottom, one cell or several -- order matters, nothing
+# below depends on anything that comes after it.
+# ============================================================================
+
+import re
+
+# ---- [M1] the audit judge ---------------------------------------------------
+RISK_AUDIT_PROMPT = """ROLE:
+You are an independent reviewer checking a linkage model's decision on whether
+an ALERT bears on a specific LIBRARY RISK. You are given the alert text, the
+risk text, and the model's decision + reasoning. Do not just restate the
+model's reasoning -- independently re-derive the answer from the texts, then
+say whether you AGREE or DISAGREE with the model.
+
+Quote exactly, verbatim, from the supplied texts in alert_quote and
+risk_quote -- these are checked programmatically against the source text, so a
+quote that does not appear verbatim will be treated as unsupported.
+
+Return JSON only:
+{"verdict": "AGREE" | "DISAGREE" | "UNCERTAIN",
+ "error_type": "FALSE_LINK_UNSUPPORTED" | "FALSE_LINK_WRONG_SCOPE" | "FALSE_LINK_THEMATIC" | "NONE",
+ "correct_decision": "LINKED" | "NOT_LINKED" | "UNCERTAIN",
+ "model_evidence_supports_decision": true | false,
+ "confidence": 1-5,
+ "alert_quote": "verbatim substring of the alert text",
+ "risk_quote": "verbatim substring of the risk text",
+ "rationale": "one or two plain sentences"}"""
+
+RISK_AUDIT_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {"name": "risk_audit", "strict": True, "schema": {
+        "type": "object", "additionalProperties": False,
+        "required": ["verdict", "error_type", "correct_decision",
+                     "model_evidence_supports_decision", "confidence",
+                     "alert_quote", "risk_quote", "rationale"],
+        "properties": {
+            "verdict": {"type": "string", "enum": ["AGREE", "DISAGREE", "UNCERTAIN"]},
+            "error_type": {"type": "string", "enum": ["FALSE_LINK_UNSUPPORTED",
+                           "FALSE_LINK_WRONG_SCOPE", "FALSE_LINK_THEMATIC", "NONE"]},
+            "correct_decision": {"type": "string", "enum": ["LINKED", "NOT_LINKED", "UNCERTAIN"]},
+            "model_evidence_supports_decision": {"type": "boolean"},
+            "confidence": {"type": "integer"},
+            "alert_quote": {"type": "string"},
+            "risk_quote": {"type": "string"},
+            "rationale": {"type": "string"}}}}
+}
+
+RISK_AUDIT_ERROR_LOG = []
+
+async def _risk_audit_one(alert_text, risk_text, model_decision, model_reasoning):
+    payload = {"alert_text": alert_text, "risk_text": risk_text,
+               "model_decision": model_decision, "model_reasoning": model_reasoning}
+    messages = [{"role": "system", "content": RISK_AUDIT_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+    kw = {"model": MODEL, "user": USE_CASE, "response_format": RISK_AUDIT_SCHEMA}
+    if "gemini" in MODEL.lower():
+        kw.update(temperature=0.0, seed=42, reasoning_effort="low", max_tokens=1200)
+    else:
+        kw.update(reasoning_effort="low", max_completion_tokens=1200)
+
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            token = await tok.get()
+            r = await oai.chat.completions.create(
+                messages=messages, extra_headers={"Authorization": f"Bearer {token}"}, **kw)
+            return json.loads(r.choices[0].message.content)
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            if "401" in str(e): await tok.invalidate()
+            await asyncio.sleep(1.5 ** attempt)
+    RISK_AUDIT_ERROR_LOG.append(last_err)
+    return {"verdict": "UNCERTAIN", "error_type": "NONE", "correct_decision": "UNCERTAIN",
+            "model_evidence_supports_decision": False, "confidence": 1,
+            "alert_quote": "", "risk_quote": "", "rationale": f"audit call failed: {last_err}"}
+
+
+def _norm_text(s):
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+def quote_check(quote, source_text):
+    return bool(quote) and _norm_text(quote) in _norm_text(source_text)
+
+def verdict_after_quote_check(judge_out, alert_text, risk_text):
+    a_ok = quote_check(judge_out.get("alert_quote", ""), alert_text)
+    r_ok = quote_check(judge_out.get("risk_quote", ""), risk_text)
+    verified = a_ok and r_ok
+    verdict = judge_out["verdict"]
+    if not verified and verdict == "AGREE":
+        verdict = "UNCERTAIN"
+    return verdict, verified
+
+
+# ---- [M2] bucket table: CAUGHT / MISSED / DISCOVERY / NOT_JUDGED -----------
 def build_bucket_table(verdicts_df, golden_df):
     v = verdicts_df.copy()
     v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
@@ -18,7 +115,7 @@ def build_bucket_table(verdicts_df, golden_df):
         if key not in judged_keys:
             rows.append({"RID": g.RECORD_ID, "RISK": g.LIB_RISK, "bucket": "NOT_JUDGED",
                          "golden": True, "model_linked": False, "max_score": None,
-                         "linked_risks": ""})   # Direct has no parentage chain -- see note
+                         "linked_risks": ""})   # Direct has no RSM parentage chain
     caught = v[v.golden_linked & (v.DEC == "LINKED")]
     missed = v[v.golden_linked & (v.DEC != "LINKED")]
     discov = v[~v.golden_linked & (v.DEC == "LINKED")]
@@ -35,6 +132,7 @@ def build_bucket_table(verdicts_df, golden_df):
     return bt, v
 
 
+# ---- [M3] run the audit over every row in the bucket table -----------------
 async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, concurrency=20):
     sem = asyncio.Semaphore(concurrency)
     v = verdicts_enriched.set_index(["REC", "RISK"])
@@ -43,12 +141,12 @@ async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, c
         if row.bucket == "NOT_JUDGED":
             return {
                 "audit_label": "CANDIDATE_GAP",
-                "audit_verdict_final": "NOT_AUDITED",             # FIX -- confirmed, not blank
+                "audit_verdict_final": "NOT_AUDITED",
                 "audit_error_type": "",
                 "audit_confidence": None,
                 "model_evidence_verified": False,
                 "selection_reason": ("Golden & never assessed - library risk has no "
-                                      "published text in Helios (data gap)"),   # FIX -- Direct's actual cause, not inherited RSM wording
+                                      "published text in Helios (data gap)"),
                 "judge_response_json": "(not audited - no model output for this pair)",
             }
         async with sem:
@@ -96,17 +194,20 @@ async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, c
     return pd.DataFrame(results)
 
 
+# ---- [M4] assemble + write the answer key -----------------------------------
 def build_answer_key(bucket_table, audited_results):
     ak = pd.concat([bucket_table.reset_index(drop=True),
                      audited_results.reset_index(drop=True)], axis=1)
-    ak = ak.rename(columns={"RISK": "LR"})     # FIX -- mirrors template's RID/RGL naming
+    ak = ak.rename(columns={"RISK": "LR"})
     return ak[["Key", "review_id", "RID", "LR", "bucket", "golden", "model_linked",
                "max_score", "linked_risks", "model_evidence_verified", "audit_label",
                "audit_verdict_final", "audit_error_type", "audit_confidence",
                "selection_reason", "judge_response_json"]]
 
 
+# ---- Execute -----------------------------------------------------------------
 bucket_table, v_enriched = build_bucket_table(verdicts, golden)
 audited_results = await run_risk_audit(bucket_table, alert_txt, risk_txt, v_enriched)
 answer_key = build_answer_key(bucket_table, audited_results)
 answer_key.to_excel(OUTPUT_DIR / "manual_review_pack_direct_answer_key.xlsx", index=False)
+print(f"[M] wrote {len(answer_key):,} rows -> manual_review_pack_direct_answer_key.xlsx")
