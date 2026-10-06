@@ -1,0 +1,112 @@
+def build_bucket_table(verdicts_df, golden_df):
+    v = verdicts_df.copy()
+    v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
+    v["DEC"] = v.decision.astype(str).str.upper()
+    gsub = golden_df[~golden_df.LIB_RISK.isin(_BLANK)]
+    golden_pairs = set(gsub.RECORD_ID + "|" + gsub.LIB_RISK)
+    v["key"] = v.REC + "|" + v.RISK
+    v["golden_linked"] = v.key.isin(golden_pairs)
+
+    score_col = next((c for c in ["score", "link_score", "relevance_score"]
+                       if c in v.columns), None)
+    v["score"] = v[score_col] if score_col else 0
+
+    judged_keys = set(v.key)
+    rows = []
+    for _, g in gsub.iterrows():
+        key = g.RECORD_ID + "|" + g.LIB_RISK
+        if key not in judged_keys:
+            rows.append({"RID": g.RECORD_ID, "RISK": g.LIB_RISK, "bucket": "NOT_JUDGED",
+                         "golden": True, "model_linked": False, "max_score": None,
+                         "linked_risks": ""})   # Direct has no parentage chain -- see note
+    caught = v[v.golden_linked & (v.DEC == "LINKED")]
+    missed = v[v.golden_linked & (v.DEC != "LINKED")]
+    discov = v[~v.golden_linked & (v.DEC == "LINKED")]
+    for df_, bucket in [(caught, "CAUGHT"), (missed, "MISSED"), (discov, "DISCOVERY")]:
+        for rec, grp in df_.groupby("REC"):
+            rows.append({"RID": rec, "RISK": grp.RISK.iloc[0], "bucket": bucket,
+                         "golden": bool(grp.golden_linked.iloc[0]),
+                         "model_linked": bucket in ("CAUGHT", "DISCOVERY"),
+                         "max_score": grp.score.max() if len(grp) else 0,
+                         "linked_risks": ""})
+    bt = pd.DataFrame(rows)
+    bt["Key"]       = bt.RID.astype(str) + bt.RISK.astype(str)
+    bt["review_id"] = ["R%03d" % (i + 1) for i in range(len(bt))]
+    return bt, v
+
+
+async def run_risk_audit(bucket_table, alert_txt, risk_txt, verdicts_enriched, concurrency=20):
+    sem = asyncio.Semaphore(concurrency)
+    v = verdicts_enriched.set_index(["REC", "RISK"])
+
+    async def _one(row):
+        if row.bucket == "NOT_JUDGED":
+            return {
+                "audit_label": "CANDIDATE_GAP",
+                "audit_verdict_final": "NOT_AUDITED",             # FIX -- confirmed, not blank
+                "audit_error_type": "",
+                "audit_confidence": None,
+                "model_evidence_verified": False,
+                "selection_reason": ("Golden & never assessed - library risk has no "
+                                      "published text in Helios (data gap)"),   # FIX -- Direct's actual cause, not inherited RSM wording
+                "judge_response_json": "(not audited - no model output for this pair)",
+            }
+        async with sem:
+            a = alert_txt.get(row.RID, ""); rtxt = risk_txt.get(row.RISK, "")
+            dec = row.model_linked and "LINKED" or "NOT_LINKED"
+            reasoning = ""
+            try:
+                reasoning = v.loc[(row.RID, row.RISK)].reasoning
+            except Exception:
+                pass
+            out = await _risk_audit_one(a, rtxt, dec, reasoning)
+            vfinal, verified = verdict_after_quote_check(out, a, rtxt)
+            out["verdict_after_quote_check"] = vfinal
+
+            if vfinal == "AGREE":
+                label = "CONFIRMED"
+            elif vfinal == "DISAGREE" and row.bucket == "MISSED":
+                label = "GOLDEN_NOT_SUPPORTED_BY_TEXT"
+            elif vfinal == "DISAGREE":
+                label = "DISPUTED"
+            else:
+                label = "NEEDS_SME"
+
+            reason_map = {
+                ("CAUGHT", "DISAGREE"): "Golden & linked - judge disputes (is the judge too strict)?",
+                ("CAUGHT", "AGREE"): "Golden & linked - judge confirms (clear case)",
+                ("CAUGHT", "UNCERTAIN"): "Golden & linked - judge unsure",
+                ("MISSED", "AGREE"): "Golden & not linked - judge agrees with the model's rejection (golden over-mapping)?",
+                ("MISSED", "DISAGREE"): "Golden & linked - judge disputes: missed link",
+                ("DISCOVERY", "AGREE"): "Discovery - judge confirms, evidence verified (candidate genuine new link)",
+                ("DISCOVERY", "DISAGREE"): f"Discovery - judge disputes: {out['error_type'].replace('FALSE_LINK_', '').replace('_', ' ').lower()}",
+                ("DISCOVERY", "UNCERTAIN"): "Discovery - judge unsure (SME judgement needed)",
+            }
+            reason = reason_map.get((row.bucket, vfinal), f"{row.bucket} - judge {vfinal.lower()}")
+
+            return {"audit_label": label, "audit_verdict_final": vfinal,
+                    "audit_error_type": out["error_type"], "audit_confidence": out["confidence"],
+                    "model_evidence_verified": verified, "selection_reason": reason,
+                    "judge_response_json": json.dumps(out, ensure_ascii=False)}
+
+    tasks = [asyncio.create_task(_one(r)) for r in bucket_table.itertuples()]
+    results = []
+    for fut in asyncio.as_completed(tasks):
+        results.append(await fut)
+    return pd.DataFrame(results)
+
+
+def build_answer_key(bucket_table, audited_results):
+    ak = pd.concat([bucket_table.reset_index(drop=True),
+                     audited_results.reset_index(drop=True)], axis=1)
+    ak = ak.rename(columns={"RISK": "LR"})     # FIX -- mirrors template's RID/RGL naming
+    return ak[["Key", "review_id", "RID", "LR", "bucket", "golden", "model_linked",
+               "max_score", "linked_risks", "model_evidence_verified", "audit_label",
+               "audit_verdict_final", "audit_error_type", "audit_confidence",
+               "selection_reason", "judge_response_json"]]
+
+
+bucket_table, v_enriched = build_bucket_table(verdicts, golden)
+audited_results = await run_risk_audit(bucket_table, alert_txt, risk_txt, v_enriched)
+answer_key = build_answer_key(bucket_table, audited_results)
+answer_key.to_excel(OUTPUT_DIR / "manual_review_pack_direct_answer_key.xlsx", index=False)
