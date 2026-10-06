@@ -1,0 +1,45 @@
+import json
+import pandas as pd
+
+def build_collation(verdicts_df, alert_txt, risk_txt):
+    """One row per judged (alert, library risk) pair. model_evidence_alert and
+    model_evidence_risk are NOT separate model outputs -- RISK_SCHEMA in [C]
+    only ever returns decision/relevance_score/reasoning, no evidence-quote
+    fields. Both columns below are populated from `reasoning` as the closest
+    available substitute; don't read them as independently-verified spans."""
+    v = verdicts_df.copy()
+    v["RECORD_ID"] = _norm_id(v.RECORD_ID)
+    v["LIB_RISK"]  = _norm_id(v.LIB_RISK)
+
+    # model_all_summaries: every candidate risk judged for THIS alert, not
+    # just the one row -- built once per alert, reused across its rows.
+    all_by_rec = {
+        rid: grp[["LIB_RISK", "decision", "relevance_score", "reasoning"]]
+                .to_dict("records")
+        for rid, grp in v.groupby("RECORD_ID")
+    }
+
+    rows = []
+    for _, r in v.iterrows():
+        rid, risk = r.RECORD_ID, r.LIB_RISK
+        raw = {"alert_id": rid, "library_risk_id": risk, "decision": r.decision,
+               "relevance_score": r.relevance_score, "reasoning": r.reasoning}
+        rows.append({
+            "alert_id":             rid,
+            "library_risk_id":      risk,
+            "alert_text":           alert_txt.get(rid, ""),
+            "library_risk_text":    risk_txt.get(risk, ""),
+            "model_decision":       r.decision,
+            "model_score":          r.relevance_score,
+            "model_reasoning":      r.reasoning,
+            "model_evidence_alert": r.reasoning,   # no separate field exists -- see note above
+            "model_evidence_risk":  r.reasoning,   # same
+            "model_raw_json":       json.dumps(raw, ensure_ascii=False),
+            "model_all_summaries":  json.dumps(all_by_rec.get(rid, []), ensure_ascii=False),
+        })
+    return pd.DataFrame(rows)
+
+
+collated = build_collation(verdicts, alert_txt, risk_txt)
+print(f"collated: {len(collated):,} rows")   # expect ~18,676 — every judged pair, not just one slice
+collated.to_excel(OUTPUT_DIR / "risk_linkage_collated_direct.xlsx", index=False)
