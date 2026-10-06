@@ -1,0 +1,23 @@
+scope = set(rsm_v["RECORD_ID"])
+src = str(path)
+print(f"  source                           : {path.name}")
+print(f"  verdict rows (pairs judged)      : {len(rsm_v):,}")
+print(f"  distinct records  -> SCOPE       : {len(scope):,}")
+print(f"  distinct library risks           : {rsm_v['LIB_RISK'].nunique():,}")
+print(f"  LINKED verdicts                  : "
+      f"{int((rsm_v.decision.astype(str).str.upper()=='LINKED').sum()):,}")
+print("  (expect ~160 records / ~2,409 pairs / ~116 risks for iteration 1-2)")
+
+# NEW — direct must not be capped at whatever subset routed reached.
+# Union rwt's full population back in so the RSM route's own drop
+# doesn't leak into the lane that's supposed to not depend on it.
+if "results_with_truth" in globals():
+    _rwt_all = set(_norm_id(globals()["results_with_truth"]["RECORD_ID"]))
+    added = _rwt_all - scope
+    if added:
+        print(f"  [A1] adding {len(added):,} record(s) rwt has but routed's "
+              f"parquet doesn't (routed's RSM-parent drop) : {sorted(added)}")
+        scope |= _rwt_all
+
+elif SCOPE_CSV.exists():
+    ...
