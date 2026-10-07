@@ -1,0 +1,32 @@
+import pandas as pd
+
+# ---- 0. sanity check before trusting any merge -----------------------------
+print("d1 dtypes -- REC:", d1["REC"].dtype, " RISK:", d1["RISK"].dtype)
+print("alert_txt key type:", type(next(iter(alert_txt))))
+print("alert_txt size:", len(alert_txt), " risk_txt size:", len(risk_txt))
+
+# ---- 1. normalize join keys the same way alert_txt/risk_txt were built ----
+# _norm_id = astype(str).strip().upper() -- d1 came from a CSV round-trip, so
+# REC/RISK are likely int64; alert_txt/risk_txt are keyed by normalized strings.
+# Skipping this step gives an all-NaN merge with no error.
+d1["REC"]  = _norm_id(d1["REC"])
+d1["RISK"] = _norm_id(d1["RISK"])
+
+# ---- 2. pick exactly 10 distinct alerts, keep every row d1 has for them ---
+distinct_recs = d1["REC"].drop_duplicates().sample(n=10, random_state=42)
+sample_df = d1[d1["REC"].isin(distinct_recs)].copy()
+
+# ---- 3. merge in the text --------------------------------------------------
+sample_df["alert_text"] = sample_df["REC"].map(alert_txt)
+sample_df["risk_text"]  = sample_df["RISK"].map(risk_txt)
+
+# ---- 4. confirm the merge actually landed ----------------------------------
+print(f"\ndistinct alerts: {sample_df['REC'].nunique()}   rows: {len(sample_df):,}")
+missing_alert = sample_df["alert_text"].isna().sum()
+missing_risk  = sample_df["risk_text"].isna().sum()
+print(f"missing alert_text: {missing_alert}   missing risk_text: {missing_risk}")
+if missing_alert or missing_risk:
+    print("WARNING -- non-zero missing. Check the dtype print above, or whether "
+          "alert_txt/risk_txt still hold the scope this kernel session expects.")
+
+sample_df.head(20)
