@@ -5,11 +5,9 @@
 def honest_recall(scorecard_counts, audited_df):
     """Recompute recall against a LEGITIMATE denominator, using the audit to remove
     the golden links that are not real (over-mapping) or not text-derivable.
-    FIX: audited_df may include CORRECT_LINK rows (caught pairs) when built from
-    AUDIT_SLICE="all"/"correct" -- these aren't misses and the TRUE_LINK_MISSED /
-    CORRECT_REJECTION / STRUCTURAL_OVERMAPPING / SME / TEXT_TOO_THIN categories
-    don't describe them. Excluded here before taking any share."""
-    fn = audited_df[audited_df.audit_category != "CORRECT_LINK"]     # FIX
+    CORRECT_LINK rows (caught pairs) are excluded before taking any share -- they
+    aren't misses and the miss-only categories don't describe them."""
+    fn = audited_df[audited_df.audit_category != "CORRECT_LINK"]
 
     not_real       = fn.audit_category.isin(["CORRECT_REJECTION", "STRUCTURAL_OVERMAPPING"]).mean()
     genuine_or_sme = 1 - not_real        # TRUE_LINK_MISSED + SME + TEXT_TOO_THIN
@@ -30,20 +28,33 @@ def honest_recall(scorecard_counts, audited_df):
     print("=" * 72); print("HONEST RECALL (denominator corrected using the audit)"); print("=" * 72)
     print(f"  Reported (naive) recall        : {validated:,}/{v['addressable']:,} = "
           f"{validated/max(v['addressable'],1):.1%}   <- inflated denominator, DO NOT USE")
-    print(f"  Audit says of NOT_LINKED, only : {genuine_or_sme:.0%} are plausibly real "
+    print(f"  Audit says of NOT_LINKED, only : {genuine_or_sme:.1%} are plausibly real "
           f"(rest = over-mapping / correct rejection)")
     print("-" * 60)
-    print(f"  TEXT-DERIVABLE RECALL          : {validated:,}/{denom_textderivable:,.0f} = "
+
+    # NEW -- show every term that sums to each denominator, not just the total.
+    print("  DENOMINATOR BUILD (text-derivable):")
+    print(f"    validated (caught)                          : {validated:,}")
+    print(f"    + jnl_real = jnl({jnl:,}) x genuine_or_sme({genuine_or_sme:.1%}) : {jnl_real:,.1f}")
+    print(f"    + insufficient_evidence                     : {insuff:,}")
+    print(f"    = denom_textderivable                       : {denom_textderivable:,.1f}")
+    print(f"  TEXT-DERIVABLE RECALL           : {validated:,}/{denom_textderivable:,.0f} = "
           f"{recall_textderivable:.1%}")
     print("      (of links the TEXT supports, how many we caught)")
-    print(f"  MODEL-ADDRESSABLE RECALL       : {validated:,}/{denom_addressable:,.0f} = "
+    print("-" * 60)
+
+    print("  DENOMINATOR BUILD (model-addressable):")
+    print(f"    validated (caught)                          : {validated:,}")
+    print(f"    + jnl_fixable = jnl({jnl:,}) x fixable_share({fixable_share:.1%}) : {jnl_fixable:,.1f}")
+    print(f"    + insufficient_evidence                     : {insuff:,}")
+    print(f"    = denom_addressable                         : {denom_addressable:,.1f}")
+    print(f"  MODEL-ADDRESSABLE RECALL        : {validated:,}/{denom_addressable:,.0f} = "
           f"{recall_addressable:.1%}")
     print("      (excludes SME-only links no model can infer from text)")
     print("-" * 60)
     print("  USE THESE TWO. The naive number measures golden inflation, not the model.")
     return {"text_derivable": recall_textderivable, "addressable": recall_addressable,
             "denom_textderivable": denom_textderivable, "denom_addressable": denom_addressable}
-
 
 def draw_waterfall(golden_total, data_gap, not_judged, correct_rejection, overmapping,
                     sme, true_missed, insufficient, validated, save_path=None):
