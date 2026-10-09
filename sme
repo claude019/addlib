@@ -1,0 +1,280 @@
+import re, json, asyncio
+import numpy as np
+import pandas as pd
+from tqdm.auto import tqdm
+
+_need = ["verdicts", "golden", "alert_txt", "risk_txt", "oai", "tok", "MODEL",
+         "USE_CASE", "_norm_id", "_BLANK", "OUTPUT_DIR"]
+_gone = [n for n in _need if n not in globals()]
+if _gone:
+    raise NameError(f"not in this kernel: {_gone} -- run in the Direct notebook after [C] and [F-pre]")
+
+# ================================ settings ===================================
+CONCURRENCY = 20
+USE_CACHE   = True      # delete JUDGE_CACHE after editing the judge prompt below
+JUDGE_CACHE = OUTPUT_DIR / "judge_results_linked_pairs.parquet"
+DISC_ROWS   = list(range(4, 11))     # score rows in the template's DISCOVERY table
+CAUGHT_ROWS = list(range(5, 11))     # score rows in the template's CAUGHT table
+VERDICT_LABEL = {"AGREE": "CONFIRMED", "DISAGREE": "DISPUTED", "UNCERTAIN": "NEEDS_SME"}
+ROW_NAME = {"CONFIRMED": "LLM as a judge predicted - confirmed Linked",
+            "NEEDS_SME": "LLM as a judge predicted - Not sure",
+            "DISPUTED":  "LLM as a judge predicted - Should not be linked"}
+
+# ============================ independent judge ==============================
+# Sees: alert text, risk text, model decision, model reasoning. NOT the golden label.
+RISK_AUDIT_PROMPT = """ROLE:
+You are an independent reviewer. A linkage model decided that an ALERT bears on a
+LIBRARY RISK (decision = LINKED) and gave its reasoning. Do not just restate the
+model's reasoning -- independently re-derive the answer from the alert text and
+the risk text only.
+
+VERDICT:
+- AGREE: the two texts support the link.
+- DISAGREE: the two texts do not support the link (different subject matter,
+  wrong scope, or only a loose thematic overlap).
+- UNCERTAIN: the link is plausible but cannot be established from these two texts
+  alone -- it would need a subject-matter expert.
+
+Quote exactly, verbatim, from the supplied texts in alert_quote and risk_quote --
+these are checked programmatically against the source text, so a quote that does
+not appear verbatim will be treated as unsupported.
+
+Return JSON only:
+{"verdict": "AGREE" | "DISAGREE" | "UNCERTAIN",
+ "error_type": "FALSE_LINK_UNSUPPORTED" | "FALSE_LINK_WRONG_SCOPE" | "FALSE_LINK_THEMATIC" | "NONE",
+ "correct_decision": "LINKED" | "NOT_LINKED" | "UNCERTAIN",
+ "model_evidence_supports_decision": true | false,
+ "confidence": 1-5,
+ "alert_quote": "verbatim substring of the alert text",
+ "risk_quote": "verbatim substring of the risk text",
+ "rationale": "one or two plain sentences"}"""
+
+RISK_AUDIT_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {"name": "risk_audit", "strict": True, "schema": {
+        "type": "object", "additionalProperties": False,
+        "required": ["verdict", "error_type", "correct_decision",
+                     "model_evidence_supports_decision", "confidence",
+                     "alert_quote", "risk_quote", "rationale"],
+        "properties": {
+            "verdict": {"type": "string", "enum": ["AGREE", "DISAGREE", "UNCERTAIN"]},
+            "error_type": {"type": "string", "enum": ["FALSE_LINK_UNSUPPORTED",
+                           "FALSE_LINK_WRONG_SCOPE", "FALSE_LINK_THEMATIC", "NONE"]},
+            "correct_decision": {"type": "string", "enum": ["LINKED", "NOT_LINKED", "UNCERTAIN"]},
+            "model_evidence_supports_decision": {"type": "boolean"},
+            "confidence": {"type": "integer"},
+            "alert_quote": {"type": "string"},
+            "risk_quote": {"type": "string"},
+            "rationale": {"type": "string"}}}}
+}
+
+def _failed_out(msg):
+    return {"_failed": True, "_error": msg}
+
+async def _risk_audit_one(alert_text, risk_text, model_reasoning):
+    payload = {"alert_text": alert_text, "risk_text": risk_text,
+               "model_decision": "LINKED", "model_reasoning": model_reasoning}
+    messages = [{"role": "system", "content": RISK_AUDIT_PROMPT},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+    kw = {"model": MODEL, "user": USE_CASE, "response_format": RISK_AUDIT_SCHEMA}
+    if "gemini" in MODEL.lower():
+        kw.update(temperature=0.0, seed=42, reasoning_effort="low", max_tokens=1200)
+    else:
+        kw.update(reasoning_effort="low", max_completion_tokens=1200)
+    last_err = None
+    for attempt in range(1, 4):
+        try:
+            token = await tok.get()
+            r = await oai.chat.completions.create(
+                messages=messages, extra_headers={"Authorization": f"Bearer {token}"}, **kw)
+            out = json.loads(r.choices[0].message.content)
+            out["_failed"] = False
+            return out
+        except Exception as e:
+            last_err = f"{type(e).__name__}: {e}"
+            if "401" in str(e):
+                await tok.invalidate()
+            await asyncio.sleep(1.5 ** attempt)
+    return _failed_out(last_err)
+
+def _norm_text(s):
+    return re.sub(r"\s+", " ", str(s)).strip().lower()
+
+def quote_check(quote, source_text):
+    return bool(quote) and _norm_text(quote) in _norm_text(source_text)
+
+def verdict_after_quote_check(out, alert_text, risk_text):
+    """AGREE without verifiable quotes is downgraded to UNCERTAIN (Method pt 3)."""
+    verified = (quote_check(out.get("alert_quote", ""), alert_text)
+                and quote_check(out.get("risk_quote", ""), risk_text))
+    verdict = out["verdict"]
+    if not verified and verdict == "AGREE":
+        verdict = "UNCERTAIN"
+    return verdict, verified
+
+async def run_judge(df, concurrency=CONCURRENCY):
+    sem  = asyncio.Semaphore(concurrency)
+    rows = df.reset_index(drop=True)
+
+    async def _one(i, r):
+        async with sem:
+            a, t = alert_txt.get(r.REC, ""), risk_txt.get(r.RISK, "")
+            reasoning = r.reasoning if isinstance(r.reasoning, str) else ""
+            out = (_failed_out("missing alert/risk text for this id") if (not a or not t)
+                   else await _risk_audit_one(a, t, reasoning))
+            if out["_failed"]:
+                return i, {"audit_label": "JUDGE_ERROR", "verdict_raw": "", "downgraded": False,
+                           "evidence_verified": False, "error_type": "", "confidence": np.nan,
+                           "judge_failed": True, "judge_error": out["_error"], "judge_json": ""}
+            vfinal, verified = verdict_after_quote_check(out, a, t)
+            label = VERDICT_LABEL[vfinal]
+            if r.bucket == "CAUGHT" and label == "NEEDS_SME":
+                label = "DISPUTED"              # CAUGHT has two buckets only
+            return i, {"audit_label": label, "verdict_raw": out["verdict"],
+                       "downgraded": (out["verdict"] == "AGREE" and vfinal == "UNCERTAIN"),
+                       "evidence_verified": verified, "error_type": out["error_type"],
+                       "confidence": out["confidence"], "judge_failed": False, "judge_error": "",
+                       "judge_json": json.dumps({k: v for k, v in out.items() if not k.startswith("_")},
+                                                ensure_ascii=False)}
+
+    tasks = [asyncio.create_task(_one(i, r)) for i, r in enumerate(rows.itertuples())]
+    res = {}
+    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="judge"):
+        i, d = await fut
+        res[i] = d
+    return pd.concat([rows, pd.DataFrame([res[i] for i in range(len(rows))])], axis=1)
+
+# ============================ buckets (pair level) ===========================
+def build_buckets(verdicts_df, golden_df):
+    if "relevance_score" not in verdicts_df.columns:
+        raise KeyError(f"verdicts has no relevance_score; columns = {list(verdicts_df.columns)}")
+    v = verdicts_df.copy()
+    v["REC"], v["RISK"] = _norm_id(v.RECORD_ID), _norm_id(v.LIB_RISK)
+    v["DEC"] = v.decision.astype(str).str.strip().str.upper()
+    rank = {"LINKED": 4, "INSUFFICIENT_EVIDENCE": 3, "NOT_LINKED": 2, "MISSING": 1, "ERROR": 0}
+    v = (v.assign(_r=v.DEC.map(rank).fillna(-1)).sort_values("_r", ascending=False)
+           .drop_duplicates(["REC", "RISK"]).drop(columns="_r"))
+    g  = golden_df[~golden_df.LIB_RISK.isin(_BLANK)]
+    g  = g[g.RECORD_ID.isin(set(v.REC))]
+    gp = g[["RECORD_ID", "LIB_RISK"]].drop_duplicates()
+    gkeys = set(gp.RECORD_ID + "|" + gp.LIB_RISK)
+    v["key"]          = v.REC + "|" + v.RISK
+    v["golden"]       = v.key.isin(gkeys)
+    v["model_linked"] = v.DEC.eq("LINKED")
+    v["score"]        = pd.to_numeric(v["relevance_score"], errors="coerce")
+    v["bucket"] = np.select(
+        [v.golden & v.model_linked, ~v.golden & v.model_linked, v.golden & ~v.model_linked],
+        ["CAUGHT", "DISCOVERY", "MISSED"], default="TRUE_NEGATIVE")
+    n_never = len(gkeys - set(v.key))
+    return v, gp, n_never
+
+v_all, gp, n_never = build_buckets(verdicts, golden)
+golden_total = len(gp)
+print(f"pairs judged {len(v_all):,} | golden pairs {golden_total:,} | golden never judged {n_never:,}")
+print("CAUGHT {:,} | DISCOVERY {:,} | MISSED {:,}".format(
+    *[int((v_all.bucket == b).sum()) for b in ("CAUGHT", "DISCOVERY", "MISSED")]))
+print("template headers say: CAUGHT 293 | DISCOVERY 1,367 | MISSED 939 | judged 18,676")
+print("  -> if these differ, `verdicts` in this kernel is a different run from the sheet\n")
+
+# ============================ run the judge ==================================
+keep = ["REC", "RISK", "bucket", "golden", "model_linked", "score", "decision", "reasoning"]
+to_audit = v_all[v_all.bucket.isin(["CAUGHT", "DISCOVERY"])][keep]
+
+audited, cache_ok = None, False
+if USE_CACHE and JUDGE_CACHE.exists():
+    cached = pd.read_parquet(JUDGE_CACHE)
+    cache_ok = (set(zip(cached.REC, cached.RISK, cached.bucket))
+                == set(zip(to_audit.REC, to_audit.RISK, to_audit.bucket))
+                and not cached.judge_failed.any())
+    print("judge cache:", "reused" if cache_ok else "ignored (different pairs, or it holds failed calls)")
+    if cache_ok:
+        audited = cached
+if audited is None:
+    audited = await run_judge(to_audit)
+    audited.to_parquet(JUDGE_CACHE, index=False)
+
+def _reason(r):
+    if r.audit_label in ("CONFIRMED", "JUDGE_ERROR"): return ""
+    if r.verdict_raw == "DISAGREE":                   return "judge disagreed"
+    if r.downgraded:                                  return "agreed, but quotes not verifiable"
+    return "judge unsure"
+audited["reason_detail"] = audited.apply(_reason, axis=1)
+
+nfail = int(audited.judge_failed.sum())
+print(f"\njudge calls failed: {nfail}  (must be 0 before trusting any table below)")
+if nfail:
+    print("first error:", audited.loc[audited.judge_failed, "judge_error"].iloc[0])
+print("\nwhy rows are not CONFIRMED:")
+print(pd.crosstab([audited.bucket, audited.audit_label],
+                  audited.reason_detail).loc[lambda d: d.index.get_level_values(1) != "CONFIRMED"].to_string(), "\n")
+
+disc_all   = audited[audited.bucket == "DISCOVERY"].copy()
+caught_all = audited[audited.bucket == "CAUGHT"].copy()
+
+def _score_rows(df, template_rows, name):
+    n_nan = int(df.score.isna().sum())
+    obs   = sorted(set(df.score.dropna().astype(int)))
+    extra = [s for s in obs if s not in template_rows]
+    if n_nan: print(f"WARNING {name}: {n_nan} rows have no score -- not in the pivot below")
+    if extra: print(f"NOTE {name}: scores {extra} fall outside the template's rows "
+                    f"{template_rows[0]}-{template_rows[-1]}; the table below adds rows for them")
+    return sorted(set(template_rows) | set(obs))
+
+# ===== (1) "An independent AI judge checked" -- DISCOVERY ====================
+order = ["CONFIRMED", "NEEDS_SME", "DISPUTED"]
+t_judge = (disc_all[disc_all.audit_label.isin(order)].groupby("audit_label")
+           .agg(Links=("RISK", "size"), distinct_alert=("REC", "nunique"), distinct_LR=("RISK", "nunique"))
+           .reindex(order).fillna(0).astype(int))
+t_judge["% of discoveries"] = (t_judge.Links / max(t_judge.Links.sum(), 1)).round(3)
+t_judge.index = [ROW_NAME[i] for i in t_judge.index]
+print("(1) independent judge on DISCOVERY\n", t_judge.to_string(), "\n")
+
+# ===== (2) the two rows above it: split of the discovery links ===============
+golden_alerts = set(gp.RECORD_ID)
+has_golden = disc_all.REC.isin(golden_alerts)
+def _part(m):
+    s = disc_all[m]
+    return {"Links": len(s), "distinct_alert": s.REC.nunique(), "distinct_LR": s.RISK.nunique()}
+a, b = _part(has_golden), _part(~has_golden)
+t_split = pd.DataFrame({
+    f"# of linkage ({a['distinct_alert']} golden alerts that are new links adhoc to golden links)": a,
+    f"# of linkage ({b['distinct_alert']} alerts with no golden obligations linked)": b}).T
+print("(2) discovery split by whether the alert has any golden LR link\n", t_split.to_string(), "\n")
+
+# ===== (3) DISCOVERY: model score x judge label + cut-off columns ============
+d_ok   = disc_all[disc_all.audit_label.isin(order)]
+rows_d = _score_rows(disc_all, DISC_ROWS, "DISCOVERY")
+pv_disc = (pd.crosstab(d_ok.score.astype(int), d_ok.audit_label)
+             .reindex(index=rows_d, columns=["CONFIRMED", "DISPUTED", "NEEDS_SME"], fill_value=0))
+pv_disc["Grand Total"] = pv_disc.sum(axis=1)
+tot_conf, tot_all = int(pv_disc.CONFIRMED.sum()), int(pv_disc["Grand Total"].sum())
+pv_disc["Cut-off confirmed coverage"] = [pv_disc.loc[s:, "CONFIRMED"].sum() / max(tot_conf, 1) for s in pv_disc.index]
+pv_disc["Cut-off discovery volume"]   = [pv_disc.loc[s:, "Grand Total"].sum() / max(tot_all, 1) for s in pv_disc.index]
+pv_disc.loc["Grand Total"] = list(pv_disc.iloc[:, :4].sum()) + [1.0, 1.0]
+print("(3) DISCOVERY by score  (cut-off = score >= row)\n", pv_disc.round(3).to_string(), "\n")
+
+# ===== (4) CAUGHT: model score x judge label + golden-link recall ============
+c_ok   = caught_all[caught_all.audit_label.isin(["CONFIRMED", "DISPUTED"])]
+rows_c = _score_rows(caught_all, CAUGHT_ROWS, "CAUGHT")
+pv_caught = (pd.crosstab(c_ok.score.astype(int), c_ok.audit_label)
+               .reindex(index=rows_c, columns=["CONFIRMED", "DISPUTED"], fill_value=0))
+pv_caught["Grand Total"] = pv_caught.sum(axis=1)
+# recall comes from the MODEL's score, so it counts every caught pair (judge errors included)
+pv_caught["Golden link recall at cut-off"] = [(caught_all.score >= s).sum() / max(golden_total, 1)
+                                              for s in pv_caught.index]
+pv_caught.loc["Grand Total"] = list(pv_caught.iloc[:, :3].sum()) + [len(caught_all) / max(golden_total, 1)]
+print(f"(4) CAUGHT by score  (recall = caught pairs with score >= row / {golden_total:,} golden pairs)\n",
+      pv_caught.round(3).to_string(), "\n")
+
+err_d, err_c = int((disc_all.audit_label == "JUDGE_ERROR").sum()), int((caught_all.audit_label == "JUDGE_ERROR").sum())
+print(f"reconcile  DISCOVERY pivot {int(pv_disc.loc['Grand Total', 'Grand Total']):,} + {err_d} errors = {len(disc_all):,} | "
+      f"CAUGHT pivot {int(pv_caught.loc['Grand Total', 'Grand Total']):,} + {err_c} errors = {len(caught_all):,}")
+
+out = OUTPUT_DIR / "LR_template_tables_direct.xlsx"
+with pd.ExcelWriter(out, engine="openpyxl") as xl:
+    t_judge.to_excel(xl, sheet_name="judge_summary")
+    t_split.to_excel(xl, sheet_name="alert_split")
+    pv_disc.to_excel(xl, sheet_name="discovery_by_score")
+    pv_caught.to_excel(xl, sheet_name="caught_by_score")
+    audited.to_excel(xl, sheet_name="audited_pairs", index=False)
+print("saved ->", out)
