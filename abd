@@ -1,0 +1,133 @@
+import pandas as pd
+import openpyxl
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+
+_need = ["v_all", "gp", "golden_total", "audited", "disc_all", "caught_all",
+         "t_judge", "t_split", "pv_disc", "pv_caught"]
+_gone = [n for n in _need if n not in globals()]
+if _gone:
+    raise NameError(f"not in this kernel: {_gone} -- run the judge+tables script first")
+
+NAVY, WHITE_BOLD = "1F3864", Font(name="Arial", bold=True, color="FFFFFF")
+HEADER = PatternFill("solid", fgColor=NAVY)
+thin = Side(style="thin", color="BFBFBF")
+BORDER = Border(left=thin, right=thin, top=thin, bottom=thin)
+NOTE = Font(name="Arial", italic=True, size=9, color="C00000")
+
+wb = openpyxl.Workbook()
+ws = wb.active; ws.title = "Alert_LR_performance_filled"
+r = 1
+
+def banner(text, span=6):
+    global r
+    c = ws.cell(row=r, column=1, value=text)
+    c.font = WHITE_BOLD; c.fill = HEADER
+    ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=span)
+    r += 2
+
+def kv_table(title, rows):
+    global r
+    banner(title, span=3)
+    for label, val in rows:
+        ws.cell(row=r, column=1, value=label).border = BORDER
+        c = ws.cell(row=r, column=2, value=val); c.border = BORDER
+        r += 1
+    r += 1
+
+def df_table(title, df, note=None):
+    global r
+    banner(title, span=max(3, len(df.columns) + 1))
+    if note:
+        ws.cell(row=r, column=1, value=note).font = NOTE
+        ws.merge_cells(start_row=r, start_column=1, end_row=r, end_column=len(df.columns) + 1)
+        r += 1
+    ws.cell(row=r, column=1, value=df.index.name or "").font = WHITE_BOLD
+    ws.cell(row=r, column=1).fill = HEADER
+    for j, col in enumerate(df.columns, start=2):
+        c = ws.cell(row=r, column=j, value=str(col)); c.font = WHITE_BOLD; c.fill = HEADER
+    r += 1
+    for idx, row in df.iterrows():
+        ws.cell(row=r, column=1, value=str(idx)).border = BORDER
+        for j, val in enumerate(row, start=2):
+            c = ws.cell(row=r, column=j, value=val); c.border = BORDER
+        r += 1
+    r += 1
+
+# ---- ALERT/LR in Scope -------------------------------------------------------
+kv_table("ALERT/ LR in Scope", [
+    ("Total Alerts", int(v_all.REC.nunique())),
+    ("Library Risk in Scope", int(v_all.RISK.nunique())),
+    ("Golden Alerts to LR Linkages", int(golden_total)),
+    ("Full Model Judged Alert to LR Pairs", int(len(v_all))),
+])
+
+# ---- Confusion matrix ---------------------------------------------------------
+tp = int((v_all.bucket == "CAUGHT").sum());        fp = int((v_all.bucket == "DISCOVERY").sum())
+fn = int((v_all.bucket == "MISSED").sum());         tn = int((v_all.bucket == "TRUE_NEGATIVE").sum())
+cm = pd.DataFrame(
+    [[tp, fp, tp + fp], [fn, tn, fn + tn], [tp + fn, fp + tn, tp + fp + fn + tn]],
+    index=["Model = LINKED", "Model = NOT_LINKED", "Column total"],
+    columns=["Golden = LINKED", "Golden = NOT_LINKED (New discovery)", "Row total"])
+cm.index.name = "Confusion matrix"
+df_table("Confusion matrix (gpt-5.6-luna, winning prompt)", cm)
+
+# ---- Headline metrics -----------------------------------------------------
+recall    = tp / max(tp + fn, 1)
+precision = tp / max(tp + fp, 1)
+accuracy  = (tp + tn) / max(tp + fp + fn + tn, 1)
+hm = pd.DataFrame({"Naive Metrics": [f"{recall:.1%}", f"{precision:.1%}", f"{accuracy:.1%}"],
+                   "Text Derivable": ["n/a", "n/a", "n/a"]},
+                  index=["Recall", "Precision", "Accuracy"])
+hm.index.name = "Headline metrics"
+df_table("Headline metrics", hm,
+         note=("Text Derivable column intentionally blank -- this run's judge only audited "
+               "CAUGHT+DISCOVERY (AUDIT_MISSED_N=0). An honest/text-derivable recall needs the "
+               "judge to also have looked at a MISSED sample; rerun with AUDIT_MISSED_N>0 first."))
+
+# ---- Golden Dataset Story ---------------------------------------------------
+caught_df = v_all[v_all.bucket == "CAUGHT"]
+gds = pd.DataFrame({
+    "Test linkages in the data (Golden data)": [golden_total, golden_total, tp,
+                                                 f"{tp/max(golden_total,1):.1%}"],
+    "distinct alert": [int(gp.RECORD_ID.nunique()), int(gp.RECORD_ID.nunique()),
+                       int(caught_df.REC.nunique()),
+                       f"{caught_df.REC.nunique()/max(gp.RECORD_ID.nunique(),1):.1%}"],
+    "distinct LR": [int(gp.LIB_RISK.nunique()), int(gp.LIB_RISK.nunique()),
+                   int(caught_df.RISK.nunique()),
+                   f"{caught_df.RISK.nunique()/max(gp.LIB_RISK.nunique(),1):.1%}"],
+}, index=["Overall Golden dataset", "Checked by model", "Predicted correctly (True positive)", "Recall"])
+gds.index.name = "Golden Dataset Story"
+df_table("Golden Dataset Story", gds)
+
+# ---- An independent AI judge checked (DISCOVERY) ----------------------------
+jt = t_judge.rename(columns={"distinct_alert": "distinct alert", "distinct_LR": "distinct obligation",
+                             "% of discoveries": "% of discoveries"})
+jt["Key take away"] = ""     # fill by hand
+jt.index.name = "An independent AI judge checked (LLM as a judge)"
+df_table("An independent AI judge checked (LLM as a judge)", jt)
+
+# ---- discovery split ---------------------------------------------------------
+ts = t_split.rename(columns={"distinct_alert": "distinct alert", "distinct_LR": "distinct LR"})
+ts.index.name = ""
+df_table("Left[ Total Linkage {:,} - Golden linkage {:,} ]".format(fp, golden_total), ts)
+
+# ---- Can we reduce the discovery bit somehow? -------------------------------
+banner("Can we reduce the discoverbit some how?", span=8)
+
+pd_ = pv_disc.rename(columns={"Cut-off confirmed coverage": "Cust off level confirmed Coverage",
+                              "Cut-off discovery volume": "Cust off level discovery volume"})
+pd_.index.name = "Model Score"
+df_table(f"bucket : DISCOVERY for {fp:,}", pd_)
+
+pc_ = pv_caught.rename(columns={"Golden link recall at cut-off": "Golden Link Recall"})
+pc_.index.name = "Model Score"
+df_table(f"bucket : CAUGHT for {tp:,}", pc_)
+
+# ---- cosmetics ----------------------------------------------------------------
+for col in "ABCDEFGHI":
+    ws.column_dimensions[col].width = 26
+
+out = OUTPUT_DIR / "Alert_LR_performance_filled.xlsx"
+wb.save(out)
+print("saved ->", out)
