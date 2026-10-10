@@ -1,0 +1,17 @@
+_need = ["audited", "caught_all", "disc_all"]
+_gone = [n for n in _need if n not in globals()]
+
+if _gone:
+    print(f"missing from this kernel: {_gone} -- rebuilding from JUDGE_CACHE on disk")
+    audited = pd.read_parquet(JUDGE_CACHE)
+    caught_all = audited[audited.bucket == "CAUGHT"].copy()
+    disc_all   = audited[audited.bucket == "DISCOVERY"].copy()
+
+print("CAUGHT distinct alert:", caught_all.REC.nunique())
+print("CAUGHT distinct LR:", caught_all.RISK.nunique())
+print()
+print("DISCOVERY scores 0-3:\n",
+      disc_all[disc_all.score < 4].groupby("score").audit_label.value_counts().unstack(fill_value=0))
+print()
+print("CAUGHT scores 2-4:\n",
+      caught_all[caught_all.score < 5].groupby("score").audit_label.value_counts().unstack(fill_value=0))
