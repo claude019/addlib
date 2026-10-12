@@ -1,0 +1,6 @@
+tax_id_cols = ['risk_taxonomy_l1_id', 'risk_taxonomy_l2_id', 'risk_taxonomy_l3_id']
+fwd_id = helios.groupby(tax_id_cols, dropna=False)['library_risk_id'].nunique()
+rev_id = helios.groupby('library_risk_id', dropna=False)[tax_id_cols].nunique()
+
+print(fwd_id[fwd_id > 1])
+print(rev_id[(rev_id > 1).any(axis=1)])   # was (fwd_id > 1) — fixed
