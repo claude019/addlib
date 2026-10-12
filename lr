@@ -2,26 +2,26 @@
 # library risk ID, and that extract2's mapping agrees with the Helios golden source.
 #
 # Run this in your notebook after `helios` and `extract2` are already loaded.
-# Check column names first — they're read off screenshots and may not match exactly:
+# Check column names first -- they're read off screenshots and may not match exactly:
 #   print(helios.columns.tolist())
 #   print(extract2.columns.tolist())
 
 # --- Step 1: internal consistency check within extract2 ---------------------
 
 tax_cols_e2 = [
-    'regulation_summary_risk_taxonomy_l1',
-    'regulation_summary_risk_taxonomy_l2',
-    'regulation_summary_risk_taxonomy_l3',
+    'Regulation Summary Risk Taxonomy L1',
+    'Regulation Summary Risk Taxonomy L2',
+    'Regulation Summary Risk Taxonomy L3',
 ]
-lr_col_e2 = 'regulation_summary_library_risk_id_number'
+lr_col_e2 = 'Regulation Summary Library Risk ID Number'
 
 fwd = extract2.groupby(tax_cols_e2, dropna=False)[lr_col_e2].nunique()
 rev = extract2.groupby(lr_col_e2, dropna=False)[tax_cols_e2].nunique()
 
-print("Taxonomy combos mapping to >1 library risk ID (should be empty):")
+print("Taxonomy combos mapping to >1 library risk ID:")
 print(fwd[fwd > 1])
 
-print("\nLibrary risk IDs mapping to >1 taxonomy combo (should be empty):")
+print("\nLibrary risk IDs mapping to >1 taxonomy combo:")
 print(rev[(rev > 1).any(axis=1)])
 
 # --- Step 2: check ID format matches before joining to helios ---------------
@@ -32,8 +32,12 @@ print(helios['library_risk_id'].dropna().unique()[:5])
 print("\nSample extract2 library risk id values:")
 print(extract2[lr_col_e2].dropna().unique()[:5])
 
-# If the formats differ (e.g. 'LR-00000875' vs 875 or '00000875'), normalize
-# one side to match. Example if extract2 is numeric and helios has the prefix:
+# extract2 carries a literal '-' placeholder for missing IDs, not NaN --
+# that gets filtered out explicitly below, after extract2_lr is built.
+
+# If the formats still differ (e.g. 'LR-00000875' vs 875 or '00000875'),
+# normalize one side to match. Example if extract2 is numeric and helios
+# has the prefix:
 #
 # extract2[lr_col_e2] = 'LR-' + extract2[lr_col_e2].astype(str).str.zfill(8)
 
@@ -54,22 +58,45 @@ extract2_lr = (
     .drop_duplicates()
     .rename(columns={
         lr_col_e2: 'library_risk_id',
-        'regulation_summary_risk_taxonomy_l1': 'l1_extract2',
-        'regulation_summary_risk_taxonomy_l2': 'l2_extract2',
-        'regulation_summary_risk_taxonomy_l3': 'l3_extract2',
+        'Regulation Summary Risk Taxonomy L1': 'l1_extract2',
+        'Regulation Summary Risk Taxonomy L2': 'l2_extract2',
+        'Regulation Summary Risk Taxonomy L3': 'l3_extract2',
     })
 )
 
-assert extract2_lr['library_risk_id'].duplicated().sum() == 0, \
-    "extract2 still has one library_risk_id with more than one taxonomy combo — fix Step 1 issues first"
+# drop the '-' placeholder rows AFTER the rebuild, not before
+extract2_lr = extract2_lr[extract2_lr['library_risk_id'] != '-']
+
+# --- Step 3b: inspect duplicates instead of asserting them away -------------
+# Step 1 already found real cases where one library_risk_id carries more than
+# one taxonomy combo in extract2 (e.g. LR-00000850). Set those aside rather
+# than halting the notebook on them.
+
+dupes = (
+    extract2_lr[extract2_lr['library_risk_id'].duplicated(keep=False)]
+    .sort_values('library_risk_id')
+)
+
+print(f"\nlibrary_risk_ids with >1 taxonomy combo in extract2: {dupes['library_risk_id'].nunique()}")
+dupes
 
 # --- Step 4: merge and compare taxonomy text on each side -------------------
+# Only the library_risk_ids that are internally consistent in extract2 go
+# into the clean merge; the duplicated ones stay in `dupes` for follow-up.
 
-merged = helios_lr.merge(extract2_lr, on='library_risk_id', how='inner')
+clean_lr_ids = extract2_lr.loc[
+    ~extract2_lr['library_risk_id'].isin(dupes['library_risk_id']),
+    'library_risk_id'
+].unique()
 
-print(f"\nLibrary risk IDs in helios:          {helios_lr.shape[0]}")
-print(f"Library risk IDs in extract2:         {extract2_lr.shape[0]}")
-print(f"Library risk IDs matched in both:     {merged.shape[0]}")
+merged = helios_lr.merge(
+    extract2_lr[extract2_lr['library_risk_id'].isin(clean_lr_ids)],
+    on='library_risk_id', how='inner'
+)
+
+print(f"\nLibrary risk IDs in helios:                 {helios_lr.shape[0]}")
+print(f"Library risk IDs in extract2 (clean subset): {len(clean_lr_ids)}")
+print(f"Library risk IDs matched in both:            {merged.shape[0]}")
 
 mismatches = merged[
     (merged['l1_helios'] != merged['l1_extract2']) |
