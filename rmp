@@ -1,0 +1,34 @@
+# Same internal-consistency check as extract2, run on extract3 -- confirms
+# (or extends) the two rule violations already found within RegMap's own data.
+
+tax_cols_e3 = [
+    'Regulation Summary Risk Taxonomy L1',
+    'Regulation Summary Risk Taxonomy L2',
+    'Regulation Summary Risk Taxonomy L3',
+]
+lr_col_e3 = 'Regulation Summary Library Risk ID Number'
+
+fwd_e3 = extract3.groupby(tax_cols_e3, dropna=False)[lr_col_e3].nunique()
+rev_e3 = extract3.groupby(lr_col_e3, dropna=False)[tax_cols_e3].nunique()
+
+print("extract3 -- taxonomy combos mapping to >1 library risk ID:")
+print(fwd_e3[fwd_e3 > 1])
+
+print("\nextract3 -- library risk IDs mapping to >1 taxonomy combo:")
+print(rev_e3[(rev_e3 > 1).any(axis=1)])
+
+# Cross-check against the two violations already found in extract2
+known_violations = [
+    ('Regulatory Compliance Risk', 'Inappropriate market conduct',
+     'Failure to identify, record and report conflicts of interest'),
+    ('Retail Credit Risk', 'Failure in Retail Credit Risk Processes',
+     'Failure in Customer Risk Assessment'),
+]
+print("\nSame combos in extract3:")
+for combo in known_violations:
+    match = extract3[
+        (extract3[tax_cols_e3[0]] == combo[0]) &
+        (extract3[tax_cols_e3[1]] == combo[1]) &
+        (extract3[tax_cols_e3[2]] == combo[2])
+    ][lr_col_e3].unique()
+    print(combo, '->', match)
