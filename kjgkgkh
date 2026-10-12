@@ -1,6 +1,82 @@
-tax_id_cols = ['risk_taxonomy_l1_id', 'risk_taxonomy_l2_id', 'risk_taxonomy_l3_id']
-fwd_id = helios.groupby(tax_id_cols, dropna=False)['library_risk_id'].nunique()
-rev_id = helios.groupby('library_risk_id', dropna=False)[tax_id_cols].nunique()
+# Final confirmation checks before presenting findings.
+# Run after merged / helios_lr / extract2_lr / clean_lr_ids / mismatches
+# already exist from the earlier validation steps.
 
-print(fwd_id[fwd_id > 1])
-print(rev_id[(rev_id > 1).any(axis=1)])   # was (fwd_id > 1) — fixed
+import re
+
+# --- 1. Separate real mismatches from pure formatting noise -----------------
+
+def norm_light(s):
+    if pd.isna(s):
+        return s
+    return re.sub(r'\s+', ' ', str(s).strip()).lower()
+
+for col in ['l1_helios', 'l2_helios', 'l3_helios', 'l1_extract2', 'l2_extract2', 'l3_extract2']:
+    merged[col + '_norm'] = merged[col].apply(norm_light)
+
+real_mismatches = merged[
+    (merged['l1_helios_norm'] != merged['l1_extract2_norm']) |
+    (merged['l2_helios_norm'] != merged['l2_extract2_norm']) |
+    (merged['l3_helios_norm'] != merged['l3_extract2_norm'])
+]
+print(f"Mismatches after whitespace/case normalization: {real_mismatches.shape[0]} "
+      f"(was {mismatches.shape[0]} on raw text)")
+
+# --- 2. Which extract2 library_risk_ids never matched helios at all? --------
+
+unmatched_ids = extract2_lr.loc[
+    extract2_lr['library_risk_id'].isin(clean_lr_ids)
+    & ~extract2_lr['library_risk_id'].isin(helios_lr['library_risk_id']),
+    'library_risk_id'
+].unique()
+print(f"\nextract2 library_risk_ids with no helios match: {len(unmatched_ids)}")
+print(unmatched_ids)
+
+# --- 3. Full detail on LR-00000850: one inconsistent risk, or several? ------
+
+print("\nLR-00000850 in helios:")
+display(helios[helios['library_risk_id'] == 'LR-00000850'][
+    ['library_risk_id', 'risk_taxonomy_l1', 'risk_taxonomy_l2', 'risk_taxonomy_l3', 'title']
+].drop_duplicates())
+
+print("\nLR-00000850 in extract2:")
+display(extract2[extract2[lr_col_e2] == 'LR-00000850'][
+    tax_cols_e2 + [lr_col_e2, 'Regulation Summary ID', 'Regulation Summary Title']
+].drop_duplicates())
+
+# --- 4. Is the Treasury Risk pattern systematic (versioning) or scattered? --
+
+treasury_mismatches = real_mismatches[real_mismatches['l1_helios'] == 'Treasury Risk']
+print(f"\nTreasury Risk mismatches: {treasury_mismatches.shape[0]} "
+      f"of {real_mismatches.shape[0]} total")
+display(treasury_mismatches[['library_risk_id', 'l2_helios', 'l2_extract2', 'l3_helios', 'l3_extract2']])
+
+# --- 5. Cross-check against extract3 as a third source ----------------------
+# extract3 also carries a library risk ID column -- if it agrees with helios
+# where extract2 disagrees, that points to extract2 being the stale side.
+
+lr_col_e3 = 'Regulation Summary Library Risk ID Number'   # confirm exact name first
+tax_cols_e3 = [
+    'Regulation Summary Risk Taxonomy L1',
+    'Regulation Summary Risk Taxonomy L2',
+    'Regulation Summary Risk Taxonomy L3',
+]
+
+extract3_lr = (
+    extract3[[lr_col_e3] + tax_cols_e3]
+    .drop_duplicates()
+    .rename(columns={
+        lr_col_e3: 'library_risk_id',
+        tax_cols_e3[0]: 'l1_extract3',
+        tax_cols_e3[1]: 'l2_extract3',
+        tax_cols_e3[2]: 'l3_extract3',
+    })
+)
+
+three_way = real_mismatches.merge(extract3_lr, on='library_risk_id', how='left')
+print(f"\nMismatched IDs also present in extract3: {three_way['l1_extract3'].notna().sum()} "
+      f"of {three_way.shape[0]}")
+display(three_way[[
+    'library_risk_id', 'l1_helios', 'l1_extract2', 'l1_extract3',
+    'l2_helios', 'l2_extract2', 'l2_extract3',
+]])
