@@ -1,52 +1,55 @@
 
 
-As part of our review of GPPS policy data, we conducted a market-level analysis across the **54 markets/entities in scope** to assess the availability of local, regional and global policies in the GPPS UI and reconcile these observations with the underlying database tables.
+As part of our review of GPPS policy data, we analysed the 54 markets/entities in scope to assess the availability of local, regional and global policies in the GPPS UI and reconcile the findings with the underlying database tables.
 
-The objective was to identify potential data gaps and discrepancies between the database records and the policies accessible through the UI.
+The objective was to understand the current level of policy data coverage and identify any gaps that may need to be addressed or clarified before proceeding further with model development.
 
 **1. Summary of findings**
 
 The analysis identified the following:
 
-- **54 markets/entities** are in scope.
-- **44 markets/entities** have country-level policy data, while **10 markets/entities** have no policy rows in their respective country tables.
-- The country-level tables contain **493 policy rows** across the markets reviewed.
-- The global policy table contains **660 policy rows**, representing **260 unique policies**.
-- The review also identified instances where global policy IDs or related records are present in the underlying tables but are not visible in the GPPS UI.
-- No regional policies were identified as visible in the GPPS UI for the markets reviewed.
+- 54 markets/entities are in scope, of which 44 have country-level policy data and 10 have no policy rows in their respective country tables.
+- The country-level tables contain 493 policy rows in total.
+- The global policy table contains 660 policy rows, representing 260 unique policies.
+- No regional policies were identified as available in the GPPS UI for the markets reviewed.
+- Although the 10 identified markets have no country-level policy rows, global policy availability varies across these markets. Some have global policies visible in the UI, while other policy IDs are present in the underlying tables but are not visible in the UI.
 
-**2. Markets/entities with no country-level policy data**
+**2. Detailed findings for markets without country-level policy data**
 
-The following 10 markets/entities have no policy rows in their respective country-level tables:
+The following observations were recorded for the 10 markets with no country-level policy rows.
 
-Argentina, Canada, Chile, Guernsey, Israel, Isle of Man, Jersey, Cayman Islands, Saudi Arabia and Uruguay.
+- **Argentina:** No local or regional policies are visible in the GPPS UI. One global policy (ID 190) is visible in the UI. An additional global policy reference (ID 74) is present in the underlying data but is not visible in the UI.
+- **Chile:** No local or regional policies are visible in the GPPS UI. One global policy (ID 104) is visible in the UI and is also reflected in the database. Global policy ID 74 is present in the underlying data but is not visible in the UI.
+- **Saudi Arabia:** No local or regional policies are visible in the GPPS UI. Multiple global policies (IDs 31, 33, 34, 35, 37, 39, 54 and 90) are visible in the UI and reflected in the database. Global policy ID 74 is also present in the underlying data but is not visible in the UI. Additionally, Saudi Arabia is not currently included in the country list displayed in the GPPS UI.
+- **Uruguay:** No local or regional policies are visible in the GPPS UI. One global policy (ID 190) is visible in the UI. Global policy ID 74 is present in the underlying data but is not visible in the UI.
+- **Guernsey, Israel and Isle of Man:** No local or regional policies are visible in the GPPS UI. No global policies were identified as visible in the UI; however, global policy ID 74 is present in the underlying data but is not visible in the UI.
+- **Jersey:** No regional policies are visible in the GPPS UI. Local policy access is available on a restricted basis. No global policies were identified as visible in the UI, although global policy ID 74 is present in the underlying data but is not visible in the UI.
+- **Canada and Cayman Islands:** No local or regional policies are visible in the GPPS UI, and no global policy references were identified in the available data reviewed for these markets.
 
-The reconciliation of database records against the GPPS UI indicates the following:
+**3. Potential implications for model development**
 
-- **Argentina, Chile, Guernsey, Israel, Isle of Man, Jersey, Saudi Arabia and Uruguay:** Global policy references or related records were identified in the underlying data for these markets. However, policy availability and visibility in the GPPS UI require further validation.
-- **Canada and Cayman Islands:** No corresponding global policy references were identified in the available data reviewed.
-- **Jersey:** Local policy access is available in the GPPS UI on a restricted-access basis.
-- **Saudi Arabia:** The market is not currently included in the country list displayed in the GPPS UI.
+The findings highlight two areas that require further consideration.
 
-The detailed market-level analysis also captures the presence or absence of local, regional and global policies in the UI, alongside the corresponding policy IDs and records identified in the database tables.
+First, the absence of country-level policy data across these markets may limit the availability of market-specific policy information for model development and validation. While global policies are available for some markets, we need to establish whether this level of coverage is sufficient for the intended model scope.
 
-**3. Additional observations**
+Second, global policy IDs that exist in the underlying data but are not visible in the GPPS UI require clarification. Until their applicability and expected visibility are confirmed, we cannot establish whether these represent expected system behaviour, access restrictions or gaps requiring remediation.
 
-The review identified cases where global policy IDs are present in the underlying database tables but are not visible in the GPPS UI. Further validation is required to determine whether these records are unpublished, access-restricted, obsolete or otherwise excluded from the UI.
+These observations do not necessarily indicate confirmed defects, but they highlight areas where data completeness and policy availability need to be validated before their implications for model development can be determined.
 
-These observations are being documented as potential reconciliation gaps and should not be interpreted as confirmed system defects until the relevant policy and application owners have validated the expected behaviour.
+**4. Clarifications and next steps**
 
-**4. Validation required / next steps**
+Could the relevant policy and application owners please help confirm the following?
 
-Could the relevant policy and application owners please review the findings and help confirm the following:
+1. Whether the absence of country-level policy data for the identified markets is expected or whether additional local policy data is required.
+2. Whether the global policies currently visible in the UI provide sufficient coverage for these markets, given the intended model requirements.
+3. Whether global policy ID 74, which appears in the underlying data but is not visible in the UI for several markets, is expected to be available and, if so, whether any action is required.
+4. Whether the absence of global policy references for Canada and Cayman Islands is expected.
+5. Whether Saudi Arabia should be included in the country list displayed in the GPPS UI.
+6. Whether the restricted local policy access observed for Jersey is intentional and appropriately documented.
+7. Whether any additional data remediation or reconciliation is required before model development proceeds.
 
-1. Whether the absence of country-level policy data is expected for each of the 10 markets/entities identified.
-2. Whether the global policy records and IDs identified in the database should be accessible or visible in the GPPS UI.
-3. Whether any missing local or regional policies need to be created, migrated or made available in the UI.
-4. Whether the country-list configuration requires an update, particularly for Saudi Arabia.
-5. Whether restricted-access arrangements, such as those observed for Jersey, are intentional and appropriately documented.
-6. Whether any additional reconciliation is required between the database records and the policies displayed in the UI.
+The supporting Excel analysis contains the detailed market-level breakdown, including database table references, policy IDs, and the availability of local, regional and global policies in the GPPS UI.
 
-The supporting Excel analysis contains the detailed market-level breakdown, including the relevant database tables, policy row counts, unique policy counts, version information, segment counts, policy IDs and UI availability observations.
+Your feedback will help us confirm the expected state of policy coverage, determine which gaps require action, and assess any implications for model development.
 
-Please review the findings and share your feedback or any required corrections. This will help us establish a documented understanding of the current state and agree on any necessary follow-up actions.
+Kind regards,  
