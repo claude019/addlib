@@ -1,51 +1,31 @@
-# %% [T0] CONFIG
-# =============================================================================
-# T0. CONFIG - edit names here only (every column name lives in this cell)
-# =============================================================================
+# %% [1] CONFIG
 import re
-import difflib
 import numpy as np
 import pandas as pd
 from pathlib import Path
 
-ALERTS = alerts                         # Rapid2 REGDEV alerts (2,391 rows x 24 cols)
-HELIOS = helios                         # Helios wide, 1 row per risk instance
-GOLD   = globals().get("golden")        # optional: golden parquet (RECORD_ID, LIB_RISK)
-RWT    = globals().get("rwt")           # optional: defines the 161 scoped records
-VERD   = globals().get("verdicts")      # optional: LLM verdicts, to compare against
+ALERTS = alerts
+HELIOS = helios
+EXTRACT2 = extract2
+GOLD = globals().get("golden")      # optional
+RWT = globals().get("rwt")          # optional, defines scope for the hit-rate check
 
 OUT_DIR = Path("taxonomy_lookup_test")
 OUT_DIR.mkdir(exist_ok=True)
-XLSX    = OUT_DIR / "alert_to_helios_taxonomy_lookup_test.xlsx"
+XLSX = OUT_DIR / "alert_taxonomy_lookup.xlsx"
 
-C_ALERT_ID = "RECORD_ID"
-C_ALERT_L1 = "LEVEL_1_RISK_TAXONOMY"
-C_ALERT_L2 = "LEVEL_2_RISK_TAXONOMY"
-C_ALERT_L3 = "LEVEL_3_RISK_TAXONOMY"
-
-C_HEL_LR     = "library_risk_id"
-C_HEL_L1     = "risk_taxonomy_l1"
-C_HEL_L2     = "risk_taxonomy_l2"
-C_HEL_L3     = "risk_taxonomy_l3"
-C_HEL_STATUS = "library_risk_status"    # None to skip the Published filter
-C_HEL_TITLE  = "title"                  # None to skip
-C_HEL_IDS    = ["risk_taxonomy_l1_id", "risk_taxonomy_l2_id", "risk_taxonomy_l3_id"]  # None to skip ID check
-
-C_GOLD_REC = "RECORD_ID"
-C_GOLD_LR  = "LIB_RISK"
-C_RWT_ID   = "RECORD_ID"
-C_VERD_REC = "RECORD_ID"
-C_VERD_LR  = "LIB_RISK"
-C_VERD_DEC_CANDIDATES = ["decision", "verdict", "link_decision", "label"]
-
-HEL_PUBLISHED_ONLY = True
-PREFER_NON_RETIRING = True              # tie-break when a '(TO BE RETIRED)' node collides with its replacement
-STRICT_TIERS   = {"EXACT", "RELAXED"}
-ASSIGNED_TIERS = {"EXACT", "RELAXED", "L2L3_ONLY", "PREFIX"}
-SUGGEST_CUTOFF = 0.55
+C_ALERT_ID, C_ALERT_L1, C_ALERT_L2, C_ALERT_L3 = \
+    "RECORD_ID", "LEVEL_1_RISK_TAXONOMY", "LEVEL_2_RISK_TAXONOMY", "LEVEL_3_RISK_TAXONOMY"
+C_HEL_LR, C_HEL_L1, C_HEL_L2, C_HEL_L3, C_HEL_STATUS = \
+    "library_risk_id", "risk_taxonomy_l1", "risk_taxonomy_l2", "risk_taxonomy_l3", "library_risk_status"
+C_E2_LR, C_E2_L1, C_E2_L2, C_E2_L3 = \
+    "Regulation Summary Library Risk ID Number", "Regulation Summary Risk Taxonomy L1", \
+    "Regulation Summary Risk Taxonomy L2", "Regulation Summary Risk Taxonomy L3"
+C_GOLD_REC, C_GOLD_LR, C_RWT_ID = "RECORD_ID", "LIB_RISK", "RECORD_ID"
 
 BLANK = {"", "-", "NONE", "NAN", "NAT", "NULL", "<NA>", "N/A"}
 
+# %% [2] HELPERS
 def norm(s):
     if pd.isna(s):
         return np.nan
@@ -54,7 +34,7 @@ def norm(s):
         return np.nan
     s = re.sub(r"^\(\s*to be retired[^)]*\)\s*", "", s, flags=re.I)
     s = re.sub(r"\s+", " ", s).strip().lower()
-    return s if s else np.nan
+    return s or np.nan
 
 def norm_relaxed(s):
     s = norm(s)
@@ -63,13 +43,7 @@ def norm_relaxed(s):
     s = s.replace("&", " and ")
     s = re.sub(r"[^a-z0-9 ]+", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
-    return s if s else np.nan
-
-def nid(x):
-    if pd.isna(x):
-        return np.nan
-    s = re.sub(r"\.0$", "", str(x).strip().upper())
-    return np.nan if s in BLANK else s
+    return s or np.nan
 
 def lr_id(x):
     if pd.isna(x):
@@ -80,391 +54,152 @@ def lr_id(x):
     m = re.fullmatch(r"(?:LR-?)?(\d+)", s)
     return "LR-" + m.group(1).zfill(8) if m else s
 
-def resolve(c):
-    lrs = sorted({x[0] for x in c})
-    if len(lrs) == 1:
-        return lrs[0], 1, "", lrs
-    if PREFER_NON_RETIRING:
-        live = sorted({x[0] for x in c if not x[1]})
-        if len(live) == 1:
-            return live[0], len(lrs), "tiebreak_non_retiring", lrs
-    return np.nan, len(lrs), "multiple_LRs", lrs
+def nid(x):
+    if pd.isna(x):
+        return np.nan
+    s = re.sub(r"\.0$", "", str(x).strip().upper())
+    return np.nan if s in BLANK else s
 
-# %% [T1] INPUT CHECKS
-# =============================================================================
-# T1. INPUT CHECKS
-# =============================================================================
-need = {"alerts": (ALERTS, [C_ALERT_ID, C_ALERT_L1, C_ALERT_L2, C_ALERT_L3]),
-        "helios": (HELIOS, [C_HEL_LR, C_HEL_L1, C_HEL_L2, C_HEL_L3])}
-for name, (df, cols) in need.items():
-    miss = [c for c in cols if c not in df.columns]
-    assert not miss, f"{name} missing {miss}. Columns: {list(df.columns)}"
-if C_HEL_STATUS and C_HEL_STATUS not in HELIOS.columns:
-    print(f"WARN {C_HEL_STATUS} not in helios -> Published filter skipped")
-    C_HEL_STATUS = None
-if C_HEL_TITLE and C_HEL_TITLE not in HELIOS.columns:
-    C_HEL_TITLE = None
-if C_HEL_IDS and not all(c in HELIOS.columns for c in C_HEL_IDS):
-    print("WARN helios taxonomy ID columns not found -> ID-level 1:1 check skipped")
-    C_HEL_IDS = None
-print(f"alerts {ALERTS.shape} | helios {HELIOS.shape} | golden {'-' if GOLD is None else GOLD.shape} | "
-      f"rwt {'-' if RWT is None else RWT.shape} | verdicts {'-' if VERD is None else VERD.shape}")
-
-# %% [T2] HELIOS LOOKUP
-# =============================================================================
-# T2. HELIOS LOOKUP - one key per normalised taxonomy path
-# =============================================================================
-h = HELIOS.copy()
-if C_HEL_STATUS and HEL_PUBLISHED_ONLY:
-    h = h[h[C_HEL_STATUS].astype(str).str.strip().str.lower().eq("published")]
-assert len(h), "Published filter removed every Helios row - check C_HEL_STATUS values"
-
-h["lr"] = h[C_HEL_LR].map(lr_id)
-h = h.dropna(subset=["lr"])
-for i, c in ((1, C_HEL_L1), (2, C_HEL_L2), (3, C_HEL_L3)):
-    h[f"l{i}n"] = h[c].map(norm)
-    h[f"l{i}r"] = h[c].map(norm_relaxed)
-h["retiring"] = False
-for c in (C_HEL_L1, C_HEL_L2, C_HEL_L3):
-    h["retiring"] |= h[c].astype(str).str.match(r"^\s*\(\s*to be retired", case=False)
-
-hk = h[["lr", "l1n", "l2n", "l3n", "l1r", "l2r", "l3r", "retiring"]].drop_duplicates().reset_index(drop=True)
-HEL_LRS = set(hk["lr"])
-
-K3, K3R, K2R, K1R, K23R = {}, {}, {}, {}, {}
-for r in hk.to_dict("records"):
-    for d, key in ((K3, (r["l1n"], r["l2n"], r["l3n"])), (K3R, (r["l1r"], r["l2r"], r["l3r"])),
-                   (K2R, (r["l1r"], r["l2r"])), (K1R, (r["l1r"],)), (K23R, (r["l2r"], r["l3r"]))):
-        if any(pd.isna(k) for k in key):
-            continue
-        d.setdefault(key, []).append((r["lr"], bool(r["retiring"])))
-H_L1 = {k[0] for k in K1R}
-
-KEYSTR = {}
-for r in hk.to_dict("records"):
-    if pd.notna(r["l1r"]) and pd.notna(r["l2r"]) and pd.notna(r["l3r"]):
-        KEYSTR.setdefault(" | ".join([r["l1r"], r["l2r"], r["l3r"]]), r["lr"])
-print(f"Helios lookup: {len(HEL_LRS)} LRs | {len(K3)} exact keys | {len(K3R)} relaxed keys | "
-      f"{int(hk['retiring'].sum())} rows flagged (TO BE RETIRED)")
-
-# %% [T3] ALERT COMBOS
-# =============================================================================
-# T3. ALERT TAXONOMY COMBOS - resolve each distinct triple once
-# =============================================================================
-a = ALERTS.copy()
-a["_id"] = a[C_ALERT_ID].map(nid)
-a["ck"] = ("L1=" + a[C_ALERT_L1].fillna("<blank>").astype(str) + "\u00a6L2=" + a[C_ALERT_L2].fillna("<blank>").astype(str)
-           + "\u00a6L3=" + a[C_ALERT_L3].fillna("<blank>").astype(str))
-assert a["ck"].notna().all(), "combo key has NaN - taxonomy columns need cleaning"
-for i, c in ((1, C_ALERT_L1), (2, C_ALERT_L2), (3, C_ALERT_L3)):
-    a[f"l{i}n"] = a[c].map(norm)
-    a[f"l{i}r"] = a[c].map(norm_relaxed)
-
-combos = a.drop_duplicates("ck")[["ck", C_ALERT_L1, C_ALERT_L2, C_ALERT_L3,
-                                  "l1n", "l2n", "l3n", "l1r", "l2r", "l3r"]].copy()
-combos["n_alert_rows"] = combos["ck"].map(a["ck"].value_counts())
-print(f"alerts: {len(a)} rows | {a['_id'].nunique()} distinct records | {len(combos)} distinct taxonomy combos")
-
-# %% [T4] RESOLVE
-# =============================================================================
-# T4. RESOLVE - tiered match, never force a match
-# =============================================================================
-out = []
-for r in combos.to_dict("records"):
-    t1, t2, t3 = r["l1n"], r["l2n"], r["l3n"]
-    u1, u2, u3 = r["l1r"], r["l2r"], r["l3r"]
+def depth_of(u1, u2, u3):
     pop = [pd.notna(u1), pd.notna(u2), pd.notna(u3)]
     npop = sum(pop)
-    depth = 0
+    d = 0
     for p in pop:
         if not p:
             break
-        depth += 1
-    tier, c = None, None
+        d += 1
+    return npop, d
+
+# %% [3] BUILD A LOOKUP - same function for Helios and for extract2
+def build_lookup(df, lr_col, l1, l2, l3, has_retiring_prefix=False):
+    d = df.copy()
+    d["lr"] = d[lr_col].map(lr_id)
+    d = d.dropna(subset=["lr"])
+    for i, c in ((1, l1), (2, l2), (3, l3)):
+        d[f"l{i}n"] = d[c].map(norm)
+        d[f"l{i}r"] = d[c].map(norm_relaxed)
+    d["retiring"] = False
+    if has_retiring_prefix:
+        for c in (l1, l2, l3):
+            d["retiring"] |= d[c].astype(str).str.match(r"^\s*\(\s*to be retired", case=False)
+    k = d[["lr", "l1n", "l2n", "l3n", "l1r", "l2r", "l3r", "retiring"]].drop_duplicates()
+    K3, K3R, K2R, K1R, K23R = {}, {}, {}, {}, {}
+    for r in k.to_dict("records"):
+        for dd, key in ((K3, (r["l1n"], r["l2n"], r["l3n"])), (K3R, (r["l1r"], r["l2r"], r["l3r"])),
+                        (K2R, (r["l1r"], r["l2r"])), (K1R, (r["l1r"],)), (K23R, (r["l2r"], r["l3r"]))):
+            if not any(pd.isna(x) for x in key):
+                dd.setdefault(key, []).append((r["lr"], bool(r["retiring"])))
+    return {"K3": K3, "K3R": K3R, "K2R": K2R, "K1R": K1R, "K23R": K23R, "lrs": set(k["lr"])}
+
+hel_src = HELIOS[HELIOS[C_HEL_STATUS].astype(str).str.lower().eq("published")] \
+    if C_HEL_STATUS in HELIOS.columns else HELIOS
+HEL = build_lookup(hel_src, C_HEL_LR, C_HEL_L1, C_HEL_L2, C_HEL_L3, has_retiring_prefix=True)
+E2 = build_lookup(EXTRACT2, C_E2_LR, C_E2_L1, C_E2_L2, C_E2_L3, has_retiring_prefix=False)
+print(f"Helios: {len(HEL['lrs'])} published LRs | extract2: {len(E2['lrs'])} LRs")
+
+# %% [4] MATCH ONE TAXONOMY PATH AGAINST A LOOKUP - tiered, never forces a pick
+def match(lk, t1, t2, t3, u1, u2, u3):
+    npop, depth = depth_of(u1, u2, u3)
     if npop == 0:
-        tier = "NO_TAXONOMY"
-    elif depth != npop:
-        tier = "MALFORMED"
-    elif depth == 3:
-        if (t1, t2, t3) in K3:
-            tier, c = "EXACT", K3[(t1, t2, t3)]
-        elif (u1, u2, u3) in K3R:
-            tier, c = "RELAXED", K3R[(u1, u2, u3)]
-        elif (u2, u3) in K23R:
-            tier, c = "L2L3_ONLY", K23R[(u2, u3)]
-    elif depth == 2 and (u1, u2) in K2R:
-        tier, c = "PREFIX", K2R[(u1, u2)]
-    elif depth == 1 and (u1,) in K1R:
-        tier, c = "PREFIX", K1R[(u1,)]
-    lr, ncand, note, cand_list = np.nan, 0, "", []
+        return "NO_TAXONOMY", np.nan, []
+    if depth != npop:
+        return "MALFORMED", np.nan, []
+    tier, cand = None, None
+    if depth == 3:
+        if (t1, t2, t3) in lk["K3"]:
+            tier, cand = "EXACT", lk["K3"][(t1, t2, t3)]
+        elif (u1, u2, u3) in lk["K3R"]:
+            tier, cand = "RELAXED", lk["K3R"][(u1, u2, u3)]
+        elif (u2, u3) in lk["K23R"]:
+            tier, cand = "L2L3_ONLY", lk["K23R"][(u2, u3)]
+    elif depth == 2 and (u1, u2) in lk["K2R"]:
+        tier, cand = "PREFIX", lk["K2R"][(u1, u2)]
+    elif depth == 1 and (u1,) in lk["K1R"]:
+        tier, cand = "PREFIX", lk["K1R"][(u1,)]
     if tier is None:
-        tier = "UNMATCHED"
-    elif c is not None:
-        lr, ncand, note, cand_list = resolve(c)
-        if pd.isna(lr):
-            tier = tier + "_AMBIGUOUS"
-    fails_at = ""
-    if tier == "UNMATCHED":
-        if u1 not in H_L1:
-            fails_at = "L1"
-        elif pd.notna(u2) and (u1, u2) not in K2R:
-            fails_at = "L2"
-        elif pd.notna(u3):
-            fails_at = "L3"
-    suggest = ""
-    if tier == "UNMATCHED" and npop:
-        q = " | ".join("" if pd.isna(x) else x for x in (u1, u2, u3)).strip(" |")
-        near = difflib.get_close_matches(q, list(KEYSTR), n=3, cutoff=SUGGEST_CUTOFF)
-        suggest = " ;; ".join(f"{KEYSTR[k]} ({difflib.SequenceMatcher(None, q, k).ratio():.2f}): {k}" for k in near)
-    out.append({"ck": r["ck"], "tier": tier, "tax_lr": lr, "n_cand": ncand, "note": note,
-                "cand_lrs": ", ".join(cand_list[:10]) + (" ..." if len(cand_list) > 10 else ""),
-                "fails_at": fails_at, "suggest": suggest})
-res = pd.DataFrame(out)
-combos = combos.merge(res, on="ck", how="left")
-al = a.merge(res, on="ck", how="left")
-al["assigned"] = al["tier"].isin(ASSIGNED_TIERS)
-al["strict"] = al["tier"].isin(STRICT_TIERS)
+        return "UNMATCHED", np.nan, []
+    lrs = sorted({c[0] for c in cand})
+    if len(lrs) == 1:
+        return tier, lrs[0], lrs
+    live = sorted({c[0] for c in cand if not c[1]})          # tie-break: drop retiring duplicates
+    if len(live) == 1:
+        return tier, live[0], lrs
+    return tier + "_AMBIGUOUS", np.nan, lrs
 
-# %% [T5] MATCH FUNNEL
-# =============================================================================
-# T5. MATCH FUNNEL
-# =============================================================================
-tier_order = ["EXACT", "RELAXED", "L2L3_ONLY", "PREFIX", "EXACT_AMBIGUOUS", "RELAXED_AMBIGUOUS",
-              "L2L3_ONLY_AMBIGUOUS", "PREFIX_AMBIGUOUS", "UNMATCHED", "MALFORMED", "NO_TAXONOMY"]
-funnel = (al["tier"].value_counts().reindex(tier_order, fill_value=0)
-          .rename("alert_rows").to_frame())
-funnel["distinct_records"] = al.groupby("tier")["_id"].nunique().reindex(tier_order, fill_value=0)
-funnel["distinct_combos"] = combos["tier"].value_counts().reindex(tier_order, fill_value=0)
-funnel.index.name = "tier"
-funnel["share_of_rows"] = (funnel["alert_rows"] / len(al)).round(4)
-funnel["distinct_LRs"] = al[al["assigned"]].groupby("tier")["tax_lr"].nunique().reindex(tier_order)
-print("\nMATCH FUNNEL")
-print(funnel.to_string())
-print(f"\nstrict match (EXACT+RELAXED): {al['strict'].sum()}/{len(al)} = {al['strict'].mean():.1%}")
-print(f"all assigned                : {al['assigned'].sum()}/{len(al)} = {al['assigned'].mean():.1%}")
-print(f"distinct LRs reached        : {al.loc[al['assigned'], 'tax_lr'].nunique()} of {len(HEL_LRS)} published")
-
-unm = combos[combos["tier"].eq("UNMATCHED")].sort_values("n_alert_rows", ascending=False)
-print(f"\nUNMATCHED combos: {len(unm)} (rows affected {unm['n_alert_rows'].sum()}) | fails at: "
-      f"{unm['fails_at'].value_counts().to_dict()}")
-print(unm[[C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "n_alert_rows", "fails_at", "suggest"]].head(15).to_string(index=False))
-
-amb = combos[combos["tier"].str.endswith("_AMBIGUOUS")].sort_values("n_alert_rows", ascending=False)
-print(f"\nAMBIGUOUS combos: {len(amb)} (rows affected {amb['n_alert_rows'].sum()})")
-print(amb[[C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "tier", "n_cand", "n_alert_rows"]].head(10).to_string(index=False))
-
-# %% [T6] CHECKS
-# =============================================================================
-# T6. SOURCE CHECKS - Helios consistency and alert data quality
-# =============================================================================
-chk = []
-chk.append(("Helios published LRs in lookup", len(HEL_LRS)))
-chk.append(("Helios rows flagged (TO BE RETIRED)", int(hk["retiring"].sum())))
-coll = {k: v for k, v in K3R.items() if len({x[0] for x in v}) > 1}
-chk.append(("Relaxed taxonomy keys mapping to >1 LR (collisions)", len(coll)))
-multi_text = hk.groupby("lr")[["l1r", "l2r", "l3r"]].apply(lambda d: len(d.drop_duplicates())).gt(1).sum()
-chk.append(("LRs carrying >1 distinct taxonomy text", int(multi_text)))
-if C_HEL_IDS:
-    hid = h.dropna(subset=C_HEL_IDS)
-    fwd = hid.groupby(C_HEL_IDS)["lr"].nunique()
-    rev = hid.groupby("lr")[C_HEL_IDS].nunique()
-    chk.append(("Helios ID triplets mapping to >1 LR", int((fwd > 1).sum())))
-    chk.append(("Helios LRs mapping to >1 ID triplet", int((rev > 1).any(axis=1).sum())))
-chk.append(("Alert rows", len(a)))
-chk.append(("Alert distinct records", int(a["_id"].nunique())))
-chk.append(("Alert records with >1 row", int((a.groupby("_id").size() > 1).sum())))
+# %% [5] RESOLVE EVERY DISTINCT ALERT TAXONOMY COMBO, AGAINST BOTH LOOKUPS
+a = ALERTS.copy()
+a["_id"] = a[C_ALERT_ID].map(nid)
 for i, c in ((1, C_ALERT_L1), (2, C_ALERT_L2), (3, C_ALERT_L3)):
-    chk.append((f"Alert rows with blank/placeholder L{i}", int(a[f"l{i}n"].isna().sum())))
-delim = sum(a[c].astype(str).str.contains(r"[;|\n]", regex=True).sum() for c in (C_ALERT_L1, C_ALERT_L2, C_ALERT_L3))
-chk.append(("Alert taxonomy cells containing ; | or newline (multi-value?)", int(delim)))
-bad_l1 = sorted(set(a["l1r"].dropna()) - H_L1)
-chk.append(("Distinct alert L1 values not in Helios L1", len(bad_l1)))
-checks = pd.DataFrame(chk, columns=["check", "value"])
-print("\nSOURCE CHECKS")
-print(checks.to_string(index=False))
-if bad_l1:
-    print("alert L1 not in Helios:", bad_l1[:15])
-if coll:
-    print("collision keys (first 5):", list(coll)[:5])
+    a[f"l{i}n"] = a[c].map(norm)
+    a[f"l{i}r"] = a[c].map(norm_relaxed)
+a["ck"] = ("L1=" + a[C_ALERT_L1].fillna("<blank>").astype(str) + "|L2=" + a[C_ALERT_L2].fillna("<blank>").astype(str)
+           + "|L3=" + a[C_ALERT_L3].fillna("<blank>").astype(str))
 
-# %% [T7] GOLDEN HIT RATE
-# =============================================================================
-# T7. GOLDEN HIT RATE - is the taxonomy-derived LR among the record's golden LRs?
-# =============================================================================
-ev, by_tier, gold_summary = None, None, {}
-if GOLD is None:
-    print("\nNo golden loaded -> hit-rate section skipped")
-else:
+combos = a.drop_duplicates("ck")[["ck", C_ALERT_L1, C_ALERT_L2, C_ALERT_L3,
+                                  "l1n", "l2n", "l3n", "l1r", "l2r", "l3r"]].copy()
+combos["n_rows"] = combos["ck"].map(a["ck"].value_counts())
+
+rows = []
+for r in combos.to_dict("records"):
+    args = (r["l1n"], r["l2n"], r["l3n"], r["l1r"], r["l2r"], r["l3r"])
+    h_tier, h_lr, _ = match(HEL, *args)
+    e_tier, e_lr, _ = match(E2, *args)
+    rows.append({"ck": r["ck"], "helios_tier": h_tier, "helios_lr": h_lr,
+                 "extract2_tier": e_tier, "extract2_lr": e_lr})
+res = pd.DataFrame(rows)
+combos = combos.merge(res, on="ck", how="left")
+a = a.merge(res, on="ck", how="left")
+
+ASSIGNED = {"EXACT", "RELAXED", "L2L3_ONLY", "PREFIX"}
+a["assigned"] = a["helios_tier"].isin(ASSIGNED)
+
+def cross_status(r):
+    if pd.isna(r["helios_lr"]):
+        return ""
+    if pd.isna(r["extract2_lr"]):
+        return "REGMAP_AMBIGUOUS" if "_AMBIGUOUS" in str(r["extract2_tier"]) else "NO_REGMAP_MATCH"
+    return "AGREE" if r["extract2_lr"] == r["helios_lr"] else "DISAGREE"
+
+combos["cross_status"] = combos.apply(cross_status, axis=1)
+
+# %% [6] MATCH FUNNEL + CROSS-CHECK SUMMARY
+tiers = ["EXACT", "RELAXED", "L2L3_ONLY", "PREFIX", "EXACT_AMBIGUOUS", "RELAXED_AMBIGUOUS",
+         "L2L3_ONLY_AMBIGUOUS", "PREFIX_AMBIGUOUS", "UNMATCHED", "MALFORMED", "NO_TAXONOMY"]
+funnel = a["helios_tier"].value_counts().reindex(tiers, fill_value=0).rename("alert_rows").to_frame()
+funnel["share"] = (funnel["alert_rows"] / len(a)).round(4)
+print("\nMATCH FUNNEL (alert -> Helios)")
+print(funnel)
+print(f"\nStrict match (EXACT+RELAXED): {a['helios_tier'].isin(['EXACT', 'RELAXED']).mean():.1%}")
+print(f"All assigned (incl. L2L3_ONLY/PREFIX): {a['assigned'].mean():.1%}")
+print(f"Distinct LRs reached: {a.loc[a['assigned'], 'helios_lr'].nunique()} of {len(HEL['lrs'])} published")
+
+assigned_combos = combos[combos["helios_lr"].notna()]
+print(f"\nCROSS-CHECK vs extract2 (n={len(assigned_combos)} assigned combos, "
+      f"{assigned_combos['n_rows'].sum()} alert rows)")
+print(assigned_combos["cross_status"].value_counts())
+print(f"Agree rate (combos): {(assigned_combos['cross_status'] == 'AGREE').mean():.1%}")
+
+disagree = assigned_combos[assigned_combos["cross_status"] == "DISAGREE"]
+if len(disagree):
+    print(f"\nDISAGREEMENTS ({len(disagree)}):")
+    print(disagree[[C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "helios_lr", "extract2_lr", "n_rows"]].to_string(index=False))
+
+# %% [7] GOLDEN HIT RATE (optional - runs only if `golden` is loaded)
+if GOLD is not None:
     g = pd.DataFrame({"_id": GOLD[C_GOLD_REC].map(nid), "lr": GOLD[C_GOLD_LR].map(lr_id)}).dropna().drop_duplicates()
     scope = set(RWT[C_RWT_ID].map(nid).dropna()) if RWT is not None else set(a["_id"].dropna())
     g = g[g["_id"].isin(scope)]
     gset = g.groupby("_id")["lr"].apply(set)
-    ev = al[al["_id"].isin(gset.index)].drop_duplicates(["_id", "ck"]).copy()
-    ev["gold_n"] = ev["_id"].map(gset.map(len))
-    ev["chance"] = ev["_id"].map(gset.map(lambda s: len(s & HEL_LRS))) / len(HEL_LRS)
-    ev["tax_in_gold"] = [(lr in gset[i]) if pd.notna(lr) else np.nan for i, lr in zip(ev["_id"], ev["tax_lr"])]
-    gold_lrs_any = set(g["lr"])
-    ev["tax_lr_in_any_golden"] = ev["tax_lr"].isin(gold_lrs_any)
-    e = ev[ev["assigned"]].copy()
-    by_tier = (e.groupby("tier").agg(rows=("tax_in_gold", "size"), hits=("tax_in_gold", "sum"),
-                                     chance=("chance", "mean")))
-    by_tier["hit_rate"] = by_tier["hits"] / by_tier["rows"]
-    by_tier["lift_vs_chance"] = by_tier["hit_rate"] / by_tier["chance"]
-    tot = e["tax_in_gold"].astype(float)
-    gold_summary = {
-        "golden_pairs_in_scope": len(g), "golden_records": int(g["_id"].nunique()),
-        "eval_rows_all_scoped": len(ev), "eval_rows_with_assigned_lr": len(e),
-        "eval_rows_unassigned": len(ev) - len(e),
-        "hits": int(tot.sum()), "hit_rate": float(tot.mean()) if len(e) else np.nan,
-        "chance_baseline": float(e["chance"].mean()) if len(e) else np.nan,
-        "records_with_any_hit": int(e[e["tax_in_gold"] == True]["_id"].nunique()),
-        "records_evaluated": int(e["_id"].nunique()),
-    }
-    s = e[e["strict"]]
-    gold_summary["strict_hit_rate"] = float(s["tax_in_gold"].astype(float).mean()) if len(s) else np.nan
-    print("\nGOLDEN HIT RATE (taxonomy LR in record's golden LR set; golden is non-exhaustive)")
-    print(by_tier.round(4).to_string())
-    print({k: (round(v, 4) if isinstance(v, float) else v) for k, v in gold_summary.items()})
-    print(f"pair coverage if each hit recovers one golden pair: {gold_summary['hits']}/{len(g)} = "
-          f"{gold_summary['hits'] / max(len(g), 1):.1%}  (structural ceiling, one LR per alert row)")
-    miss = e[e["tax_in_gold"] == False]
-    print(f"misses: {len(miss)} | tax LR appears in golden for other records: "
-          f"{int(miss['tax_lr_in_any_golden'].sum())} | tax LR never in golden: {int((~miss['tax_lr_in_any_golden']).sum())}")
-    print(miss["tax_lr"].value_counts().head(10).to_string())
+    ev = a[a["assigned"] & a["_id"].isin(gset.index)].drop_duplicates(["_id", "ck"]).copy()
+    ev["hit"] = [lr in gset[i] for i, lr in zip(ev["_id"], ev["helios_lr"])]
+    print(f"\nGOLDEN HIT RATE: {ev['hit'].mean():.1%} on {len(ev)} rows "
+          f"(golden averages {g.groupby('_id').size().mean():.1f} LRs/alert, so this is agreement, not recall)")
+    print(ev.groupby("helios_tier")["hit"].mean().round(3))
 
-# %% [T8] LLM COMPARISON
-# =============================================================================
-# T8. OPTIONAL - compare with LLM verdicts
-# =============================================================================
-llm_summary = {}
-if VERD is not None and ev is not None:
-    dec_col = next((c for c in C_VERD_DEC_CANDIDATES if c in VERD.columns), None)
-    if dec_col is None:
-        print("\nNo decision column found in verdicts -> LLM comparison skipped:", list(VERD.columns))
-    else:
-        v = pd.DataFrame({"_id": VERD[C_VERD_REC].map(nid), "lr": VERD[C_VERD_LR].map(lr_id),
-                          "linked": VERD[dec_col].astype(str).str.upper().eq("LINKED")}).dropna(subset=["_id", "lr"])
-        judged = set(zip(v["_id"], v["lr"]))
-        linked = set(zip(v.loc[v["linked"], "_id"], v.loc[v["linked"], "lr"]))
-        e = ev[ev["assigned"]].copy()
-        e["tax_judged"] = [(i, lr) in judged for i, lr in zip(e["_id"], e["tax_lr"])]
-        e["tax_llm_linked"] = [(i, lr) in linked for i, lr in zip(e["_id"], e["tax_lr"])]
-        hit = e[e["tax_in_gold"] == True]
-        llm_summary = {
-            "assigned_rows": len(e),
-            "tax_LR_was_judged": int(e["tax_judged"].sum()),
-            "tax_LR_llm_linked": int(e["tax_llm_linked"].sum()),
-            "tax_golden_hits": len(hit),
-            "tax_golden_hits_llm_also_linked": int(hit["tax_llm_linked"].sum()),
-            "tax_golden_hits_llm_missed": int((~hit["tax_llm_linked"]).sum()),
-            "tax_non_golden_llm_linked": int(e[e["tax_in_gold"] == False]["tax_llm_linked"].sum()),
-        }
-        print("\nLLM COMPARISON")
-        print(llm_summary)
-        ev = ev.merge(e[["_id", "ck", "tax_judged", "tax_llm_linked"]], on=["_id", "ck"], how="left")
-
-# %% [T9] EXPORT
-# =============================================================================
-# T9. EXPORT - crosswalk + review lists + summary workbook
-# =============================================================================
-from openpyxl import load_workbook
-from openpyxl.styles import Font, PatternFill, Alignment
-
-cw = combos[["tier", C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "tax_lr", "n_cand", "note", "cand_lrs",
-             "fails_at", "n_alert_rows"]].sort_values(["tier", "n_alert_rows"], ascending=[True, False])
-cw = cw.merge(hk.drop_duplicates("lr")[["lr", "l1n", "l2n", "l3n"]].rename(
-    columns={"lr": "tax_lr", "l1n": "helios_l1", "l2n": "helios_l2", "l3n": "helios_l3"}), on="tax_lr", how="left")
-cw.to_csv(OUT_DIR / "crosswalk_alert_taxonomy_to_LR.csv", index=False)
-
-al["rk"] = al["_id"].astype(str) + "\u00a6" + al["ck"]
-alert_level = al[["rk", "_id", C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "tier", "tax_lr"]].rename(columns={"_id": "RECORD_ID"})
-if ev is not None:
-    ev["rk"] = ev["_id"].astype(str) + "\u00a6" + ev["ck"]
-    extra = [c for c in ["tax_in_gold", "gold_n", "chance", "tax_judged", "tax_llm_linked"] if c in ev.columns]
-    alert_level = alert_level.merge(ev[["rk"] + extra].drop_duplicates("rk"), on="rk", how="left")
-alert_level = alert_level.drop(columns=["rk"])
-
+# %% [8] EXPORT
 with pd.ExcelWriter(XLSX, engine="openpyxl") as xw:
-    funnel.reset_index().to_excel(xw, sheet_name="By_Tier_Match", index=False)
-    if by_tier is not None:
-        by_tier.reset_index().to_excel(xw, sheet_name="By_Tier_Golden", index=False)
-    cw.to_excel(xw, sheet_name="Crosswalk", index=False)
-    unm[[C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "n_alert_rows", "fails_at", "suggest"]].to_excel(xw, sheet_name="Unmatched_Review", index=False)
-    amb[[C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "tier", "n_cand", "cand_lrs", "n_alert_rows"]].to_excel(xw, sheet_name="Ambiguous", index=False)
-    alert_level.to_excel(xw, sheet_name="Alert_Level", index=False)
-    checks.to_excel(xw, sheet_name="Source_Checks", index=False)
-
-wb = load_workbook(XLSX)
-ARIAL, BOLD = Font(name="Arial"), Font(name="Arial", bold=True)
-HDR_FILL = PatternFill("solid", start_color="404040")
-for ws in wb.worksheets:
-    for row in ws.iter_rows():
-        for c in row:
-            c.font = ARIAL
-    for c in ws[1]:
-        c.font = Font(name="Arial", bold=True, color="FFFFFF")
-        c.fill = HDR_FILL
-        c.alignment = Alignment(wrap_text=True, vertical="top")
-    for col in ws.columns:
-        w = max((len(str(c.value)) for c in col[:200] if c.value is not None), default=8)
-        ws.column_dimensions[col[0].column_letter].width = min(max(w + 2, 10), 60)
-    ws.freeze_panes = "A2"
-
-ws = wb.create_sheet("Summary", 0)
-BLUE = Font(name="Arial", color="0000FF")
-BLK = Font(name="Arial", color="000000")
-rows = {}
-r = 1
-ws.cell(r, 1, "Alert -> Helios Library Risk: taxonomy lookup test").font = Font(name="Arial", bold=True, size=14)
-r += 1
-ws.cell(r, 1, "Blue = run output, black = formula. Golden is non-exhaustive: a miss is not an error.").font = Font(name="Arial", italic=True, color="595959")
-r += 2
-
-def put(label, val, key=None, fmt="#,##0", formula=False):
-    global r
-    ws.cell(r, 1, label).font = BLK
-    c = ws.cell(r, 2, val)
-    c.font = BLK if formula else BLUE
-    c.number_format = fmt
-    if key:
-        rows[key] = r
-    r += 1
-
-def head(t):
-    global r
-    r += 1
-    ws.cell(r, 1, t).font = BOLD
-    r += 1
-
-head("Match funnel (alert rows)")
-put("Alert rows", len(al), "rows")
-put("Distinct records", int(al["_id"].nunique()))
-put("Distinct taxonomy combos", len(combos))
-for t in tier_order:
-    put(f"  {t}", int(funnel.loc[t, "alert_rows"]), t)
-put("Strict matched (EXACT + RELAXED)", f"=B{rows['EXACT']}+B{rows['RELAXED']}", "strict", formula=True)
-put("Strict match rate", f"=B{rows['strict']}/B{rows['rows']}", fmt="0.0%", formula=True)
-put("All assigned (strict + L2L3_ONLY + PREFIX)",
-    f"=B{rows['strict']}+B{rows['L2L3_ONLY']}+B{rows['PREFIX']}", "assigned", formula=True)
-put("All-assigned rate", f"=B{rows['assigned']}/B{rows['rows']}", fmt="0.0%", formula=True)
-put("Distinct LRs reached", int(al.loc[al["assigned"], "tax_lr"].nunique()))
-put("Published LRs in Helios lookup", len(HEL_LRS))
-
-if gold_summary:
-    head("Golden hit rate (scoped records)")
-    put("Golden pairs in scope", gold_summary["golden_pairs_in_scope"], "gp")
-    put("Eval rows with an assigned LR", gold_summary["eval_rows_with_assigned_lr"], "ev")
-    put("Hits (taxonomy LR in record's golden set)", gold_summary["hits"], "hits")
-    put("Hit rate", f"=B{rows['hits']}/B{rows['ev']}", "hr", fmt="0.0%", formula=True)
-    put("Chance baseline (random LR from published pool)", gold_summary["chance_baseline"], "ch", fmt="0.0%")
-    put("Lift vs chance", f"=B{rows['hr']}/B{rows['ch']}", fmt="0.0x", formula=True)
-    put("Golden pair coverage (hits / golden pairs)", f"=B{rows['hits']}/B{rows['gp']}", fmt="0.0%", formula=True)
-if llm_summary:
-    head("Overlap with LLM verdicts")
-    for k, v_ in llm_summary.items():
-        put(k, v_)
-ws.column_dimensions["A"].width = 58
-ws.column_dimensions["B"].width = 14
-wb.save(XLSX)
+    funnel.reset_index(names="tier").to_excel(xw, sheet_name="Funnel", index=False)
+    combos.to_excel(xw, sheet_name="Combos", index=False)
+    a[["_id", C_ALERT_L1, C_ALERT_L2, C_ALERT_L3, "helios_tier", "helios_lr",
+       "extract2_tier", "extract2_lr"]].to_excel(xw, sheet_name="Alert_Level", index=False)
 print(f"\nWrote {XLSX.resolve()}")
-print(f"Wrote {(OUT_DIR / 'crosswalk_alert_taxonomy_to_LR.csv').resolve()}")
