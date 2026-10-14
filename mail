@@ -1,0 +1,52 @@
+
+
+As part of our review of GPPS policy data, we conducted a market-level analysis across the **54 markets/entities in scope** to assess the availability of local, regional and global policies in the GPPS UI and reconcile these observations with the underlying database tables.
+
+The objective was to identify potential data gaps and discrepancies between the database records and the policies accessible through the UI.
+
+**1. Summary of findings**
+
+The analysis identified the following:
+
+- **54 markets/entities** are in scope.
+- **44 markets/entities** have country-level policy data, while **10 markets/entities** have no policy rows in their respective country tables.
+- The country-level tables contain **493 policy rows** across the markets reviewed.
+- The global policy table contains **660 policy rows**, representing **260 unique policies**.
+- The review also identified instances where global policy IDs or related records are present in the underlying tables but are not visible in the GPPS UI.
+- No regional policies were identified as visible in the GPPS UI for the markets reviewed.
+
+**2. Markets/entities with no country-level policy data**
+
+The following 10 markets/entities have no policy rows in their respective country-level tables:
+
+Argentina, Canada, Chile, Guernsey, Israel, Isle of Man, Jersey, Cayman Islands, Saudi Arabia and Uruguay.
+
+The reconciliation of database records against the GPPS UI indicates the following:
+
+- **Argentina, Chile, Guernsey, Israel, Isle of Man, Jersey, Saudi Arabia and Uruguay:** Global policy references or related records were identified in the underlying data for these markets. However, policy availability and visibility in the GPPS UI require further validation.
+- **Canada and Cayman Islands:** No corresponding global policy references were identified in the available data reviewed.
+- **Jersey:** Local policy access is available in the GPPS UI on a restricted-access basis.
+- **Saudi Arabia:** The market is not currently included in the country list displayed in the GPPS UI.
+
+The detailed market-level analysis also captures the presence or absence of local, regional and global policies in the UI, alongside the corresponding policy IDs and records identified in the database tables.
+
+**3. Additional observations**
+
+The review identified cases where global policy IDs are present in the underlying database tables but are not visible in the GPPS UI. Further validation is required to determine whether these records are unpublished, access-restricted, obsolete or otherwise excluded from the UI.
+
+These observations are being documented as potential reconciliation gaps and should not be interpreted as confirmed system defects until the relevant policy and application owners have validated the expected behaviour.
+
+**4. Validation required / next steps**
+
+Could the relevant policy and application owners please review the findings and help confirm the following:
+
+1. Whether the absence of country-level policy data is expected for each of the 10 markets/entities identified.
+2. Whether the global policy records and IDs identified in the database should be accessible or visible in the GPPS UI.
+3. Whether any missing local or regional policies need to be created, migrated or made available in the UI.
+4. Whether the country-list configuration requires an update, particularly for Saudi Arabia.
+5. Whether restricted-access arrangements, such as those observed for Jersey, are intentional and appropriately documented.
+6. Whether any additional reconciliation is required between the database records and the policies displayed in the UI.
+
+The supporting Excel analysis contains the detailed market-level breakdown, including the relevant database tables, policy row counts, unique policy counts, version information, segment counts, policy IDs and UI availability observations.
+
+Please review the findings and share your feedback or any required corrections. This will help us establish a documented understanding of the current state and agree on any necessary follow-up actions.
