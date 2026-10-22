@@ -1,0 +1,19 @@
+# 2) Entity mapper — Active rows only
+mapper_query = """
+SELECT *
+FROM `hsbc-11545401-cmpdatcwrs1-prod.rc_curated_prod.aa_hsbc_helios_entity_mapper`
+WHERE entity_mapper_status = "Active"
+"""
+mapper_df = client.query(mapper_query).to_dataframe()
+
+# business_entity_key -> display name (business_entity is already the resolved name)
+lob_map_df = mapper_df[["business_entity_key", "business_entity"]].drop_duplicates()
+lob_key_to_name = dict(zip(lob_map_df["business_entity_key"].astype(str), lob_map_df["business_entity"]))
+
+# legal_entity_key -> display name
+le_map_df = mapper_df[["legal_entity_key", "legal_entity"]].drop_duplicates()
+le_key_to_name = dict(zip(le_map_df["legal_entity_key"].astype(str), le_map_df["legal_entity"]))
+
+
+dupe_check = lob_map_df["business_entity_key"].value_counts()
+dupe_check[dupe_check > 1]
