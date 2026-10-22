@@ -3,13 +3,21 @@ import pandas as pd
 
 client = bigquery.Client(project="hsbc-12211200-cmlpwb-prod")
 
-geo_keys = (4023, 18046, 3875, 4017)
+# 1) Raw Mexico alerts — Location drives the filter
+raw_query = """
+SELECT alert_id, transfer_date, location AS Location, title, summ_contnt, summ_updt, geo_hier_key
+FROM `hsbc-11545401-cmpdatcwrs1-prod.rc_curated_prod.aa_hsbc_rapid2_hzn_alert_conformed`
+WHERE location = "Mexico"
+AND transfer_date >= "2026-06-01"
+"""
+raw_df = client.query(raw_query).to_dataframe()
+alert_ids = tuple(raw_df["alert_id"].dropna().unique().tolist())
 
-# 1) Predictions
+# 2) Predictions for exactly those alert_ids
 pred_query = f"""
-SELECT alert_id, geo_hier_key, lob, lob_recommended, ai_recommended_le, process_date_time
+SELECT alert_id, lob, lob_recommended, ai_recommended_le, process_date_time
 FROM `cmlp_exp_003_1_prod.Random_LOB_LE`
-WHERE geo_hier_key IN {geo_keys}
+WHERE alert_id IN {alert_ids}
 ORDER BY alert_id, process_date_time DESC
 """
 pred_df = client.query(pred_query).to_dataframe()
@@ -19,7 +27,7 @@ pred_df = pred_df[pred_df["process_date_time"] == latest_ts]
 
 recommended = pred_df[pred_df["lob_recommended"] == "AI Recommended"].copy()
 
-# 2) Entity mapper — Active rows only
+# 3) Entity mapper — Active rows only
 mapper_query = """
 SELECT *
 FROM `hsbc-11545401-cmpdatcwrs1-prod.rc_curated_prod.aa_hsbc_helios_entity_mapper`
@@ -27,23 +35,29 @@ WHERE entity_mapper_status = "Active"
 """
 mapper_df = client.query(mapper_query).to_dataframe()
 
-# business_entity_key -> display name
-lob_map_df = mapper_df[["business_entity_key", "business_entity"]].drop_duplicates()
-lob_key_to_name = dict(zip(lob_map_df["business_entity_key"].astype(str), lob_map_df["business_entity"]))
+# Sanity check — see what business_entity / legal_entity actually contain
+print("business_entity sample:", mapper_df["business_entity"].unique()[:5])
+print("legal_entity sample:", mapper_df["legal_entity"].unique()[:5])
 
-# legal_entity_key -> display name
-le_map_df = mapper_df[["legal_entity_key", "legal_entity"]].drop_duplicates()
-le_key_to_name = dict(zip(le_map_df["legal_entity_key"].astype(str), le_map_df["legal_entity"]))
+# business_entity_key -> deepest available l1-l5 name
+bl_cols = ["business_entity_l5", "business_entity_l4", "business_entity_l3",
+           "business_entity_l2", "business_entity_l1"]
+lob_map_df = mapper_df[["business_entity_key"] + bl_cols].drop_duplicates()
+lob_map_df["display_name"] = lob_map_df[bl_cols].bfill(axis=1).iloc[:, 0]
+lob_key_to_name = dict(zip(lob_map_df["business_entity_key"].astype(str), lob_map_df["display_name"]))
 
-# (optional sanity check — should print an empty Series if keys are unique)
-dupe_check = lob_map_df["business_entity_key"].value_counts()
-print(dupe_check[dupe_check > 1])
+# legal_entity_key -> deepest available l1-l7 name
+le_cols = ["legal_entity_l7", "legal_entity_l6", "legal_entity_l5", "legal_entity_l4",
+           "legal_entity_l3", "legal_entity_l2", "legal_entity_l1"]
+le_map_df = mapper_df[["legal_entity_key"] + le_cols].drop_duplicates()
+le_map_df["display_name"] = le_map_df[le_cols].bfill(axis=1).iloc[:, 0]
+le_key_to_name = dict(zip(le_map_df["legal_entity_key"].astype(str), le_map_df["display_name"]))
 
-# 3) Translate keys to names, then join into one comma-separated string per alert
+# 4) Translate keys to names, join into one comma-separated string per alert
 def join_unique_names(series, key_map):
     seen = []
     for v in series:
-        name = key_map.get(str(v), str(v))  # falls back to raw key if unmapped
+        name = key_map.get(str(v), str(v))
         if name not in seen:
             seen.append(name)
     return ",".join(seen)
@@ -53,7 +67,7 @@ def flatten_le_names(lists, key_map):
     for lst in lists:
         if lst is None:
             continue
-        if isinstance(lst, float):   # catches NaN for missing/null array cells
+        if isinstance(lst, float):
             continue
         for v in lst:
             name = key_map.get(str(v), str(v))
@@ -65,19 +79,12 @@ rec_lob = recommended.groupby("alert_id")["lob"].apply(lambda s: join_unique_nam
 rec_le  = recommended.groupby("alert_id")["ai_recommended_le"].apply(lambda s: flatten_le_names(s, le_key_to_name)).rename("Recommended_LE")
 rec_summary = pd.concat([rec_lob, rec_le], axis=1).reset_index()
 
-# 4) Raw alert text
-raw_query = f"""
-SELECT alert_id, transfer_date, location AS Location, title, summ_contnt, summ_updt, geo_hier_key
-FROM `hsbc-11545401-cmpdatcwrs1-prod.rc_curated_prod.aa_hsbc_rapid2_hzn_alert_conformed`
-WHERE geo_hier_key IN {geo_keys}
-"""
-raw_df = client.query(raw_query).to_dataframe()
-
 # 5) Join and save
-output = raw_df.merge(rec_summary, on="alert_id", how="left")
+output = raw_df.merge(rec_summary, on="alert_id", how="inner")
 output = output.rename(columns={"alert_id": "record_id"})
 output = output[["record_id", "Location", "title", "summ_contnt", "summ_updt",
                   "Recommended_LOB", "Recommended_LE"]]
 
+pd.set_option('display.max_colwidth', None)
 output.to_csv("/home/jovyan/mexico_sample_output.csv", index=False)
-output
+output.head()
