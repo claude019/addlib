@@ -1,0 +1,10 @@
+def _build_query(self):
+    chanl_ids = ", ".join(str(i) for i in self.ingest_chanl_ids)
+    batch_clause = self._build_batch_clause()
+    cat_values = ", ".join(f"'{c}'" for c in self.alert_cat_cdes)
+    limit_clause = f"LIMIT {self.limit}" if self.limit else ""
+    select_clause = ", ".join(self.select_cols)
+    return f"""
+    SELECT {select_clause}
+    FROM {self._table_fqdn()}
+    WHERE alert_id IN (462967,462969,462970,462973,462975,462976,462977,462978,462889,462898)
