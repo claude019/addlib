@@ -1,0 +1,439 @@
+These are fictional transactions for training purposes.
+Step 2: Convert the data into an Excel table
+This is important because Copilot works best when the data is organized in a supported, structured format.
+1. Select any cell within the dataset.
+2. Press Ctrl + T on Windows, or use Insert → Table.
+3. Confirm that My table has headers is selected.
+4. Click OK.
+5. Open the Table Design tab.
+6. Rename the table SalesData.
+Step 3: Save the workbook correctly
+For the demonstration:
+1. Save the workbook as Copilot_Excel_Training.xlsx.
+2. Store it in OneDrive or SharePoint.
+3. Ensure that you are signed in with an account that has access to Copilot in Excel.
+If you are using your organization's Microsoft 365 account, check beforehand whether Copilot is enabled and whether your administrator has restricted any features.
+
+Microsoft documents the supported workbook requirements and access considerations in its official Copilot in Excel getting-started guide. Microsoft Support
+
+Trainer tip: Prepare the workbook and test the prompts before the session. That way, you won't have to troubleshoot permissions or licensing while presenting.
+3. Module 1 — Introduce Copilot in Excel (5 minutes)
+Start with a simple explanation.
+What you should explain
+Microsoft Copilot in Excel is an AI assistant that allows users to describe what they want to do in ordinary language rather than manually performing every Excel operation.
+
+For example, instead of:
+- Writing a formula to calculate revenue.
+- Building a PivotTable manually.
+- Applying conditional formatting.
+- Creating a chart from selected columns.
+- Manually investigating trends.
+You can describe the task to Copilot and ask it to help.
+Demonstrate the difference
+Traditional Excel approach:
+1. Insert a new column.
+2. Enter a formula.
+3. Copy the formula down.
+4. Format the results.
+5. Create a PivotTable to summarize the results.
+Copilot approach:
+
+You can ask:
+Calculate revenue and profit for every transaction, identify the best-performing product category, and summarize the key findings.
+
+Copilot can help perform these tasks, depending on the capabilities available in your environment. You should still review its changes and verify the calculations.
+Explain the three working modes
+Depending on the interface available to your organization, Copilot in Excel offers three modes. Microsoft Support
+Mode	What it does	When to use it
+Chat	Answers questions and analyzes workbook information without directly editing the workbook	When you want to understand the data
+Plan	Proposes a plan before carrying out changes	When you want to review a complex task first
+Edit	Can make changes directly to the workbook	When you want to generate formulas, tables, charts, or other content
+
+
+What to say during your presentation:
+
+"Think of Chat as asking a question, Plan as deciding what to do, and Edit as asking Copilot to carry out the work. The important thing is to review the results, particularly when the changes affect an existing workbook."
+4. Module 2 — Get started with Copilot (10 minutes)
+Now demonstrate the actual Excel interface.
+Step 1: Open Copilot
+1. Open your prepared workbook in Excel.
+2. Look for the Copilot icon.
+3. Click it to open the Copilot pane.
+4. If your interface provides a mode selector, demonstrate the available options.
+The location and available options can vary by Excel version and platform.
+
+If the Copilot icon is missing, check your Microsoft 365 licence, organizational access, Excel version, and relevant settings.
+Step 2: Ask Copilot to explain the workbook
+Start with a simple prompt.
+
+Prompt 1:
+Analyze the SalesData table and explain what each column represents. Identify the key metrics that can be calculated from this dataset and suggest five business questions that we could answer using this data.
+
+What you should demonstrate
+Show participants how Copilot can help them understand a workbook before they begin analyzing it.
+
+Ask them to look for:
+- The structure of the dataset.
+- Potential measures such as revenue and profit.
+- Dimensions such as region, product, and category.
+- Business questions that could be investigated.
+For example, potential questions include:
+- Which region generates the most revenue?
+- Which product category is the most profitable?
+- What is the average transaction value?
+- Which products have the highest profit margins?
+- How do sales differ across regions?
+Teaching point: Copilot is useful even before you start writing formulas. It can help users decide what to investigate.
+Step 3: Demonstrate a follow-up prompt
+AI works best as a conversation rather than a single question.
+
+Ask:
+Focus on the relationship between region, product category, and revenue. Explain which comparisons would be most useful and why.
+
+Then ask:
+Suggest the most appropriate Excel visualizations for these comparisons.
+
+Explain that users can refine their requests based on the previous response rather than starting over each time.
+5. Module 3 — Analyze data and discover insights (10 minutes)
+This is one of the most important sections because it demonstrates how Copilot can help users move from raw data to business understanding.
+Step 1: Ask a business question
+In the Copilot pane, enter:
+Analyze the SalesData table. Identify the top-performing region by total revenue, the best-performing product category by revenue, and the product with the highest total profit. Explain the results and show the calculations used.
+
+What to observe
+Ask participants to check whether Copilot:
+- Identifies the relevant columns.
+- Uses the correct calculations.
+- Provides results in a useful format.
+- Explains the findings clearly.
+For your own reference, the expected results from this sample dataset are:
+Metric	Expected result
+Total revenue	₹14,91,000
+Total profit	₹2,91,100
+Highest-revenue region	East, ₹4,38,000
+Highest-revenue category	Electronics, ₹11,40,000
+Highest-profit product	Laptop, ₹84,000
+
+
+These are the correct figures for the sample transactions provided above. Use them to verify the AI-generated results.
+Step 2: Investigate an insight
+Follow up with:
+Explain why Electronics contributes the largest share of total revenue. Calculate the percentage contribution of each category to total revenue and present the results in descending order.
+
+This introduces a valuable concept: moving from descriptive analysis to interpretation.
+
+Descriptive analysis tells you what happened. Interpretation helps you understand what the numbers might mean.
+
+However, explain that the dataset contains only 12 transactions. It is enough to demonstrate the technique, but not to make significant business decisions.
+Step 3: Ask Copilot to identify anomalies
+Enter:
+Review the SalesData table for unusual values, potential inconsistencies, and transactions that deserve further investigation. Explain the reason for each finding and distinguish confirmed data-quality problems from observations that require additional context.
+
+This is a good opportunity to explain that an unusual value is not automatically an error.
+
+For example, a transaction with unusually high revenue could be legitimate rather than incorrect.
+
+Microsoft provides additional examples of using Copilot to identify insights, trends, and outliers in its data insights guide. Microsoft Support
+6. Module 4 — Generate formulas using natural language (15 minutes)
+This is likely to be the most immediately useful feature for your audience.
+
+Explain that Copilot can help users write formulas even when they don't know the exact Excel syntax.
+Example 1: Calculate revenue
+Step 1
+Open the Excel workbook and select the SalesData table.
+Step 2
+Open Copilot and enter:
+Add a new column called Revenue to the SalesData table. Calculate revenue for each transaction by multiplying Units_Sold by Unit_Price. Use an Excel formula so the calculation updates automatically when the source values change.
+
+Step 3
+Review the proposed changes and allow Copilot to apply them if they are correct.
+Step 4
+Check the results.
+
+The formula should be equivalent to:
+
+=[@Units_Sold]*[@Unit_Price]
+
+This is a structured-reference formula that works within an Excel table.
+
+Explain that Copilot can generate the formula, but users should understand what the formula is doing.
+Example 2: Calculate profit
+Ask Copilot:
+Add a column called Profit. Calculate profit for each transaction as revenue minus the total cost of the units sold. Use the existing Revenue, Units_Sold, and Cost_Per_Unit columns.
+
+The intended calculation is:
+
+Profit = Revenue − (Units Sold × Cost Per Unit)
+
+The formula should be equivalent to:
+
+=[@Revenue]-([@Units_Sold]*[@Cost_Per_Unit])
+
+For the first transaction:
+- Revenue = 5 × ₹60,000 = ₹3,00,000
+- Cost = 5 × ₹48,000 = ₹2,40,000
+- Profit = ₹60,000
+Ask participants to verify this example manually.
+Example 3: Calculate profit margin
+Enter:
+Add a Profit_Margin column. Calculate the percentage profit margin for each transaction using Profit divided by Revenue. Handle cases where Revenue is zero, and format the result as a percentage with two decimal places.
+
+The intended formula is equivalent to:
+
+=IFERROR([@Profit]/[@Revenue],0)
+
+For the first transaction, the profit margin should be 20%.
+
+Explain why handling zero revenue matters: without appropriate error handling, a formula could return a division-by-zero error.
+Example 4: Categorize transactions
+Ask:
+Add a new column called Order_Size. Classify transactions with Revenue greater than or equal to ₹2,00,000 as High Value and all other transactions as Standard. Use a formula.
+
+The formula should be equivalent to:
+
+=IF([@Revenue]>=200000,"High Value","Standard")
+
+This demonstrates how Copilot can translate business rules into Excel formulas.
+What to emphasize
+Copilot is particularly useful when a user knows the business logic but doesn't remember the syntax.
+
+The user still needs to define the business rule clearly.
+
+For example, "Calculate profit" is ambiguous unless the user defines whether profit means gross profit, operating profit, or something else.
+
+Important: Depending on the interface and available features, Copilot may propose a formula, generate a column, or make a direct workbook change. Demonstrate the workflow available in your own Excel environment.
+7. Module 5 — Clean and manipulate data (10 minutes)
+Next, demonstrate how Copilot can assist with everyday data-preparation tasks.
+
+Use the same workbook so participants can see how the techniques connect.
+Example 1: Identify missing values and duplicates
+Prompt:
+Check the SalesData table for missing values, duplicate Order_IDs, inconsistent category names, and invalid dates. Return a summary of the issues found and recommend how to address them. Do not modify the source data yet.
+
+Explain why the final sentence matters: it asks Copilot to identify problems before making changes.
+What to demonstrate
+1. Review the identified issues.
+2. Check whether each issue is actually present.
+3. Ask Copilot to propose a correction.
+4. Review the correction before applying it.
+5. Verify the results after the changes.
+Our sample dataset contains no deliberately introduced missing values or duplicate order IDs. For a more realistic demonstration, create a separate practice copy with a missing product, a duplicated order ID, and an inconsistent region name.
+
+Do not introduce these errors into your original demonstration file.
+Example 2: Apply conditional formatting
+Prompt:
+Highlight transactions with Revenue greater than ₹2,00,000 in green and transactions with Profit_Margin below 20% in red. Apply the formatting to the relevant rows or cells without changing the underlying values.
+
+Show participants how conditional formatting can make important records easier to identify.
+
+Ask them to verify that the formatting rules reflect the intended business criteria.
+Example 3: Sort and filter data
+Prompt:
+Filter the SalesData table to show only Electronics transactions from the East and West regions. Sort the results by Revenue in descending order.
+
+Demonstrate how Copilot can interpret a business request and help configure the appropriate filters and sorting.
+
+Teaching point: Users should specify both the conditions and the desired ordering. "Show me the best sales" is less precise than "Filter Electronics transactions and sort by Revenue from highest to lowest."
+
+Copilot supports tasks such as highlighting, sorting, filtering, and applying conditional formatting, although the exact interaction can vary by version. Microsoft Support
+8. Module 6 — Create PivotTables and charts (15 minutes)
+This is the section I would emphasize most after formulas.
+
+PivotTables and charts are fundamental Excel skills, and Copilot can help users create them by describing the desired output.
+Part A: Create a PivotTable
+Step 1: Ask for a regional sales summary
+Enter this prompt:
+Create a PivotTable from SalesData showing Region in rows and total Revenue in values. Sort the regions from highest to lowest revenue and format the revenue as currency.
+
+Step 2: Review the PivotTable
+Explain the structure:
+- Rows: Region
+- Values: Sum of Revenue
+- Sorting: Highest revenue first
+The expected results from the sample data are:
+Region	Total revenue
+East	₹4,06,500
+West	₹3,30,000
+North	₹3,04,000
+South	₹2,74,000
+Total	₹12,14,500
+
+
+Use these figures to check the generated PivotTable.
+Step 3: Create a category-level summary
+Follow up with:
+Create another PivotTable showing Category in rows, Region in columns, and the sum of Revenue as values. Include grand totals for rows and columns.
+
+This demonstrates a more sophisticated analysis without requiring participants to configure every field manually.
+
+Ask them to compare the categories and identify where revenue is concentrated.
+Part B: Create a chart
+Step 1: Create a regional revenue chart
+Prompt:
+Create a column chart showing total Revenue by Region. Sort the regions from highest to lowest revenue. Add a descriptive title, label the vertical axis as Revenue, and format the values as Indian rupees.
+
+Step 2: Explain the visualization
+Discuss why a column chart works well for comparing categories.
+
+Ask participants:
+- Which region performs best?
+- Which region performs worst?
+- Is the difference between regions significant?
+- What additional information would help explain the differences?
+Step 3: Create a trend chart
+Because our sample contains only 12 daily transactions, you can use it to demonstrate the chart creation process, but it is not sufficient for a reliable assessment of long-term sales trends.
+
+For a more realistic demonstration, prepare a larger dataset covering several months.
+
+Then use this prompt:
+Create a line chart showing total daily revenue over time. Sort the dates chronologically, label the axes clearly, and identify any noticeable peaks or dips.
+
+This teaches participants how to choose a chart based on the business question rather than simply asking Copilot to create any chart.
+
+Microsoft's official visualization guide provides further examples of creating charts, PivotTables, and formatting rules. Microsoft Support
+9. Module 7 — Generate business insights and summaries (10 minutes)
+This section moves beyond Excel operations to demonstrate how Copilot can support decision-making.
+Step 1: Generate an executive summary
+Enter:
+Based on the SalesData table, prepare an executive summary covering total revenue, total profit, the highest-revenue region, the highest-revenue product category, and the most profitable product. Present the findings as five concise bullet points. Clearly distinguish calculated facts from recommendations.
+
+Ask participants to compare the narrative against the actual workbook.
+
+This is particularly useful for analysts who need to summarize spreadsheet findings for managers.
+Step 2: Generate recommendations
+Prompt:
+Based on the sales data, identify three areas that management should investigate to improve profitability. For each area, explain the evidence, suggest an action, and state what additional data would be required to validate the recommendation.
+
+Discuss the difference between a finding and a recommendation.
+
+For example:
+- Finding: One category contributes more revenue than the others.
+- Recommendation: Investigate whether that category also produces attractive margins and sustainable demand before increasing investment.
+The second statement is a hypothesis to investigate, not a conclusion established by revenue alone.
+Step 3: Ask follow-up questions
+Show how to continue the conversation:
+Now focus on profit margin rather than total revenue. Which products have the highest margins?
+
+Then:
+Explain the difference between revenue contribution and profit contribution. Recommend a chart that would help management compare them.
+
+This reinforces the idea that users should iteratively refine their analysis instead of treating the first AI-generated answer as final.
+10. Module 8 — Best practices, limitations, and responsible use (5 minutes)
+This is an important section, particularly if you're delivering the training in a corporate environment.
+A. Teach participants how to write effective prompts
+Explain that the quality of the output depends partly on how clearly the user defines the task.
+
+Compare these examples:
+Weak prompt	Better prompt
+Analyze my data.	Analyze SalesData and identify the top three regions by total revenue.
+Calculate profit.	Add a Profit column calculated as Revenue minus Units_Sold multiplied by Cost_Per_Unit.
+Make a chart.	Create a column chart comparing total revenue across regions, sorted in descending order.
+Clean the data.	Identify missing values, duplicate order IDs, and inconsistent category names without changing the source data.
+Give me insights.	Identify three significant patterns in revenue and profit, support each with calculated figures, and explain any limitations.
+
+
+Teach this five-part prompting framework
+A useful prompt should specify:
+1. Task: What do you want Copilot to do?
+2. Context: Which dataset or business process is involved?
+3. Criteria: What rules or conditions should it follow?
+4. Output: What format do you want?
+5. Validation: What should Copilot explain or verify?
+For example:
+Analyze the SalesData table to identify the three highest-revenue products. Calculate total revenue for each product, rank the results in descending order, and present them in a table with revenue and percentage contribution. Explain the calculation and flag any data limitations.
+
+This framework is reusable across almost every Excel use case.
+B. Explain the limitations
+Make sure participants understand the following:
+- AI can make mistakes. Always verify formulas, totals, and conclusions.
+- Business definitions matter. Copilot cannot reliably infer an organization's precise definition of revenue, profit, or performance unless it is provided.
+- Data quality matters. Incomplete or inconsistent data can produce misleading results.
+- Workbook changes matter. Review edits before saving or sharing them.
+- Security matters. Follow your organization's data-classification, confidentiality, and approved-AI policies. Do not upload sensitive business information to unauthorized tools.
+- Feature availability varies. Some capabilities may be unavailable because of licensing, platform, or organizational restrictions.
+Microsoft explicitly advises users to review and verify AI-generated results rather than relying on them without checking. Microsoft Support
+11. Module 9 — Hands-on exercise for participants (10 minutes)
+Finish the session by giving participants a task to complete independently.
+Exercise: Analyze sales performance using Copilot
+Give participants the prepared SalesData workbook and ask them to complete the following five tasks.
+Task 1: Calculate metrics
+Prompt:
+Add Revenue, Profit, and Profit_Margin columns to SalesData. Use formulas and format the results appropriately.
+
+Expected outcome: Three calculated columns.
+Task 2: Identify the top-performing region
+Prompt:
+Identify the region with the highest total revenue. Show the revenue for every region and rank them from highest to lowest.
+
+Expected outcome: A ranked regional summary.
+Task 3: Create a PivotTable
+Prompt:
+Create a PivotTable showing total revenue by Category and Region.
+
+Expected outcome: A category-by-region summary.
+Task 4: Create a visualization
+Prompt:
+Create a column chart comparing total revenue across regions. Include a descriptive title and clear axis labels.
+
+Expected outcome: An editable chart.
+Task 5: Summarize the findings
+Prompt:
+Write a five-point executive summary of the sales performance. Include the highest-revenue region, highest-revenue category, total revenue, total profit, and one recommendation for further investigation.
+
+Expected outcome: A concise business summary supported by the workbook.
+How to evaluate participants
+Assessment criterion	Marks
+Correct formulas	2
+Correct regional analysis	2
+Correct PivotTable	2
+Appropriate chart	2
+Accurate executive summary	2
+Total	10
+
+
+The goal is not to see who can write the longest prompt. It is to see who can use Copilot effectively and verify the result.
+12. Additional demonstrations if you have more time
+If your audience is comfortable with Excel, you can extend the training with a few advanced scenarios.
+Feature	Example prompt	Business application
+Scenario analysis	"Model how profit changes if unit costs increase by 5%, 10%, and 15%."	Cost management
+Forecasting	"Analyze historical monthly sales and generate a forecast for the next three months. State the assumptions and limitations."	Planning
+Error investigation	"Explain why this formula returns an error and suggest a correction."	Troubleshooting
+Workbook creation	"Create an issue-tracking table with issue ID, owner, priority, due date, and status."	Operations
+Dashboard preparation	"Create a sales dashboard containing total revenue, total profit, regional performance, and category-level revenue."	Management reporting
+Documentation	"Explain the formulas used in this workbook and identify the business assumptions they depend on."	Knowledge transfer
+
+
+These are examples of requests to test in your environment, not guarantees that every feature will work identically in every Excel installation. More advanced capabilities can depend on the available Copilot experience and organizational configuration.
+
+For further learning, Microsoft provides an official training module on uncovering data insights with AI, which covers more advanced analytical workflows. Microsoft Learn
+13. Your trainer's checklist
+Use this checklist before the session.
+
+Preparation
+- [ ] Confirm that Copilot is available in your organization's Excel environment.
+- [ ] Prepare the sample workbook and save it to OneDrive or SharePoint.
+- [ ] Convert the dataset into an Excel table.
+- [ ] Test the prompts in advance.
+- [ ] Prepare a separate copy for data-cleaning demonstrations.
+- [ ] Verify the expected calculations independently.
+- [ ] Keep a backup of the original workbook.
+During the session
+- [ ] Explain what Copilot does and where it fits into Excel.
+- [ ] Demonstrate how to open and interact with Copilot.
+- [ ] Show how to write and refine prompts.
+- [ ] Demonstrate formulas, data cleaning, PivotTables, and charts.
+- [ ] Ask participants to verify AI-generated calculations.
+- [ ] Allow time for independent practice.
+After the session
+- [ ] Share the workbook and example prompts.
+- [ ] Encourage participants to practise on approved, non-sensitive datasets.
+- [ ] Collect feedback on which use cases are most relevant to their work.
+14. What I would emphasize in your presentation
+If your audience consists primarily of business analysts and corporate Excel users, I would prioritize these four capabilities:
+1. Formula generation: Translate business logic into Excel formulas.
+2. Data analysis: Ask questions about data and identify patterns.
+3. PivotTables and charts: Turn raw data into useful summaries and visualizations.
+4. Business reporting: Convert calculated findings into concise summaries for decision-makers.
+These capabilities demonstrate a complete workflow rather than isolated AI features.
+
+One important correction for your trainer notes: the sample dataset's correct totals are ₹12,14,500 in revenue and ₹2,91,100 in profit. The correct category-level revenue for Electronics is ₹9,60,000, and the correct East-region revenue is ₹4,06,500. Use these verified figures when checking Copilot's output.
