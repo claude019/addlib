@@ -1,0 +1,18 @@
+Configured values from params.yaml:
+
+excluded_batch: "" (empty — not currently excluding any batch)
+included_batches:
+like_prefixes: ["M", "w", "D"]
+numeric_only: true
+explicit_values: ["D_2", "D_5"]
+alert_cat_cde: ["ALERT"]
+
+
+
+While working with the GPPS tables, we've noticed that policies have PDFs attached, while the textual information held in the table for those policies is limited. Since our solution relies on policy text to assess relevance, this affects how fully we can represent them.
+
+I asked Kirthan whether the text contained in these attached PDFs could be made available to us within the GPPS table against the relevant policies, and he advised that this isn't possible. I'd like to make sure I have the complete picture, so could you please confirm whether that is the case, or whether there is a way the PDF content could be made available alongside the policy records?
+
+If it isn't feasible, a brief confirmation would be very helpful for our documentation and for planning the solution around this constraint. I'd also welcome any pointers to alternative sources you may be aware of.
+
+Thank you for your time and support. Happy to jump on a short call if that's easier.
