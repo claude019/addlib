@@ -1,0 +1,344 @@
+# ============================================================
+# GPPS -- Which countries have RSM linkage, and what % of each
+# country's policies carry it
+#
+# RSM is detected two independent ways:
+#   A. Structured : objRel entries with plcyObjTypeCde == 'REG'
+#   B. Anywhere   : any string value in the policy JSON matching
+#                   RSM-<digits> (catches RSM ids sitting in fields
+#                   we haven't specifically looked at)
+#
+# A policy counts as "with RSM" if EITHER method finds something.
+# Both are shown separately so you can see whether B finds more
+# than A (i.e. RSM ids outside the known objRel path).
+#
+# Tables are discovered dynamically; tables that can't be read are
+# shown as NO ACCESS / EMPTY rather than as 0%, so an unreadable
+# country is never mistaken for "no RSM".
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+from collections import defaultdict
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.max_colwidth", 100)
+
+RSM_PATTERN = re.compile(r"RSM-\d+")
+
+COUNTRY_CODE_NAMES = {
+    "aa": "Global", "ae": "United Arab Emirates", "ar": "Argentina",
+    "au": "Australia", "bd": "Bangladesh", "be": "Belgium", "bh": "Bahrain",
+    "bm": "Bermuda", "br": "Brazil", "ca": "Canada", "cl": "Chile",
+    "cn": "China", "cz": "Czech Republic", "de": "Germany", "dz": "Algeria",
+    "es": "Spain", "fr": "France", "gb": "United Kingdom", "gg": "Guernsey",
+    "hk": "Hong Kong", "id": "Indonesia", "ie": "Ireland", "il": "Israel",
+    "im": "Isle of Man", "in": "India", "it": "Italy", "je": "Jersey",
+    "jp": "Japan", "kr": "Korea, Republic of (South)", "kw": "Kuwait",
+    "ky": "Cayman Islands", "lk": "Sri Lanka", "lu": "Luxembourg",
+    "mo": "Macau", "mt": "Malta", "mu": "Mauritius", "mv": "Maldives",
+    "my": "Malaysia", "nl": "Netherlands", "nz": "New Zealand", "om": "Oman",
+    "ph": "Philippines", "pl": "Poland", "qa": "Qatar", "sa": "Saudi Arabia",
+    "se": "Sweden", "sg": "Singapore", "th": "Thailand", "tr": "Turkey",
+    "tw": "Taiwan", "us": "United States of America", "uy": "Uruguay",
+    "vn": "Vietnam", "za": "South Africa",
+}
+
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def scan_for_rsm(node, path, hits):
+    """Walk every string value; record (field_path, rsm_id) for each
+    RSM-<digits> match. Lists collapse to [] in the path."""
+    if isinstance(node, dict):
+        for k, v in node.items():
+            scan_for_rsm(v, f"{path}.{k}" if path else k, hits)
+    elif isinstance(node, list):
+        for item in node:
+            scan_for_rsm(item, f"{path}[]", hits)
+    elif isinstance(node, str):
+        for m in RSM_PATTERN.findall(node):
+            hits.append((path, m))
+
+
+# ============================================================
+# Step 1 -- Discover tables, check access
+# ============================================================
+
+print("=" * 80)
+print("Step 1 -- Discovering policy tables and checking access")
+print("=" * 80)
+
+discovery_query = f"""
+    SELECT table_name
+    FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+    WHERE REGEXP_CONTAINS(table_name, r'^[a-z]{{2}}_hsbc_gpps_gpps_policy$')
+    ORDER BY table_name
+"""
+
+try:
+    tables = bq_client.query(discovery_query).to_dataframe()["table_name"].tolist()
+    print(f"Discovered {len(tables)} policy tables.")
+except Exception as e:
+    print(f"INFORMATION_SCHEMA not readable ({str(e)[:80]}) -- using the known code list.")
+    tables = [f"{c}_hsbc_gpps_gpps_policy" for c in sorted(COUNTRY_CODE_NAMES)]
+
+access_rows = []
+for table in tables:
+    code = table.split("_")[0]
+    country = COUNTRY_CODE_NAMES.get(code, code)
+    try:
+        n = bq_client.query(
+            f"SELECT COUNT(*) AS n FROM `{DATA_PROJECT}.{DATASET}.{table}`"
+        ).to_dataframe()["n"].iloc[0]
+        access_rows.append({"country": country, "table": table,
+                            "status": "OK" if n > 0 else "EMPTY", "rows": int(n)})
+    except Exception as e:
+        access_rows.append({"country": country, "table": table,
+                            "status": "NO ACCESS", "rows": None})
+
+access_df = pd.DataFrame(access_rows)
+print(access_df["status"].value_counts().to_string())
+
+
+# ============================================================
+# Step 2 -- One row per policy (latest version), with RSM flags
+# ============================================================
+
+print("\n" + "=" * 80)
+print("Step 2 -- Scanning policies for RSM linkage")
+print("=" * 80)
+
+policy_rows = []
+path_hits = []   # (country, field_path, rsm_id)
+
+for _, a in access_df[access_df["status"] == "OK"].iterrows():
+    country, table = a["country"], a["table"]
+    query = (f"SELECT policy_core_id, version_num, json_data "
+             f"FROM `{DATA_PROJECT}.{DATASET}.{table}`")
+    try:
+        df = bq_client.query(query).to_dataframe()
+    except Exception as e:
+        print(f"  {country:30s} load failed -- {str(e)[:60]}")
+        continue
+
+    latest = (df.sort_values("version_num")
+              .groupby("policy_core_id", as_index=False).tail(1))
+
+    for _, row in latest.iterrows():
+        parsed = safe_json_loads(row["json_data"])
+        if not isinstance(parsed, dict):
+            continue
+
+        # Method A -- structured: objRel entries typed REG
+        reg_entries = 0
+        segments = get_nested(parsed, "policyApplication", "segment")
+        for seg in (segments if isinstance(segments, list) else []):
+            if not isinstance(seg, dict):
+                continue
+            obj_rel = seg.get("objRel")
+            for obj in (obj_rel if isinstance(obj_rel, list) else []):
+                if isinstance(obj, dict) and obj.get("plcyObjTypeCde") == "REG":
+                    reg_entries += 1
+
+        # Method B -- RSM-<digits> anywhere in the JSON
+        hits = []
+        scan_for_rsm(parsed, "", hits)
+        rsm_ids = {h[1] for h in hits}
+        for p, m in hits:
+            path_hits.append((country, p, m))
+
+        policy_rows.append({
+            "country": country,
+            "policy_core_id": row["policy_core_id"],
+            "policyTitle": parsed.get("policyTitle"),
+            "has_REG_objrel": reg_entries > 0,
+            "REG_objrel_entries": reg_entries,
+            "has_RSM_id_anywhere": len(rsm_ids) > 0,
+            "distinct_RSM_ids": len(rsm_ids),
+            "RSM_ids": "; ".join(sorted(rsm_ids)[:10]) + (" ..." if len(rsm_ids) > 10 else ""),
+            "has_RSM": (reg_entries > 0) or (len(rsm_ids) > 0),
+        })
+
+    print(f"  {country:30s} {latest['policy_core_id'].nunique()} policies scanned")
+
+policy_df = pd.DataFrame(policy_rows)
+
+
+# ============================================================
+# Step 3 -- Country summary
+# ============================================================
+
+print("\n" + "=" * 80)
+print("Step 3 -- RSM linkage by country")
+print("=" * 80)
+
+summary = (
+    policy_df.groupby("country")
+    .agg(
+        distinct_policies=("policy_core_id", "nunique"),
+        policies_with_RSM=("has_RSM", "sum"),
+        via_REG_objrel=("has_REG_objrel", "sum"),
+        via_RSM_id_anywhere=("has_RSM_id_anywhere", "sum"),
+        total_REG_entries=("REG_objrel_entries", "sum"),
+    )
+    .reset_index()
+)
+summary["pct_policies_with_RSM"] = (
+    summary["policies_with_RSM"] / summary["distinct_policies"] * 100
+).round(2)
+
+# distinct RSM ids per country
+rsm_id_counts = (
+    pd.DataFrame(path_hits, columns=["country", "path", "rsm_id"])
+    .groupby("country")["rsm_id"].nunique().rename("distinct_RSM_ids")
+    .reset_index()
+) if path_hits else pd.DataFrame(columns=["country", "distinct_RSM_ids"])
+
+summary = summary.merge(rsm_id_counts, on="country", how="left")
+summary["distinct_RSM_ids"] = summary["distinct_RSM_ids"].fillna(0).astype(int)
+
+# Merge in access status so unreadable countries stay visible
+full = access_df[["country", "table", "status"]].merge(summary, on="country", how="left")
+full["rsm_status"] = full.apply(
+    lambda r: r["status"] if r["status"] != "OK"
+    else ("HAS RSM" if r["policies_with_RSM"] > 0 else "NO RSM FOUND"),
+    axis=1,
+)
+full = full.sort_values(["pct_policies_with_RSM", "policies_with_RSM"],
+                        ascending=False, na_position="last")
+
+cols = ["country", "table", "rsm_status", "distinct_policies", "policies_with_RSM",
+        "pct_policies_with_RSM", "via_REG_objrel", "via_RSM_id_anywhere",
+        "total_REG_entries", "distinct_RSM_ids"]
+
+print("\n[3a] Countries WITH RSM linkage:")
+with_rsm = full[full["rsm_status"] == "HAS RSM"]
+if len(with_rsm):
+    display(with_rsm[cols])
+else:
+    print("  None found.")
+
+print("\n[3b] Countries readable but with NO RSM found:")
+display(full[full["rsm_status"] == "NO RSM FOUND"][
+    ["country", "table", "distinct_policies"]])
+
+print("\n[3c] Countries NOT readable (cannot say anything about RSM here):")
+display(full[full["rsm_status"].isin(["NO ACCESS", "EMPTY"])][
+    ["country", "table", "rsm_status"]])
+
+print("\n[3d] Overall:")
+tot_pol = int(summary["distinct_policies"].sum())
+tot_rsm = int(summary["policies_with_RSM"].sum())
+print(f"  {len(with_rsm)} of {len(summary)} readable countries have RSM linkage")
+print(f"  {tot_rsm:,} of {tot_pol:,} policies ({tot_rsm / tot_pol * 100:.2f}%) carry RSM")
+
+# Do the two methods disagree?
+only_b = int(((~policy_df["has_REG_objrel"]) & policy_df["has_RSM_id_anywhere"]).sum())
+only_a = int((policy_df["has_REG_objrel"] & (~policy_df["has_RSM_id_anywhere"])).sum())
+print(f"\n  Method agreement check:")
+print(f"    policies with RSM id somewhere but NO REG objRel : {only_b:,}")
+print(f"    policies with REG objRel but NO RSM-<digits> id  : {only_a:,}")
+if only_b:
+    print("    -> RSM ids exist outside the REG objRel path; see Step 4 for where.")
+if only_a:
+    print("    -> Some REG entries carry ids in a different format than RSM-<digits>.")
+
+
+# ============================================================
+# Step 4 -- Where in the JSON were RSM ids found?
+# ============================================================
+
+print("\n" + "=" * 80)
+print("Step 4 -- Field paths where RSM ids appear")
+print("=" * 80)
+
+if path_hits:
+    path_df = pd.DataFrame(path_hits, columns=["country", "field_path", "rsm_id"])
+    path_summary = (
+        path_df.groupby("field_path")
+        .agg(occurrences=("rsm_id", "size"),
+             distinct_rsm_ids=("rsm_id", "nunique"),
+             countries=("country", lambda s: "; ".join(sorted(s.unique()))))
+        .reset_index()
+        .sort_values("occurrences", ascending=False)
+    )
+    display(path_summary)
+else:
+    print("  No RSM-<digits> ids found anywhere in any policy JSON.")
+
+
+# ============================================================
+# Step 5 -- Policy-level detail for countries that have RSM
+# ============================================================
+
+print("\n" + "=" * 80)
+print("Step 5 -- Policy-level detail (policies with RSM)")
+print("=" * 80)
+
+detail = policy_df[policy_df["has_RSM"]].sort_values(
+    ["country", "policy_core_id"])
+display(detail[["country", "policy_core_id", "policyTitle",
+                "REG_objrel_entries", "distinct_RSM_ids", "RSM_ids"]])
+
+print("\n[5b] Policies WITHOUT RSM, in countries that do have it "
+      "(partial coverage within a market):")
+countries_with = set(with_rsm["country"])
+partial = policy_df[(~policy_df["has_RSM"]) & (policy_df["country"].isin(countries_with))]
+display(partial[["country", "policy_core_id", "policyTitle"]].sort_values(
+    ["country", "policy_core_id"]))
+
+
+# ============================================================
+# Export
+# ============================================================
+
+output_path = "GPPS_RSM_Linkage_By_Country.xlsx"
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    full[cols].to_excel(writer, sheet_name="RSM by Country", index=False)
+    detail.to_excel(writer, sheet_name="Policies with RSM", index=False)
+    partial.to_excel(writer, sheet_name="Policies without RSM", index=False)
+    if path_hits:
+        path_summary.to_excel(writer, sheet_name="RSM Field Paths", index=False)
+    access_df.to_excel(writer, sheet_name="Table Access", index=False)
+
+print(f"\nWritten to: {output_path}")
+print("Frames in memory: policy_df (one row per policy), full (country summary)")
