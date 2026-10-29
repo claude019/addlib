@@ -16,3 +16,28 @@ I asked Kirthan whether the text contained in these attached PDFs could be made 
 If it isn't feasible, a brief confirmation would be very helpful for our documentation and for planning the solution around this constraint. I'd also welcome any pointers to alternative sources you may be aware of.
 
 Thank you for your time and support. Happy to jump on a short call if that's easier.
+
+
+
+
+
+
+Ahead of starting development of the policy linkage solution, I wanted to share a few data coverage considerations from our review of GPPS policy data across the 54 in-scope markets, and seek your alignment on how we proceed.
+
+What we found:
+• 44 markets have country-level policy data. 10 (Argentina, Chile, Guernsey, Israel, Isle of Man, Jersey, Cayman Islands, Saudi Arabia, Uruguay and Canada) have none in their country tables. Global policies are visible for some of these markets.
+• For some policies, the substantive text sits in an attached PDF rather than in the policy record or table. For example, Policy 508 (Brazil Regulatory Duty to Customers).
+• Linked RSM details appear to be missing for most countries.
+
+Why it matters for the solution:
+• Markets with no country-level data cannot be linked to local policies, so coverage there will rely on global policies where available.
+• Policies whose content sits only in attachments carry limited text for matching, so link quality for them is likely to be lower.
+• Without RSM details, our ability to validate links in those countries is limited.
+
+Proposed way forward, for your confirmation:
+1. Proceed with development on the data currently available, with the coverage limitations above documented.
+2. Treat the 10 markets and attachment-only policies as limited coverage in the initial phase, to be revisited if the data becomes available.
+3. Track these as open dependencies with the relevant data owners.
+
+If you would prefer these gaps to be resolved before development starts, please let me know and we will plan accordingly. Your confirmation will let us document the agreed basis for the solution. Happy to walk through the details on a short call.
+
