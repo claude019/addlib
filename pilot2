@@ -1,0 +1,74 @@
+# ============================================================
+# Diagnose the FORBIDDEN on gs://cmlp_exp_003_1_prod
+#
+# Step 1 shows the REAL error text from Google (the earlier script's
+# generic "FORBIDDEN" message hid this). Step 2 checks whether your
+# ADC credentials have a quota project attached -- if not, that is
+# almost certainly the cause given you said you already have access
+# to this bucket. Step 3 retries with a quota project set.
+# ============================================================
+
+import google.auth
+from google.cloud import storage
+from google.api_core import exceptions as gexc
+
+BUCKET_NAME = "cmlp_exp_003_1_prod"
+QUOTA_PROJECT = "hsbc-12211200-cmlpwb-prod"  # set to whichever project should be billed for the call
+
+# ---- Step 1: see the real error, unfiltered ----
+print("=" * 70)
+print("STEP 1 -- Raw error from Google (no custom message in the way)")
+print("=" * 70)
+try:
+    storage.Client(project=QUOTA_PROJECT).bucket(BUCKET_NAME).reload()
+    print("OK -- bucket is reachable, no fix needed.")
+except Exception as e:
+    print(f"{type(e).__name__}:\n{e}")
+
+# ---- Step 2: inspect the credentials themselves ----
+print("\n" + "=" * 70)
+print("STEP 2 -- Credential inspection")
+print("=" * 70)
+credentials, adc_project = google.auth.default(
+    scopes=["https://www.googleapis.com/auth/cloud-platform"]
+)
+print(f"Credential type:        {type(credentials).__name__}")
+print(f"ADC default project:    {adc_project}")
+print(f"quota_project_id set:   {getattr(credentials, 'quota_project_id', None)!r}")
+if not getattr(credentials, "quota_project_id", None):
+    print("\n-> No quota project is attached to these credentials. This matches the "
+          "UserWarning you saw and is the most likely cause of the Forbidden.")
+
+# ---- Step 3: retry with a quota project explicitly attached ----
+print("\n" + "=" * 70)
+print("STEP 3 -- Retry with quota project attached")
+print("=" * 70)
+try:
+    fixed_credentials = (
+        credentials.with_quota_project(QUOTA_PROJECT)
+        if hasattr(credentials, "with_quota_project") else credentials
+    )
+    client = storage.Client(project=QUOTA_PROJECT, credentials=fixed_credentials)
+    bucket = client.bucket(BUCKET_NAME)
+    bucket.reload()
+    print(f"SUCCESS -- bucket reachable. location={bucket.location}, "
+          f"storage_class={bucket.storage_class}")
+    print("\nThe quota project was the issue. Re-run the pilot script as-is; it will "
+          "now work once you add the with_quota_project() fix above to it (or run "
+          "the gcloud command below once, which fixes it permanently for this VDI).")
+except gexc.Forbidden as e:
+    print(f"STILL FORBIDDEN -- full detail:\n{e}")
+    print("\nThis means it is a genuine IAM permissions gap, not a quota-project issue. "
+          "That's a different ask than the GPPS email thread -- raise it with whoever "
+          "administers IAM on this GCP project/bucket (your CMLP platform/admin "
+          "contact), requesting roles/storage.objectViewer (or equivalent) on "
+          f"gs://{BUCKET_NAME} for this identity, rather than replying to Kari.")
+except Exception as e:
+    print(f"{type(e).__name__}: {e}")
+
+print("\n" + "=" * 70)
+print("Permanent fix (run once in the notebook's Terminal, not a Python cell):")
+print(f"  gcloud auth application-default set-quota-project {QUOTA_PROJECT}")
+print("Then restart the kernel. This writes the quota project into the ADC file "
+      "itself, so you won't need the with_quota_project() workaround in future scripts.")
+print("=" * 70)
