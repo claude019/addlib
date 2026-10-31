@@ -1,0 +1,82 @@
+# ============================================================
+# Two separate identity tests, now that ADC has been freshly
+# refreshed:
+#
+#   1. Your personal account, via the now-fresh ADC file
+#      (skips the quota-project step -- not needed for a read)
+#   2. The compute environment's attached service account, which
+#      gcloud's own message said is normally used automatically
+#      here, but is being overridden by GOOGLE_APPLICATION_CREDENTIALS
+#      pointing at your personal login
+# ============================================================
+
+import google.auth
+from google.cloud import storage
+from google.api_core import exceptions as gexc
+
+BUCKET_NAME = "cmlp_exp_003_1_prod"
+PROJECT = "hsbc-12211200-cmlpwb-prod"
+
+# ---- 1: your personal account (fresh ADC) ----
+print("=" * 70)
+print("1 -- Personal account (fresh ADC), no quota project")
+print("=" * 70)
+try:
+    storage.Client(project=PROJECT).bucket(BUCKET_NAME).reload()
+    print("SUCCESS -- fresh ADC works. Your personal account does have access; "
+          "the earlier Forbidden was the stale-credential issue after all.")
+except gexc.Forbidden as e:
+    print(f"Still Forbidden:\n{e}")
+except Exception as e:
+    print(f"{type(e).__name__}: {str(e)[:200]}")
+
+# ---- 2: the environment's attached service account ----
+print("\n" + "=" * 70)
+print("2 -- This environment's attached service account")
+print("=" * 70)
+try:
+    import requests
+    r = requests.get(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/email",
+        headers={"Metadata-Flavor": "Google"}, timeout=3,
+    )
+    sa_email = r.text.strip() if r.status_code == 200 else None
+    print(f"Attached service account: {sa_email or 'not found'}")
+except Exception as e:
+    sa_email = None
+    print(f"Could not reach metadata server: {type(e).__name__}")
+
+try:
+    import google.auth.compute_engine
+    sa_credentials = google.auth.compute_engine.Credentials()
+    client = storage.Client(project=PROJECT, credentials=sa_credentials)
+    client.bucket(BUCKET_NAME).reload()
+    print(f"\nSUCCESS as {sa_email or 'the attached service account'} -- THIS identity "
+          f"has bucket access. Your personal login does not need it; use these "
+          f"credentials for the pilot script instead:\n\n"
+          f"    import google.auth.compute_engine\n"
+          f"    storage.Client(\n"
+          f"        project='{PROJECT}',\n"
+          f"        credentials=google.auth.compute_engine.Credentials(),\n"
+          f"    )")
+except gexc.Forbidden as e:
+    print(f"\nStill Forbidden even as the attached service account:\n{e}")
+except Exception as e:
+    print(f"\n{type(e).__name__}: {str(e)[:200]}\n"
+          f"(No service account reachable here, or it genuinely lacks access too.)")
+
+print("\n" + "=" * 70)
+print("Reading this together")
+print("=" * 70)
+print("""
+If 1 succeeded          -> done, no further changes needed.
+If 1 failed, 2 succeeded -> the grant is on the service account, not your
+                            personal login. Update the pilot script to build
+                            storage.Client with compute_engine.Credentials()
+                            as shown above.
+If both failed           -> neither identity has read access to this bucket.
+                            That's now a clean, two-identity-confirmed IAM gap
+                            -- time to request roles/storage.objectViewer (or
+                            equivalent) on gs://cmlp_exp_003_1_prod, naming
+                            whichever identity(ies) printed above.
+""")
