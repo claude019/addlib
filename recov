@@ -1,57 +1,51 @@
 # ============================================================
-# Recovery: BigQuery broke after 'gcloud auth application-default
-# login' overwrote the working ADC file with a personal login that
-# lacks serviceusage.services.use on hsbc-12211200-cmlpwb-prod.
+# Recovery attempt 2: bill the query job against DATA_PROJECT
+# instead of ANALYTICS_PROJECT.
 #
-# Testing whether the attached service account (confirmed to exist
-# in this environment, even though it lacked GCS bucket access) can
-# run BigQuery jobs -- a different resource, different grants.
+# Your GPPS queries already reference tables by full path
+# (DATA_PROJECT.DATASET.table) -- the billing project is a
+# separate setting. If your personal account has billing rights
+# on DATA_PROJECT even without them on ANALYTICS_PROJECT, this
+# restores access with no IAM change needed.
 # ============================================================
 
-import google.auth
-import google.auth.compute_engine
 from google.cloud import bigquery
 from google.api_core import exceptions as gexc
 
-ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
 LOCATION = "EU"  # match whatever you've been using
 
 print("=" * 70)
-print("Testing BigQuery as the attached service account")
+print("Testing BigQuery billed against DATA_PROJECT")
 print("=" * 70)
 try:
-    sa_credentials = google.auth.compute_engine.Credentials()
-    bq_client = bigquery.Client(
-        project=ANALYTICS_PROJECT, credentials=sa_credentials, location=LOCATION
-    )
+    bq_client = bigquery.Client(project=DATA_PROJECT, location=LOCATION)
     result = bq_client.query("SELECT 1 AS test").to_dataframe()
-    print("SUCCESS -- BigQuery works again via the attached service account.")
+    print("SUCCESS -- works when billed against DATA_PROJECT.")
     print(result)
     print(f"""
-Use this for bq_client going forward (until the ADC file is sorted out):
+Use this going forward, until the ADC file is restored:
 
-    import google.auth.compute_engine
-    from google.cloud import bigquery
+    bq_client = bigquery.Client(project="{DATA_PROJECT}", location="{LOCATION}")
 
-    bq_client = bigquery.Client(
-        project="{ANALYTICS_PROJECT}",
-        credentials=google.auth.compute_engine.Credentials(),
-        location="{LOCATION}",
-    )
-
-This restores your GPPS table access immediately -- no IAM request needed
-for this part. The earlier GCS bucket issue is unrelated and unaffected.
+This only changes which project the query JOB is billed against -- your
+table references stay exactly as they are.
 """)
 except gexc.Forbidden as e:
     print(f"Still Forbidden:\n{e}")
     print("""
-If this also fails, the attached service account doesn't have BigQuery
-access either, and the fastest recovery is asking platform support
-(whoever provisions this JupyterLab environment) to regenerate or
-restore the application_default_credentials.json file -- it may have
-been set up with specific delegated permissions that a plain personal
-login doesn't reproduce. Mention the file was overwritten by running
-'gcloud auth application-default login' as your personal account.
+Both projects are blocked for your current identity. This doesn't mean
+access is gone, but there is nothing further to try from inside the
+notebook -- it's time to ask platform support to restore or regenerate
+/home/jovyan/.config/gcloud/application_default_credentials.json. Tell
+them specifically:
+  - the file was overwritten by running 'gcloud auth application-default
+    login' as your personal account (dipayan1.banerjee@noexternalmail.hsbc.com)
+  - BigQuery queries that worked before that command now fail with
+    USER_PROJECT_DENIED / missing serviceusage.services.use on
+    hsbc-12211200-cmlpwb-prod
+  - this suggests the original file had a quota project pre-configured
+    that a plain personal login does not reproduce
 """)
 except Exception as e:
     print(f"{type(e).__name__}: {str(e)[:300]}")
