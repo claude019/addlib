@@ -1,0 +1,377 @@
+# PART 1 of 3 -- config, helpers, Stages 0-2 (tooling, attachment inventory, link types)
+# Run Parts 1, 2, 3 in order in the SAME notebook kernel; each builds on the last.
+# Edit the CONFIG block below before running.
+
+# ============================================================
+# GPPS -- Can we actually reach the PDF attachments?
+#
+# Tests the access route suggested for policies whose real content
+# sits in attached PDFs rather than in the table:
+#
+#   STAGE 0  Tooling available in this notebook (GCS client, PDF libs)
+#   STAGE 1  Inventory every attachment in policyApplication.appendix[]
+#            / guidance[]; how many policies depend on a PDF
+#   STAGE 2  What kind of links are these? (docUrl / docGmsUrl / gs://)
+#   STAGE 3  Find the metadata table holding the GCS URI, and join it
+#   STAGE 4  Manual tests -- paste a gs:// path or URL you've been given
+#   STAGE 5  Pilot: push a sample of attachments through the full
+#            chain (locate -> download -> is it a PDF -> extract text)
+#   STAGE 6  Summary + export
+#
+# Only attachments flagged actvFlg == 'Y' are tested. Where a document
+# has been replaced, the old version stays in the array with actvFlg 'N'
+# (its id sits in the new entry's oldDocId) -- testing the old one would
+# give a stale or missing file.
+#
+# Nothing is written to disk unless SAVE_DIR is set. Tokens are only
+# ever sent to hosts ending in .hsbc.
+# ============================================================
+
+import os
+import re
+import io
+import json
+import shutil
+import subprocess
+import importlib
+from urllib.parse import urlparse
+from collections import Counter
+
+import pandas as pd
+from bs4 import BeautifulSoup
+from google.cloud import bigquery
+
+try:
+    bq_client
+except NameError:
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 300)
+pd.set_option("display.max_colwidth", 110)
+
+
+# ============================================================
+# CONFIG -- edit this block
+# ============================================================
+
+SAMPLE_SIZE = 12            # attachments to push through the full pilot (Stage 5)
+MAX_DOWNLOAD_MB = 50        # skip anything larger than this
+THIN_TEXT_THRESHOLD = 500   # chars of policyText + purpose + segments below which a policy is "thin"
+MIN_PAGE_CHARS = 20         # a PDF page with fewer extracted chars is treated as image-only
+SAVE_DIR = None             # e.g. "pdf_cache" to keep downloaded PDFs; None = memory only
+
+# Paste what you've been given here:
+MANUAL_GCS_URIS = []        # e.g. ["gs://some-bucket/path/file.pdf"]
+MANUAL_HTTP_URLS = []       # e.g. the docUrl from the policy JSON
+
+# Once the metadata table holding the GCS path is identified (Stage 3 helps
+# find it), fill these in and re-run to join it onto the attachments:
+METADATA_TABLE = None           # fully qualified: "project.dataset.table"
+METADATA_URI_COLUMN = None      # column holding the gs:// path
+METADATA_KEY_COLUMN = None      # column to join on, e.g. the doc id column
+METADATA_KEY_FIELD = "docId"    # which attachment field it matches: docId / docName / gppsDocName
+
+EXTRA_DATASETS = []             # other datasets in DATA_PROJECT to search in Stage 3
+
+MAX_BYTES = MAX_DOWNLOAD_MB * 1024 * 1024
+
+COUNTRY_CODE_NAMES = {
+    "aa": "Global", "ae": "United Arab Emirates", "ar": "Argentina",
+    "au": "Australia", "bd": "Bangladesh", "be": "Belgium", "bh": "Bahrain",
+    "bm": "Bermuda", "br": "Brazil", "ca": "Canada", "cl": "Chile",
+    "cn": "China", "cz": "Czech Republic", "de": "Germany", "dz": "Algeria",
+    "es": "Spain", "fr": "France", "gb": "United Kingdom", "gg": "Guernsey",
+    "hk": "Hong Kong", "id": "Indonesia", "ie": "Ireland", "il": "Israel",
+    "im": "Isle of Man", "in": "India", "it": "Italy", "je": "Jersey",
+    "jp": "Japan", "kr": "Korea, Republic of (South)", "kw": "Kuwait",
+    "ky": "Cayman Islands", "lk": "Sri Lanka", "lu": "Luxembourg",
+    "mo": "Macau", "mt": "Malta", "mu": "Mauritius", "mv": "Maldives",
+    "my": "Malaysia", "nl": "Netherlands", "nz": "New Zealand", "om": "Oman",
+    "ph": "Philippines", "pl": "Poland", "qa": "Qatar", "sa": "Saudi Arabia",
+    "se": "Sweden", "sg": "Singapore", "th": "Thailand", "tr": "Turkey",
+    "tw": "Taiwan", "us": "United States of America", "uy": "Uruguay",
+    "vn": "Vietnam", "za": "South Africa",
+}
+
+GCS_PATTERN = re.compile(
+    r"(gs://[^\s\"'<>]+|https?://storage\.(?:googleapis|cloud\.google)\.com/[^\s\"'<>]+)"
+)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def _have(mod):
+    try:
+        importlib.import_module(mod)
+        return True
+    except Exception:
+        return False
+
+
+def link_pattern(url):
+    """Collapse ids so links of the same shape group together."""
+    if not isinstance(url, str) or not url.strip():
+        return None
+    p = urlparse(url)
+    return f"{p.scheme}://{p.netloc}{re.sub(r'\d+', '<n>', p.path)}"
+
+
+def policy_text_chars(parsed):
+    t = strip_html(get_nested(parsed, "policyText", "sgmntText"))
+    p = strip_html(get_nested(parsed, "policyPurpose", "sgmntText"))
+    segs = get_nested(parsed, "policyApplication", "segment")
+    s = 0
+    if isinstance(segs, list):
+        s = sum(len(strip_html(x.get("sgmntText"))) for x in segs if isinstance(x, dict))
+    return len(t) + len(p) + s
+
+
+def extract_attachments(parsed):
+    rows = []
+    for source in ("appendix", "guidance"):
+        items = get_nested(parsed, "policyApplication", source)
+        if not isinstance(items, list):
+            continue
+        for it in items:
+            if not isinstance(it, dict):
+                continue
+            gcs = next((v for v in it.values()
+                        if isinstance(v, str) and v.startswith("gs://")), None)
+            rows.append({
+                "source": source,
+                "actvFlg": it.get("actvFlg"),
+                "docId": it.get("docId"),
+                "oldDocId": it.get("oldDocId"),
+                "docName": it.get("docName"),
+                "gppsDocName": it.get("gppsDocName"),
+                "docRefNum": it.get("docRefNum"),
+                "docTitlText": it.get("docTitlText"),
+                "docDesc": it.get("docDesc"),
+                "docUrl": it.get("docUrl"),
+                "docGmsUrl": it.get("docGmsUrl"),
+                "gcs_uri": gcs,
+            })
+    return rows
+
+
+def scan_for_gcs(node, path, hits):
+    if isinstance(node, dict):
+        for k, v in node.items():
+            scan_for_gcs(v, f"{path}.{k}" if path else k, hits)
+    elif isinstance(node, list):
+        for item in node:
+            scan_for_gcs(item, f"{path}[]", hits)
+    elif isinstance(node, str):
+        for m in GCS_PATTERN.findall(node):
+            hits.append((path, m))
+
+
+# ============================================================
+# STAGE 0 -- Tooling
+# ============================================================
+
+print("=" * 80)
+print("STAGE 0 -- Tooling available in this notebook")
+print("=" * 80)
+
+tool_rows = [
+    {"item": "google.cloud.storage", "purpose": "read GCS objects", "available": _have("google.cloud.storage")},
+    {"item": "requests", "purpose": "call docUrl endpoint", "available": _have("requests")},
+    {"item": "fitz (PyMuPDF)", "purpose": "PDF text", "available": _have("fitz")},
+    {"item": "pypdf", "purpose": "PDF text", "available": _have("pypdf")},
+    {"item": "pdfplumber", "purpose": "PDF text", "available": _have("pdfplumber")},
+    {"item": "pdfminer.six", "purpose": "PDF text", "available": _have("pdfminer")},
+    {"item": "pytesseract", "purpose": "OCR wrapper", "available": _have("pytesseract")},
+    {"item": "tesseract binary", "purpose": "OCR engine", "available": shutil.which("tesseract") is not None},
+    {"item": "gcloud CLI", "purpose": "identity token for docUrl", "available": shutil.which("gcloud") is not None},
+]
+tool_df = pd.DataFrame(tool_rows)
+display(tool_df)
+
+if not any(r["available"] for r in tool_rows if r["purpose"] == "PDF text"):
+    print("\nNo PDF text library is installed. Text extraction will be skipped; access "
+          "tests still run. Install one (e.g. pypdf or PyMuPDF) if your environment allows it.")
+
+
+# ============================================================
+# STAGE 1 -- Attachment inventory across all policy tables
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STAGE 1 -- Attachment inventory")
+print("=" * 80)
+
+discovery_query = f"""
+    SELECT table_name
+    FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+    WHERE REGEXP_CONTAINS(table_name, r'^[a-z]{{2}}_hsbc_gpps_gpps_policy$')
+    ORDER BY table_name
+"""
+try:
+    tables = bq_client.query(discovery_query).to_dataframe()["table_name"].tolist()
+except Exception as e:
+    print(f"INFORMATION_SCHEMA not readable ({str(e)[:70]}) -- using the known code list.")
+    tables = [f"{c}_hsbc_gpps_gpps_policy" for c in sorted(COUNTRY_CODE_NAMES)]
+
+policy_rows, attach_rows, gcs_path_hits = [], [], []
+
+for table in tables:
+    code = table.split("_")[0]
+    country = COUNTRY_CODE_NAMES.get(code, code)
+    try:
+        df = bq_client.query(
+            f"SELECT policy_core_id, version_num, json_data "
+            f"FROM `{DATA_PROJECT}.{DATASET}.{table}`"
+        ).to_dataframe()
+    except Exception as e:
+        print(f"  {country:30s} not readable -- {str(e)[:60]}")
+        continue
+    if len(df) == 0:
+        continue
+
+    latest = (df.sort_values("version_num")
+              .groupby("policy_core_id", as_index=False).tail(1))
+
+    for _, row in latest.iterrows():
+        parsed = safe_json_loads(row["json_data"])
+        if not isinstance(parsed, dict):
+            continue
+        pid = row["policy_core_id"]
+
+        atts = extract_attachments(parsed)
+        n_active = sum(1 for a in atts if a["actvFlg"] == "Y")
+        text_chars = policy_text_chars(parsed)
+
+        policy_rows.append({
+            "country": country, "table": table, "policy_core_id": pid,
+            "policyTitle": parsed.get("policyTitle"),
+            "text_chars": text_chars,
+            "n_attachments": len(atts),
+            "n_active_attachments": n_active,
+        })
+        for a in atts:
+            attach_rows.append({"country": country, "policy_core_id": pid,
+                                "policyTitle": parsed.get("policyTitle"),
+                                "policy_text_chars": text_chars, **a})
+
+        hits = []
+        scan_for_gcs(parsed, "", hits)
+        for p, m in hits:
+            gcs_path_hits.append({"country": country, "policy_core_id": pid,
+                                  "field_path": p, "value": m})
+
+    print(f"  {country:30s} {latest['policy_core_id'].nunique()} policies scanned")
+
+policy_df = pd.DataFrame(policy_rows)
+attach_df = pd.DataFrame(attach_rows)
+
+policy_df["is_thin"] = policy_df["text_chars"] < THIN_TEXT_THRESHOLD
+policy_df["has_active_attachment"] = policy_df["n_active_attachments"] > 0
+policy_df["thin_with_attachment"] = policy_df["is_thin"] & policy_df["has_active_attachment"]
+policy_df["thin_no_attachment"] = policy_df["is_thin"] & ~policy_df["has_active_attachment"]
+
+country_sum = (
+    policy_df.groupby("country")
+    .agg(policies=("policy_core_id", "nunique"),
+         with_active_attachment=("has_active_attachment", "sum"),
+         thin_text=("is_thin", "sum"),
+         thin_AND_has_attachment=("thin_with_attachment", "sum"),
+         thin_with_NO_attachment=("thin_no_attachment", "sum"))
+    .reset_index()
+)
+country_sum["pct_with_attachment"] = (
+    country_sum["with_active_attachment"] / country_sum["policies"] * 100).round(1)
+country_sum = country_sum.sort_values("pct_with_attachment", ascending=False)
+
+print(f"\n[1a] Per country (thin = fewer than {THIN_TEXT_THRESHOLD} chars of table text):")
+display(country_sum)
+
+tot = len(policy_df)
+print(f"\n[1b] Overall: {int(policy_df['has_active_attachment'].sum()):,} of {tot:,} policies "
+      f"({policy_df['has_active_attachment'].mean() * 100:.1f}%) carry an active attachment.")
+print(f"     Thin-text policies: {int(policy_df['is_thin'].sum()):,}")
+print(f"       ... of which have an attachment (content likely lives in the PDF): "
+      f"{int(policy_df['thin_with_attachment'].sum()):,}")
+print(f"       ... of which have NO attachment (a genuine content gap): "
+      f"{int(policy_df['thin_no_attachment'].sum()):,}")
+
+if len(attach_df) == 0:
+    print("\nNo attachments found in any policy -- nothing further to test.")
+    raise SystemExit
+
+attach_df = attach_df.reset_index(drop=True)
+attach_active = attach_df[attach_df["actvFlg"] == "Y"].copy().reset_index(drop=True)
+print(f"\n[1c] Attachment entries: {len(attach_df):,} total, {len(attach_active):,} active "
+      f"(Y), {int((attach_df['actvFlg'] == 'N').sum()):,} inactive (N), "
+      f"{int(attach_df['actvFlg'].isna().sum()):,} with no flag.")
+print(f"     Distinct active docIds: {attach_active['docId'].nunique():,}")
+
+
+# ============================================================
+# STAGE 2 -- What kind of links are these?
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STAGE 2 -- Link types")
+print("=" * 80)
+
+for col in ("docUrl", "docGmsUrl"):
+    pats = Counter(link_pattern(u) for u in attach_active[col] if isinstance(u, str) and u.strip())
+    print(f"\n[{col}] populated for {int(attach_active[col].notna().sum()):,} of "
+          f"{len(attach_active):,} active attachments. Link shapes:")
+    for pat, n in pats.most_common(10):
+        print(f"    {n:6,d}  {pat}")
+
+gcs_df = pd.DataFrame(gcs_path_hits)
+print(f"\n[gs:// / storage links found anywhere in the policy JSON]: {len(gcs_df):,}")
+if len(gcs_df):
+    display(gcs_df.groupby("field_path").size().rename("occurrences").reset_index())
+else:
+    print("    None -- the JSON itself carries no GCS path. The path must come from a "
+          "metadata table (Stage 3), as the reply suggested.")
+
+print(f"\nActive attachments already carrying a gs:// path in the JSON: "
+      f"{int(attach_active['gcs_uri'].notna().sum()):,}")
