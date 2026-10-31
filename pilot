@@ -1,0 +1,368 @@
+# ============================================================
+# GPPS PDF attachment access -- pilot test, ONE policy
+#
+# Policy: Brazil, policy_core_id 508 (the one in your screenshot --
+# active attachment docId 13301, inactive docId 7966)
+# Bucket:  gs://cmlp_exp_003_1_prod
+#
+# Plain Python. No LLM.
+#
+# The bucket is known but the object path inside it is not, so this
+# tries two things in order:
+#   1. A handful of direct path guesses (fast, cheap -- just checks
+#      existence, no listing)
+#   2. If none hit, a capped search through the bucket's object names
+#      for the docId / filename (bounded so it can't run forever on
+#      a large prod bucket)
+# ============================================================
+
+import os
+import re
+import io
+import json
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+COUNTRY_TABLE = "br_hsbc_gpps_gpps_policy"   # Brazil
+POLICY_CORE_ID = 508
+BUCKET_NAME = "cmlp_exp_003_1_prod"
+GCS_PROJECT = ANALYTICS_PROJECT if "ANALYTICS_PROJECT" in dir() else "hsbc-12211200-cmlpwb-prod"
+
+# If you already know roughly where GPPS attachments live in this
+# bucket, set it here to skip straight to a fast, narrow search
+# (e.g. "gpps/" or "policy-attachments/"). Leave as "" to search the
+# whole bucket if the direct guesses below miss.
+KNOWN_PREFIX = ""
+MAX_OBJECTS_TO_SCAN = 200_000   # safety cap on the fallback search
+
+
+# ============================================================
+# Step 1 -- Pull this one policy and list its attachments
+# ============================================================
+
+print("=" * 70)
+print(f"STEP 1 -- Policy {POLICY_CORE_ID} ({COUNTRY_TABLE})")
+print("=" * 70)
+
+query = f"""
+    SELECT policy_core_id, version_num, json_data
+    FROM `{DATA_PROJECT}.{DATASET}.{COUNTRY_TABLE}`
+    WHERE policy_core_id = {POLICY_CORE_ID}
+    ORDER BY version_num DESC
+    LIMIT 1
+"""
+df = bq_client.query(query).to_dataframe()
+if len(df) == 0:
+    raise SystemExit(f"No row found for policy_core_id={POLICY_CORE_ID} in {COUNTRY_TABLE}.")
+
+parsed = json.loads(df["json_data"].iloc[0])
+version = df["version_num"].iloc[0]
+print(f"Loaded version {version}. policyTitle: {parsed.get('policyTitle')!r}")
+
+
+def get_nested(d, *keys):
+    cur = d
+    for k in keys:
+        if not isinstance(cur, dict):
+            return None
+        cur = cur.get(k)
+    return cur
+
+
+attachments = []
+for source in ("appendix", "guidance"):
+    items = get_nested(parsed, "policyApplication", source)
+    if isinstance(items, list):
+        for it in items:
+            if isinstance(it, dict):
+                attachments.append({
+                    "source": source,
+                    "actvFlg": it.get("actvFlg"),
+                    "docId": it.get("docId"),
+                    "oldDocId": it.get("oldDocId"),
+                    "docName": it.get("docName"),
+                    "gppsDocName": it.get("gppsDocName"),
+                    "docTitlText": it.get("docTitlText"),
+                    "docUrl": it.get("docUrl"),
+                })
+
+print(f"\nAttachments found: {len(attachments)}")
+for a in attachments:
+    print(f"  [{a['source']}] docId={a['docId']} actvFlg={a['actvFlg']!r}  {a['docName']}")
+
+active = [a for a in attachments if a["actvFlg"] == "Y"]
+if not active:
+    print("\nNo attachment is flagged active (actvFlg == 'Y'). Testing the first "
+          "attachment anyway, but flag this to the lead -- an inactive doc may be stale.")
+    active = attachments[:1]
+
+if not active:
+    raise SystemExit("This policy has no attachments to test.")
+
+
+# ============================================================
+# Step 2 -- Try direct path guesses in the bucket
+# ============================================================
+
+print("\n" + "=" * 70)
+print(f"STEP 2 -- Direct path guesses in gs://{BUCKET_NAME}")
+print("=" * 70)
+
+from google.cloud import storage
+from google.api_core import exceptions as gexc
+
+gcs_client = storage.Client(project=GCS_PROJECT)
+bucket = gcs_client.bucket(BUCKET_NAME)
+
+# sanity check: can we even reach the bucket?
+try:
+    bucket.reload()
+    print(f"Bucket reachable. Location: {bucket.location}, storage class: {bucket.storage_class}")
+except gexc.Forbidden:
+    raise SystemExit(f"FORBIDDEN -- this identity cannot read bucket metadata for "
+                     f"gs://{BUCKET_NAME} at all. Nothing further will work until "
+                     f"access is granted; stop here and report that.")
+except gexc.NotFound:
+    raise SystemExit(f"NOT_FOUND -- gs://{BUCKET_NAME} does not exist or this project "
+                     f"cannot see it. Confirm the bucket name.")
+except Exception as e:
+    print(f"Could not confirm bucket metadata ({type(e).__name__}: {str(e)[:120]}) "
+          f"-- continuing to try object-level access anyway.")
+
+
+def candidate_paths(att):
+    doc_id = str(att["docId"]) if att["docId"] is not None else None
+    name = att["docName"]
+    gpps_name = att["gppsDocName"]
+    cands = []
+    for n in (name, gpps_name):
+        if n:
+            cands.append(n)
+    if doc_id:
+        cands.append(doc_id)
+        cands.append(f"{doc_id}.pdf")
+        if name:
+            cands.append(f"{doc_id}/{name}")
+        if gpps_name:
+            cands.append(f"{doc_id}/{gpps_name}")
+    for prefix in ("gpps/", "attachments/", "policy-attachments/", "documents/"):
+        if name:
+            cands.append(f"{prefix}{name}")
+        if gpps_name:
+            cands.append(f"{prefix}{gpps_name}")
+    # de-dupe, keep order
+    seen, out = set(), []
+    for c in cands:
+        if c not in seen:
+            seen.add(c)
+            out.append(c)
+    return out
+
+
+def is_pdf(data):
+    return isinstance(data, (bytes, bytearray)) and data.lstrip()[:5] == b"%PDF-"
+
+
+found_blob = None
+found_att = None
+
+for att in active:
+    print(f"\nTrying attachment docId={att['docId']} ({att['docName']})")
+    for path in candidate_paths(att):
+        blob = bucket.blob(path)
+        try:
+            exists = blob.exists()
+        except gexc.Forbidden:
+            print(f"  FORBIDDEN on '{path}'")
+            continue
+        except Exception as e:
+            print(f"  error checking '{path}': {type(e).__name__}")
+            continue
+        mark = "FOUND" if exists else "no"
+        print(f"  {mark:5s}  {path}")
+        if exists:
+            found_blob, found_att = blob, att
+            break
+    if found_blob:
+        break
+
+
+# ============================================================
+# Step 3 -- Fallback: capped search through the bucket's object names
+# ============================================================
+
+if found_blob is None:
+    print("\n" + "=" * 70)
+    prefix_label = repr(KNOWN_PREFIX) if KNOWN_PREFIX else "none"
+    print("STEP 3 -- None of the direct guesses hit; searching the bucket "
+          f"(capped at {MAX_OBJECTS_TO_SCAN:,} objects, prefix={prefix_label})")
+    print("=" * 70)
+
+    search_terms = []
+    for att in active:
+        if att["docId"] is not None:
+            search_terms.append(str(att["docId"]))
+        if att["docName"]:
+            search_terms.append(att["docName"].lower())
+        if att["gppsDocName"]:
+            search_terms.append(att["gppsDocName"].lower())
+
+    scanned = 0
+    matches = []
+    try:
+        for blob in gcs_client.list_blobs(bucket, prefix=KNOWN_PREFIX or None):
+            scanned += 1
+            if scanned > MAX_OBJECTS_TO_SCAN:
+                print(f"  Stopped after {MAX_OBJECTS_TO_SCAN:,} objects (safety cap). "
+                      f"If the bucket is larger, set KNOWN_PREFIX to narrow the search.")
+                break
+            name_lower = blob.name.lower()
+            if any(term in name_lower for term in search_terms if term):
+                matches.append(blob)
+            if scanned % 20000 == 0:
+                print(f"  ... scanned {scanned:,} objects so far, {len(matches)} match(es)")
+    except gexc.Forbidden:
+        print("  FORBIDDEN -- this identity cannot list objects in this bucket. "
+              "Listing may be restricted even if individual blob reads would work; "
+              "ask the RCDP/platform team for the exact object path instead.")
+    except Exception as e:
+        print(f"  Listing failed: {type(e).__name__}: {str(e)[:150]}")
+
+    print(f"\nScanned {scanned:,} objects, {len(matches)} name match(es).")
+    for m in matches[:20]:
+        print(f"    {m.name}")
+    if len(matches) > 20:
+        print(f"    ... and {len(matches) - 20} more")
+
+    if matches:
+        found_blob = matches[0]
+        found_att = active[0]
+        print(f"\nUsing first match: {found_blob.name}")
+
+
+# ============================================================
+# Step 4 -- Download, verify, extract text
+# ============================================================
+
+print("\n" + "=" * 70)
+print("STEP 4 -- Result")
+print("=" * 70)
+
+accessible = False  # set True below only once a real PDF has been downloaded
+
+if found_blob is None:
+    print(f"""
+VERDICT: NOT ACCESSIBLE via gs://{BUCKET_NAME}
+
+Could not locate attachment docId={active[0]['docId']} ({active[0]['docName']})
+anywhere in this bucket, by direct path or by name search.
+
+Most likely explanations:
+  - This bucket is not where GPPS attachments are stored (it may be your
+    model workspace bucket, not RCDP's document store)
+  - The attachment lives under a path/prefix this search didn't try --
+    set KNOWN_PREFIX if you're later told the folder convention
+  - Access to list/read this content is routed through the metadata
+    table + docUrl mechanism Kari described, not a flat bucket lookup
+
+This is a concrete, reportable finding for the pilot update: the bucket
+you have access to does not appear to contain this policy's attachment.
+""")
+else:
+    try:
+        size_mb = found_blob.size / 1e6 if found_blob.size else None
+        print(f"Downloading: {found_blob.name} ({size_mb:.2f} MB)" if size_mb
+              else f"Downloading: {found_blob.name}")
+        data = found_blob.download_as_bytes()
+    except gexc.Forbidden:
+        print(f"""
+VERDICT: FOUND BUT FORBIDDEN
+
+Object '{found_blob.name}' exists in gs://{BUCKET_NAME}, but this identity
+does not have read permission on it. The bucket itself was reachable, so
+this is an object- or prefix-level permission, not a bucket-level one.
+
+Reportable finding: path resolved correctly, read access still needed.
+""")
+        data = None
+    except Exception as e:
+        print(f"Download failed: {type(e).__name__}: {str(e)[:150]}")
+        data = None
+
+    if data is not None:
+        if not is_pdf(data):
+            print(f"""
+VERDICT: FOUND AND READABLE, BUT NOT A PDF
+
+Downloaded {len(data) / 1024:.0f} KB from '{found_blob.name}', but it does
+not start with the PDF signature. Content-Type reported by GCS: 
+{found_blob.content_type!r}. Worth checking the file manually.
+""")
+        else:
+            pages, chars = None, None
+            lib_used = None
+            try:
+                from pypdf import PdfReader
+                reader = PdfReader(io.BytesIO(data))
+                texts = [(p.extract_text() or "") for p in reader.pages]
+                lib_used = "pypdf"
+            except Exception:
+                try:
+                    import fitz  # PyMuPDF
+                    with fitz.open(stream=data, filetype="pdf") as doc:
+                        texts = [p.get_text() for p in doc]
+                    lib_used = "fitz"
+                except Exception as e:
+                    texts = None
+                    print(f"  (PDF downloaded OK, but no PDF text library worked: {e})")
+
+            if texts is not None:
+                pages = len(texts)
+                chars = sum(len(t.strip()) for t in texts)
+                sample = " ".join(t.strip() for t in texts[:1])[:300].replace("\n", " ")
+                low_text_pages = sum(1 for t in texts if len(t.strip()) < 20)
+                image_only = pages > 0 and low_text_pages / pages > 0.5
+
+            accessible = True
+            print(f"""
+VERDICT: ACCESSIBLE
+
+Object:      {found_blob.name}
+Size:        {len(data) / 1024:.0f} KB
+PDF check:   passed (starts with %PDF-)
+""")
+            if texts is not None:
+                print(f"""Text extraction ({lib_used}):
+  Pages:            {pages}
+  Characters:       {chars:,}
+  Looks image-only: {image_only}  ({'would need OCR' if image_only else 'has a real text layer'})
+
+Sample text from page 1:
+  {sample!r}
+""")
+
+print("=" * 70)
+print("Pilot summary for the project lead:")
+print(f"  Policy tested:  Brazil / policy_core_id {POLICY_CORE_ID} "
+      f"(docId {active[0]['docId']})")
+print(f"  Bucket tested:  gs://{BUCKET_NAME}")
+print(f"  Outcome:        {'ACCESSIBLE' if accessible else 'NOT ACCESSIBLE -- see detail above'}")
+print("=" * 70)
