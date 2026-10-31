@@ -1,0 +1,338 @@
+# PART 2 of 3 -- Stage 3 (find the GCS metadata table) + access / extraction functions
+# Run after Part 1 in the same kernel.
+
+# ============================================================
+# STAGE 3 -- Find the metadata table holding the GCS path
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STAGE 3 -- Looking for the metadata table with GCS paths")
+print("=" * 80)
+
+meta_cols = []
+for ds in [DATASET] + list(EXTRA_DATASETS):
+    q = f"""
+        SELECT table_name, column_name, data_type
+        FROM `{DATA_PROJECT}.{ds}.INFORMATION_SCHEMA.COLUMNS`
+        WHERE REGEXP_CONTAINS(LOWER(column_name), r'(gcs|uri|path|storage|bucket|blob|pdf|attach)')
+          AND NOT REGEXP_CONTAINS(table_name, r'^[a-z]{{2}}_hsbc_gpps_gpps_policy$')
+        ORDER BY table_name, ordinal_position
+    """
+    try:
+        d = bq_client.query(q).to_dataframe()
+        d["dataset"] = ds
+        meta_cols.append(d)
+    except Exception as e:
+        print(f"  Could not read column metadata for dataset '{ds}': {str(e)[:80]}")
+
+meta_df = pd.concat(meta_cols, ignore_index=True) if meta_cols else pd.DataFrame()
+gcs_candidates = []
+
+if len(meta_df):
+    print(f"\nCandidate columns found in {meta_df.groupby(['dataset', 'table_name']).ngroups} table(s). "
+          f"Sampling values to see which actually hold gs:// paths...")
+    for (ds, tbl), grp in list(meta_df.groupby(["dataset", "table_name"]))[:25]:
+        cols = [c for c, t in zip(grp["column_name"], grp["data_type"]) if t == "STRING"][:6]
+        if not cols:
+            continue
+        try:
+            sel = ", ".join(f"`{c}`" for c in cols)
+            sample = bq_client.query(
+                f"SELECT {sel} FROM `{DATA_PROJECT}.{ds}.{tbl}` LIMIT 20"
+            ).to_dataframe()
+        except Exception as e:
+            print(f"    {ds}.{tbl}: could not sample ({str(e)[:60]})")
+            continue
+        for c in cols:
+            vals = sample[c].dropna().astype(str)
+            n_gs = int(vals.str.startswith("gs://").sum())
+            gcs_candidates.append({
+                "dataset": ds, "table": tbl, "column": c,
+                "gs_values_in_sample": n_gs,
+                "example": vals.iloc[0][:100] if len(vals) else None,
+            })
+    cand_df = pd.DataFrame(gcs_candidates)
+    likely = cand_df[cand_df["gs_values_in_sample"] > 0] if len(cand_df) else cand_df
+    if len(likely):
+        print("\n>>> Columns whose sampled values are gs:// paths (likely the metadata table):")
+        display(likely)
+        print("Set METADATA_TABLE / METADATA_URI_COLUMN / METADATA_KEY_COLUMN above, "
+              "pick the matching METADATA_KEY_FIELD, and re-run to join it on.")
+    else:
+        print("\nNo sampled column held a gs:// value. The metadata table may be in a "
+              "different dataset (add it to EXTRA_DATASETS), or the path may be stored "
+              "under a name this search didn't match -- worth asking the RCDP team for "
+              "the exact table and column.")
+        if len(cand_df):
+            display(cand_df.head(40))
+else:
+    print("\nNo candidate columns found in the searched dataset(s).")
+
+# 3b -- join, if configured
+if METADATA_TABLE and METADATA_URI_COLUMN and METADATA_KEY_COLUMN:
+    keys = sorted({str(v) for v in attach_active[METADATA_KEY_FIELD].dropna()})
+    print(f"\n[3b] Joining {len(keys):,} distinct {METADATA_KEY_FIELD} values against {METADATA_TABLE}")
+    sql = f"""
+        SELECT CAST(`{METADATA_KEY_COLUMN}` AS STRING) AS join_key,
+               `{METADATA_URI_COLUMN}` AS gcs_uri_meta
+        FROM `{METADATA_TABLE}`
+        WHERE CAST(`{METADATA_KEY_COLUMN}` AS STRING) IN UNNEST(@keys)
+    """
+    cfg = bigquery.QueryJobConfig(
+        query_parameters=[bigquery.ArrayQueryParameter("keys", "STRING", keys)])
+    try:
+        meta_join = bq_client.query(sql, job_config=cfg).to_dataframe()
+        meta_join = meta_join.drop_duplicates("join_key")
+        attach_active["_key"] = attach_active[METADATA_KEY_FIELD].astype(str)
+        attach_active = attach_active.merge(meta_join, left_on="_key", right_on="join_key", how="left")
+        attach_active["gcs_uri"] = attach_active["gcs_uri"].fillna(attach_active["gcs_uri_meta"])
+        found = int(attach_active["gcs_uri_meta"].notna().sum())
+        print(f"     Matched a GCS path for {found:,} of {len(attach_active):,} active attachments "
+              f"({found / len(attach_active) * 100:.1f}%)")
+    except Exception as e:
+        print(f"     Join failed: {str(e)[:150]}")
+else:
+    print("\n[3b] METADATA_* not configured -- skipping the join.")
+
+
+# ============================================================
+# Access + extraction functions
+# ============================================================
+
+def _is_pdf(data):
+    return isinstance(data, (bytes, bytearray)) and data.lstrip()[:5] == b"%PDF-"
+
+
+def _read_capped(resp):
+    chunks, total = [], 0
+    for chunk in resp.iter_content(chunk_size=1 << 16):
+        total += len(chunk)
+        if total > MAX_BYTES:
+            return None, "TOO_LARGE"
+        chunks.append(chunk)
+    return b"".join(chunks), None
+
+
+def get_adc_token():
+    try:
+        import google.auth
+        import google.auth.transport.requests
+        creds, _ = google.auth.default(scopes=["https://www.googleapis.com/auth/cloud-platform"])
+        creds.refresh(google.auth.transport.requests.Request())
+        return creds.token
+    except Exception:
+        return None
+
+
+def get_identity_token():
+    if not shutil.which("gcloud"):
+        return None
+    try:
+        out = subprocess.run(["gcloud", "auth", "print-identity-token"],
+                             capture_output=True, text=True, timeout=30)
+        tok = out.stdout.strip()
+        return tok if out.returncode == 0 and tok else None
+    except Exception:
+        return None
+
+
+_TOKENS = {}
+
+
+def _tokens():
+    if not _TOKENS:
+        _TOKENS["adc"] = get_adc_token()
+        _TOKENS["identity"] = get_identity_token()
+    return _TOKENS
+
+
+def test_gcs(uri):
+    res = {"route": "gcs", "target": uri, "status": None, "detail": "", "bytes": None}
+    m = re.match(r"gs://([^/]+)/(.+)", uri or "")
+    if not m:
+        res.update(status="BAD_URI", detail="not of the form gs://bucket/object")
+        return res
+    bucket_name, blob_name = m.groups()
+    try:
+        from google.cloud import storage
+        from google.api_core import exceptions as gexc
+    except Exception as e:
+        res.update(status="NO_GCS_LIBRARY", detail=str(e)[:100])
+        return res
+    try:
+        client = storage.Client(project=ANALYTICS_PROJECT)
+        blob = client.bucket(bucket_name).get_blob(blob_name)
+        if blob is None:
+            res.update(status="NOT_FOUND",
+                       detail=f"bucket reachable but no object at '{blob_name[:80]}'")
+            return res
+        if blob.size and blob.size > MAX_BYTES:
+            res.update(status="TOO_LARGE", detail=f"{blob.size / 1e6:.1f} MB")
+            return res
+        data = blob.download_as_bytes()
+        res["bytes"] = data
+        res["detail"] = f"{len(data) / 1024:.0f} KB, content-type {blob.content_type}"
+        res["status"] = "OK" if _is_pdf(data) else "NOT_A_PDF"
+    except gexc.Forbidden as e:
+        res.update(status="FORBIDDEN",
+                   detail="reachable but this identity lacks read permission on the bucket/object")
+    except gexc.NotFound:
+        res.update(status="NOT_FOUND", detail="bucket or object does not exist")
+    except Exception as e:
+        res.update(status="ERROR", detail=f"{type(e).__name__}: {str(e)[:120]}")
+    return res
+
+
+def _first_url_in_json(node):
+    if isinstance(node, str) and node.startswith("http"):
+        return node
+    if isinstance(node, dict):
+        for v in node.values():
+            u = _first_url_in_json(v)
+            if u:
+                return u
+    if isinstance(node, list):
+        for v in node:
+            u = _first_url_in_json(v)
+            if u:
+                return u
+    return None
+
+
+def _fetch_unauthenticated(url):
+    """Signed URLs must NOT receive our bearer token."""
+    import requests
+    r = requests.get(url, timeout=60, stream=True, allow_redirects=True)
+    if r.status_code != 200:
+        return None, f"signed-url HTTP {r.status_code}"
+    data, err = _read_capped(r)
+    return data, err
+
+
+def test_http(url):
+    res = {"route": "http", "target": url, "status": None, "detail": "", "bytes": None}
+    try:
+        import requests
+    except Exception as e:
+        res.update(status="NO_REQUESTS_LIBRARY", detail=str(e)[:100])
+        return res
+
+    host = urlparse(url).hostname or ""
+    variants = [("no_auth", {})]
+    if host.endswith(".hsbc"):
+        t = _tokens()
+        if t.get("adc"):
+            variants.append(("adc_access_token", {"Authorization": f"Bearer {t['adc']}"}))
+        if t.get("identity"):
+            variants.append(("identity_token", {"Authorization": f"Bearer {t['identity']}"}))
+
+    log, worst = [], None
+    for label, headers in variants:
+        try:
+            r = requests.get(url, headers=headers, timeout=30, allow_redirects=False, stream=True)
+        except requests.exceptions.SSLError:
+            log.append(f"{label}: SSL error (corporate CA? set REQUESTS_CA_BUNDLE)")
+            worst = worst or "SSL_ERROR"
+            continue
+        except Exception as e:
+            log.append(f"{label}: {type(e).__name__}")
+            worst = worst or "CONNECTION_ERROR"
+            continue
+
+        code = r.status_code
+        ctype = r.headers.get("Content-Type", "").lower()
+        data = None
+
+        if code == 200 and "pdf" in ctype:
+            data, err = _read_capped(r)
+            if err:
+                log.append(f"{label}: {err}")
+        elif code == 200 and "json" in ctype:
+            try:
+                signed = _first_url_in_json(r.json())
+            except Exception:
+                signed = None
+            if signed:
+                data, err = _fetch_unauthenticated(signed)
+                log.append(f"{label}: 200 JSON -> followed signed URL ({err or 'ok'})")
+            else:
+                log.append(f"{label}: 200 JSON with no URL in it")
+        elif code in (301, 302, 303, 307, 308):
+            loc = r.headers.get("Location", "")
+            if loc.startswith("https://") and ".hsbc" not in (urlparse(loc).hostname or ""):
+                data, err = _fetch_unauthenticated(loc)
+                log.append(f"{label}: redirect -> external signed URL ({err or 'ok'})")
+            else:
+                log.append(f"{label}: redirect to {loc[:70]} (likely SSO/login)")
+                worst = worst or "REDIRECT_TO_LOGIN"
+        elif code == 200 and "html" in ctype:
+            log.append(f"{label}: 200 but HTML (probably an SSO/login page)")
+            worst = worst or "HTML_LOGIN_PAGE"
+        else:
+            log.append(f"{label}: HTTP {code}")
+            if code in (401, 403):
+                worst = "AUTH_DENIED"
+            elif code == 404 and worst is None:
+                worst = "NOT_FOUND"
+            elif worst is None:
+                worst = f"HTTP_{code}"
+
+        if _is_pdf(data):
+            res.update(status="OK", bytes=data, detail=f"via {label}; {len(data) / 1024:.0f} KB")
+            return res
+
+    res.update(status=worst or "FAILED", detail=" | ".join(log))
+    return res
+
+
+def extract_pdf_text(data):
+    out = {"lib": None, "pages": None, "chars": None, "chars_per_page": None,
+           "low_text_pages": None, "image_only_suspected": None, "text_sample": "", "error": None}
+    texts, errors = None, []
+    for lib in ("fitz", "pypdf", "pdfplumber", "pdfminer"):
+        if not _have(lib):
+            continue
+        try:
+            if lib == "fitz":
+                import fitz
+                with fitz.open(stream=data, filetype="pdf") as doc:
+                    texts = [p.get_text() for p in doc]
+            elif lib == "pypdf":
+                from pypdf import PdfReader
+                texts = [(p.extract_text() or "") for p in PdfReader(io.BytesIO(data)).pages]
+            elif lib == "pdfplumber":
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(data)) as pdf:
+                    texts = [(p.extract_text() or "") for p in pdf.pages]
+            else:
+                from pdfminer.high_level import extract_text
+                texts = extract_text(io.BytesIO(data)).split("\f")
+                if texts and not texts[-1].strip():
+                    texts = texts[:-1]
+            out["lib"] = lib
+            break
+        except Exception as e:
+            errors.append(f"{lib}: {type(e).__name__}")
+            texts = None
+    if texts is None:
+        out["error"] = "; ".join(errors) or "no PDF text library installed"
+        return out
+
+    lens = [len(t.strip()) for t in texts]
+    pages = len(lens)
+    out.update(
+        pages=pages, chars=sum(lens),
+        chars_per_page=round(sum(lens) / pages, 1) if pages else 0,
+        low_text_pages=sum(1 for L in lens if L < MIN_PAGE_CHARS),
+        image_only_suspected=(pages > 0 and sum(1 for L in lens if L < MIN_PAGE_CHARS) / pages > 0.5),
+        text_sample=" ".join(t.strip() for t in texts[:1])[:200].replace("\n", " "),
+    )
+    return out
+
+
+def maybe_save(data, name):
+    if SAVE_DIR and data:
+        os.makedirs(SAVE_DIR, exist_ok=True)
+        safe = re.sub(r"[^\w.\-]", "_", name or "attachment.pdf")
+        with open(os.path.join(SAVE_DIR, safe), "wb") as fh:
+            fh.write(data)
