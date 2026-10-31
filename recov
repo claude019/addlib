@@ -1,0 +1,57 @@
+# ============================================================
+# Recovery: BigQuery broke after 'gcloud auth application-default
+# login' overwrote the working ADC file with a personal login that
+# lacks serviceusage.services.use on hsbc-12211200-cmlpwb-prod.
+#
+# Testing whether the attached service account (confirmed to exist
+# in this environment, even though it lacked GCS bucket access) can
+# run BigQuery jobs -- a different resource, different grants.
+# ============================================================
+
+import google.auth
+import google.auth.compute_engine
+from google.cloud import bigquery
+from google.api_core import exceptions as gexc
+
+ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+LOCATION = "EU"  # match whatever you've been using
+
+print("=" * 70)
+print("Testing BigQuery as the attached service account")
+print("=" * 70)
+try:
+    sa_credentials = google.auth.compute_engine.Credentials()
+    bq_client = bigquery.Client(
+        project=ANALYTICS_PROJECT, credentials=sa_credentials, location=LOCATION
+    )
+    result = bq_client.query("SELECT 1 AS test").to_dataframe()
+    print("SUCCESS -- BigQuery works again via the attached service account.")
+    print(result)
+    print(f"""
+Use this for bq_client going forward (until the ADC file is sorted out):
+
+    import google.auth.compute_engine
+    from google.cloud import bigquery
+
+    bq_client = bigquery.Client(
+        project="{ANALYTICS_PROJECT}",
+        credentials=google.auth.compute_engine.Credentials(),
+        location="{LOCATION}",
+    )
+
+This restores your GPPS table access immediately -- no IAM request needed
+for this part. The earlier GCS bucket issue is unrelated and unaffected.
+""")
+except gexc.Forbidden as e:
+    print(f"Still Forbidden:\n{e}")
+    print("""
+If this also fails, the attached service account doesn't have BigQuery
+access either, and the fastest recovery is asking platform support
+(whoever provisions this JupyterLab environment) to regenerate or
+restore the application_default_credentials.json file -- it may have
+been set up with specific delegated permissions that a plain personal
+login doesn't reproduce. Mention the file was overwritten by running
+'gcloud auth application-default login' as your personal account.
+""")
+except Exception as e:
+    print(f"{type(e).__name__}: {str(e)[:300]}")
