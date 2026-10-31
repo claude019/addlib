@@ -1,0 +1,150 @@
+# PART 3 of 3 -- Stage 4 (manual tests), Stage 5 (pilot), Stage 6 (summary + export)
+# Run after Parts 1 and 2 in the same kernel.
+
+# ============================================================
+# STAGE 4 -- Manual tests (paste what you've been given)
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STAGE 4 -- Manual tests")
+print("=" * 80)
+
+manual_rows = []
+for uri in MANUAL_GCS_URIS:
+    r = test_gcs(uri)
+    ext = extract_pdf_text(r["bytes"]) if r["status"] == "OK" else {}
+    manual_rows.append({"route": "gcs", "target": uri, "status": r["status"], "detail": r["detail"],
+                        "pages": ext.get("pages"), "pdf_chars": ext.get("chars"),
+                        "image_only_suspected": ext.get("image_only_suspected"),
+                        "text_sample": ext.get("text_sample")})
+for url in MANUAL_HTTP_URLS:
+    r = test_http(url)
+    ext = extract_pdf_text(r["bytes"]) if r["status"] == "OK" else {}
+    manual_rows.append({"route": "http", "target": url, "status": r["status"], "detail": r["detail"],
+                        "pages": ext.get("pages"), "pdf_chars": ext.get("chars"),
+                        "image_only_suspected": ext.get("image_only_suspected"),
+                        "text_sample": ext.get("text_sample")})
+
+if manual_rows:
+    manual_df = pd.DataFrame(manual_rows)
+    display(manual_df)
+else:
+    manual_df = pd.DataFrame()
+    print("Nothing pasted into MANUAL_GCS_URIS / MANUAL_HTTP_URLS -- skipping. Add the "
+          "gs:// path or URL you've been given and re-run.")
+
+
+# ============================================================
+# STAGE 5 -- Pilot: sample attachments through the full chain
+# ============================================================
+
+print("\n" + "=" * 80)
+print(f"STAGE 5 -- Pilot on up to {SAMPLE_SIZE} active attachments")
+print("=" * 80)
+
+attach_active = attach_active.merge(
+    policy_df[["country", "policy_core_id", "is_thin"]],
+    on=["country", "policy_core_id"], how="left")
+
+cand = attach_active[attach_active["docUrl"].notna() | attach_active["gcs_uri"].notna()].copy()
+cand = cand.sort_values(["is_thin", "country"], ascending=[False, True])
+first_per_country = cand.groupby("country").head(1)
+sample = pd.concat([first_per_country, cand.drop(first_per_country.index)]).head(SAMPLE_SIZE)
+
+print(f"{len(cand):,} active attachments have at least one route; testing {len(sample)} "
+      f"(thin-text policies first, one per country before repeats).\n")
+
+pilot_rows = []
+for _, a in sample.iterrows():
+    attempts, data, winner = [], None, None
+
+    if isinstance(a["gcs_uri"], str) and a["gcs_uri"]:
+        r = test_gcs(a["gcs_uri"])
+        attempts.append(r)
+        if r["status"] == "OK":
+            data, winner = r["bytes"], "gcs"
+
+    if data is None and isinstance(a["docUrl"], str) and a["docUrl"]:
+        r = test_http(a["docUrl"])
+        attempts.append(r)
+        if r["status"] == "OK":
+            data, winner = r["bytes"], "http"
+
+    ext = extract_pdf_text(data) if data else {}
+    if data:
+        maybe_save(data, a["gppsDocName"] or a["docName"])
+
+    final_status = "OK" if data else (attempts[-1]["status"] if attempts else "NO_ROUTE")
+    pilot_rows.append({
+        "country": a["country"], "policy_core_id": a["policy_core_id"],
+        "docId": a["docId"], "docName": a["docName"],
+        "policy_is_thin": a["is_thin"], "policy_table_chars": a["policy_text_chars"],
+        "route_used": winner,
+        "access_status": final_status,
+        "detail": " || ".join(f"{x['route']}:{x['status']} ({x['detail']})" for x in attempts),
+        "pdf_pages": ext.get("pages"), "pdf_chars": ext.get("chars"),
+        "chars_per_page": ext.get("chars_per_page"),
+        "image_only_suspected": ext.get("image_only_suspected"),
+        "extract_lib": ext.get("lib"), "extract_error": ext.get("error"),
+        "text_sample": ext.get("text_sample"),
+    })
+    print(f"  {a['country']:26s} policy {str(a['policy_core_id']):>6s}  doc {str(a['docId']):>7s}  -> {final_status}")
+
+pilot_df = pd.DataFrame(pilot_rows)
+print()
+display(pilot_df.drop(columns=["text_sample"]))
+
+
+# ============================================================
+# STAGE 6 -- Summary + export
+# ============================================================
+
+print("\n" + "=" * 80)
+print("STAGE 6 -- Summary")
+print("=" * 80)
+
+n = len(pilot_df)
+ok = int((pilot_df["access_status"] == "OK").sum())
+print(f"\nAccessible PDFs: {ok} of {n} tested")
+print("\nOutcome by status:")
+display(pilot_df["access_status"].value_counts().rename_axis("status").reset_index(name="attachments"))
+
+if ok:
+    readable = pilot_df[pilot_df["access_status"] == "OK"]
+    has_text = int((readable["image_only_suspected"] == False).sum())
+    img_only = int((readable["image_only_suspected"] == True).sum())
+    print(f"\nOf the {ok} accessible PDFs: {has_text} have an extractable text layer, "
+          f"{img_only} look image-only (would need OCR).")
+    comp = readable[["country", "policy_core_id", "policy_table_chars", "pdf_chars"]]
+    print("\nWhat the PDF adds versus what the table already holds (chars):")
+    display(comp)
+
+print("""
+Reading the result:
+  OK                      -> the route works end to end; scale it up.
+  FORBIDDEN (gcs)         -> the path is right but this identity has no read access;
+                             ask the RCDP team to grant it on that bucket.
+  NOT_FOUND (gcs)         -> the metadata path doesn't match what is in the bucket;
+                             ask for the exact bucket/prefix and naming rule.
+  AUTH_DENIED / LOGIN     -> the docUrl endpoint wants an SSO session or service
+  (http)                     identity the notebook doesn't have; use the GCS route.
+  NOT_A_PDF               -> the link returned something else (error page, JSON).
+  image-only PDFs         -> readable but no text layer; needs OCR (see tooling table).
+  NO_ROUTE                -> attachment has neither a docUrl nor a gs:// path.
+""")
+
+out_path = "GPPS_PDF_Attachment_Access_Test.xlsx"
+with pd.ExcelWriter(out_path, engine="openpyxl") as writer:
+    tool_df.to_excel(writer, sheet_name="Tooling", index=False)
+    country_sum.to_excel(writer, sheet_name="Attachments by Country", index=False)
+    attach_df.to_excel(writer, sheet_name="All Attachments", index=False)
+    if len(meta_df):
+        meta_df.to_excel(writer, sheet_name="Metadata Candidates", index=False)
+    if gcs_candidates:
+        pd.DataFrame(gcs_candidates).to_excel(writer, sheet_name="GCS Column Sampling", index=False)
+    if len(manual_df):
+        manual_df.to_excel(writer, sheet_name="Manual Tests", index=False)
+    pilot_df.to_excel(writer, sheet_name="Pilot Results", index=False)
+
+print(f"Written to: {out_path}")
+print("Frames in memory: policy_df, attach_df, attach_active, pilot_df")
