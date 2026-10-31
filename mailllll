@@ -1,0 +1,10 @@
+
+
+Wanted to give you a quick update on the GPPS PDF attachment pilot.
+
+I tried pulling the PDF attachment for one sample policy from the bucket (gs://cmlp_exp_003_1_prod), just to validate the approach before we plan further around it. The bucket itself exists and I can see its contents, but I'm not able to actually read from it -- I get a permission-denied response, and I've checked this more than one way, so it isn't a one-off glitch on my end.
+
+I've attached a screenshot of the error for reference.
+
+Could you help me figure out the next step here -- whether this is the right bucket for these attachments, and if so, who can grant read access?
+
