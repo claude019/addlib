@@ -1,3 +1,7 @@
+AND alert_cat_cde = 'ALERT'
+        AND (location IS NULL OR UPPER(TRIM(location)) NOT IN ('MEXICO', 'EGYPT'))
+        {limit_clause}
+
 # ============================================================
 # GPPS Procedure tables -- attachment / text-quality analysis
 # + interactive JSON viewer
