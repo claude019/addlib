@@ -1,0 +1,405 @@
+# ============================================================
+# GPPS Procedure tables -- attachment / text-quality analysis
+# + interactive JSON viewer
+#
+# Consolidates: schema discovery, full-record field validation
+# (not just a 5-row sample), the "Attachments analysis" output
+# in the same column layout as the policy sheet, and a cascading
+# country -> procedure_core_id JSON viewer.
+#
+# Confirmed in the prior run on this table:
+#   - version_num loads as Int64 (numeric) -- no string-sort risk
+#   - zero (id, version) duplicate pairs -- dedup via
+#     groupby(id).tail(1) gives exactly one row per procedure_core_id
+#   - main text field  = 'procedureText'
+#   - attachment field = 'procedureApplication'
+#   - title field      = 'procedureTitle'
+# This script re-derives those structurally rather than hard-coding
+# them, so it still self-detects correctly if a sibling country
+# procedure table turns up with a different shape.
+# ============================================================
+
+import os
+import re
+import json
+from collections import Counter
+import pandas as pd
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.max_colwidth", 120)
+
+SUFFICIENT_TEXT_LEN = 1000  # matches "sufficient text in RCDP" in your sheet
+THIN_500 = 500
+THIN_1000 = 1000
+
+COUNTRY_CODE_NAMES = {
+    "aa": "Global", "ae": "United Arab Emirates", "ar": "Argentina",
+    "au": "Australia", "bd": "Bangladesh", "be": "Belgium", "bh": "Bahrain",
+    "bm": "Bermuda", "br": "Brazil", "ca": "Canada", "cl": "Chile",
+    "cn": "China", "cz": "Czech Republic", "de": "Germany", "dz": "Algeria",
+    "es": "Spain", "fr": "France", "gb": "United Kingdom", "gg": "Guernsey",
+    "hk": "Hong Kong", "id": "Indonesia", "ie": "Ireland", "il": "Israel",
+    "im": "Isle of Man", "in": "India", "it": "Italy", "je": "Jersey",
+    "jp": "Japan", "kr": "Korea, Republic of (South)", "kw": "Kuwait",
+    "ky": "Cayman Islands", "lk": "Sri Lanka", "lu": "Luxembourg",
+    "mo": "Macau", "mt": "Malta", "mu": "Mauritius", "mv": "Maldives",
+    "my": "Malaysia", "nl": "Netherlands", "nz": "New Zealand", "om": "Oman",
+    "ph": "Philippines", "pl": "Poland", "qa": "Qatar", "sa": "Saudi Arabia",
+    "se": "Sweden", "sg": "Singapore", "th": "Thailand", "tr": "Turkey",
+    "tw": "Taiwan", "us": "United States of America", "uy": "Uruguay",
+    "vn": "Vietnam", "za": "South Africa",
+}
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def detect_physical_columns(df):
+    cols = list(df.columns)
+    id_col = next((c for c in cols if re.search(r"(?i)core.?id$", c)), None) \
+        or next((c for c in cols if re.search(r"(?i)_id$", c)), None)
+    version_col = next((c for c in cols if "version" in c.lower()), None)
+    json_col = next((c for c in cols if "json" in c.lower()), None)
+    return id_col, version_col, json_col
+
+
+def detect_json_fields(parsed):
+    """Find the main text field, the attachment-bearing container, and the
+    title field by STRUCTURE (contains sgmntText? contains appendix/guidance?)
+    rather than by assumed name."""
+    text_candidates = []
+    application_key = None
+    for k, v in parsed.items():
+        if isinstance(v, dict) and "sgmntText" in v:
+            text_candidates.append(k)
+        if isinstance(v, dict) and ("appendix" in v or "guidance" in v):
+            application_key = k
+
+    main_text_key = next((k for k in text_candidates if "purpose" not in k.lower()), None)
+    if main_text_key is None and text_candidates:
+        main_text_key = text_candidates[0]
+
+    title_key = next(
+        (k for k, v in parsed.items() if isinstance(v, str) and "titl" in k.lower()),
+        None,
+    )
+
+    return {
+        "main_text_key": main_text_key,
+        "text_candidates": text_candidates,
+        "application_key": application_key,
+        "title_key": title_key,
+    }
+
+
+def has_active_attachment(parsed, application_key):
+    if not application_key:
+        return False
+    app = parsed.get(application_key) or {}
+    for src in ("appendix", "guidance"):
+        items = app.get(src)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("actvFlg") == "Y":
+                    return True
+    return False
+
+
+# ============================================================
+# SECTION 1 -- Discover procedure tables and their schema
+# ============================================================
+
+print("=" * 80)
+print("SECTION 1 -- Discovering procedure tables")
+print("=" * 80)
+
+discovery_query = f"""
+    SELECT table_name
+    FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+    WHERE REGEXP_CONTAINS(table_name, r'^[a-z]{{2}}_hsbc_gpps_gpps_procedure$')
+    ORDER BY table_name
+"""
+try:
+    procedure_tables = bq_client.query(discovery_query).to_dataframe()["table_name"].tolist()
+except Exception as e:
+    print(f"INFORMATION_SCHEMA not readable ({str(e)[:80]}); falling back to the single "
+          f"table you named.")
+    procedure_tables = ["aa_hsbc_gpps_gpps_procedure"]
+
+if not procedure_tables:
+    procedure_tables = ["aa_hsbc_gpps_gpps_procedure"]
+
+print(f"\nFound {len(procedure_tables)} procedure table(s):")
+for t in procedure_tables:
+    code = t.split("_")[0]
+    print(f"  {t}  ({COUNTRY_CODE_NAMES.get(code, code)})")
+
+
+# ============================================================
+# SECTION 2 -- Load each table ONCE: detect schema, validate
+# field coverage across ALL records, dedup to latest version,
+# compute attachment/text metrics, and stash JSON for the viewer
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 2 -- Loading, validating, and scoring each table")
+print("=" * 80)
+
+result_rows = []
+viewer_lookup = {}  # viewer_lookup[country][procedure_core_id] = parsed json
+
+for table in procedure_tables:
+    code = table.split("_")[0]
+    country = COUNTRY_CODE_NAMES.get(code, code)
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+
+    print(f"\n{'-' * 80}\n{country}  ({table})\n{'-' * 80}")
+
+    try:
+        df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+    except Exception as e:
+        print(f"  FAILED to load -- {str(e)[:120]}")
+        continue
+
+    if len(df) == 0:
+        print("  EMPTY table")
+        result_rows.append({
+            "Country": country, "Total procedures": 0, "Procedures with attachment": 0,
+            "Procedures with sufficient text in RCDP (>1000 chars)": 0,
+            "have Attachment and text <500": 0, "have Attachment and text <1000": 0,
+            "% All Procedures: Attachment and Text <500": 0,
+            "% All Procedures: Attachment and Text <1000": 0,
+        })
+        continue
+
+    id_col, version_col, json_col = detect_physical_columns(df)
+    print(f"  Physical columns detected -- id: {id_col!r}, version: {version_col!r}, "
+          f"json: {json_col!r}")
+    if not all([id_col, version_col, json_col]):
+        print("  >>> Could not confidently detect physical columns -- skipping this table.")
+        continue
+
+    print(f"  Total ROWS (all versions): {len(df):,}")
+    print(f"  Distinct {id_col} values:   {df[id_col].nunique():,}")
+    print(f"  {version_col} dtype:        {df[version_col].dtype}")
+    dupes = df.groupby([id_col, version_col]).size()
+    n_dupes = (dupes > 1).sum()
+    print(f"  (id, version) pairs appearing more than once: {n_dupes}")
+    if n_dupes:
+        print("  >>> WARNING: dedup via tail(1) is not guaranteed unique here -- "
+              "investigate before trusting the totals below.")
+
+    # dedup to latest version per procedure_core_id
+    latest = df.sort_values(version_col).groupby(id_col, as_index=False).tail(1).copy()
+    latest["parsed"] = latest[json_col].apply(safe_json_loads)
+    total = latest[id_col].nunique()
+
+    # ---- detect JSON field names from the first parseable record ----
+    sample_parsed = next((p for p in latest["parsed"] if isinstance(p, dict)), None)
+    if sample_parsed is None:
+        print("  >>> No parseable JSON records -- skipping this table.")
+        continue
+    fields = detect_json_fields(sample_parsed)
+    main_text_key = fields["main_text_key"]
+    application_key = fields["application_key"]
+    print(f"  Detected -- main text field: {main_text_key!r}, "
+          f"attachment field: {application_key!r}, title field: {fields['title_key']!r}")
+
+    # ---- validate field coverage across ALL records, not just the sample ----
+    parse_ok = latest["parsed"].apply(lambda p: isinstance(p, dict)).sum()
+    key_counter = Counter()
+    has_main_text_key = 0
+    has_application_key = 0
+    for p in latest["parsed"]:
+        if not isinstance(p, dict):
+            continue
+        key_counter.update(p.keys())
+        if main_text_key and main_text_key in p:
+            has_main_text_key += 1
+        if application_key and application_key in p:
+            has_application_key += 1
+
+    print(f"  JSON parse success: {parse_ok}/{total} ({parse_ok / total * 100:.1f}%)")
+    if main_text_key:
+        print(f"  Records with {main_text_key!r} key present: "
+              f"{has_main_text_key}/{parse_ok} ({has_main_text_key / parse_ok * 100:.1f}%)")
+    if application_key:
+        print(f"  Records with {application_key!r} key present: "
+              f"{has_application_key}/{parse_ok} ({has_application_key / parse_ok * 100:.1f}%)")
+    if (main_text_key and has_main_text_key / parse_ok < 0.95) or \
+       (application_key and has_application_key / parse_ok < 0.95):
+        print("  >>> One of the detected fields is missing on a non-trivial share of "
+              "records -- check the top-level key list below for an alternate shape.")
+        print(f"      Most common top-level keys: {key_counter.most_common(10)}")
+
+    # ---- score each record + build the viewer lookup ----
+    with_attachment = 0
+    sufficient_text = 0
+    attach_and_lt500 = 0
+    attach_and_lt1000 = 0
+    viewer_lookup[country] = {}
+
+    for _, row in latest.iterrows():
+        parsed = row["parsed"]
+        pid = row[id_col]
+        if not isinstance(parsed, dict):
+            viewer_lookup[country][pid] = {"_parse_error": True, "_raw": str(row[json_col])[:2000]}
+            continue
+
+        viewer_lookup[country][pid] = parsed
+
+        main_text = ""
+        if main_text_key:
+            main_text = strip_html((parsed.get(main_text_key) or {}).get("sgmntText"))
+        text_len = len(main_text)
+        if text_len > SUFFICIENT_TEXT_LEN:
+            sufficient_text += 1
+
+        if has_active_attachment(parsed, application_key):
+            with_attachment += 1
+            if text_len < THIN_500:
+                attach_and_lt500 += 1
+            if text_len < THIN_1000:
+                attach_and_lt1000 += 1
+
+    result_rows.append({
+        "Country": country,
+        "Total procedures": total,
+        "Procedures with attachment": with_attachment,
+        "Procedures with sufficient text in RCDP (>1000 chars)": sufficient_text,
+        "have Attachment and text <500": attach_and_lt500,
+        "have Attachment and text <1000": attach_and_lt1000,
+        "% All Procedures: Attachment and Text <500": round(
+            attach_and_lt500 / total * 100, 2) if total else 0,
+        "% All Procedures: Attachment and Text <1000": round(
+            attach_and_lt1000 / total * 100, 2) if total else 0,
+    })
+    print(f"  --> {total} procedures scored")
+
+
+result_df = pd.DataFrame(result_rows)
+
+print("\n\n" + "=" * 80)
+print("Result -- same column layout as your 'Attachments analysis' sheet")
+print("=" * 80)
+display(result_df)
+
+output_path = "Procedure_data_quality.xlsx"
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    result_df.to_excel(writer, sheet_name="Attachments analysis", index=False)
+
+print(f"\nWritten to: {output_path}")
+print("Columns are labelled 'Procedures' rather than 'Policies' -- rename the header "
+      "row to match if you want to paste this directly into the existing sheet.")
+print(f"\nviewer_lookup built: {sum(len(v) for v in viewer_lookup.values()):,} procedures "
+      f"across {len(viewer_lookup)} table(s), ready for Section 3 below.")
+
+
+# ============================================================
+# SECTION 3 -- Interactive JSON viewer
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 3 -- Interactive JSON viewer")
+print("=" * 80)
+
+import ipywidgets as widgets
+from IPython.display import display as ipy_display, JSON, clear_output
+
+_countries_sorted = sorted(viewer_lookup.keys())
+
+country_dd = widgets.Dropdown(options=_countries_sorted, description="Country:",
+                               style={"description_width": "initial"},
+                               layout=widgets.Layout(width="400px"))
+procedure_dd = widgets.Dropdown(options=[], description="Procedure ID:",
+                                 style={"description_width": "initial"},
+                                 layout=widgets.Layout(width="400px"))
+info_label = widgets.Label()
+viewer_output = widgets.Output()
+
+
+def _procedure_options_for(country):
+    return sorted(viewer_lookup.get(country, {}).keys())
+
+
+def _on_country_change(change):
+    pids = _procedure_options_for(country_dd.value)
+    procedure_dd.options = pids
+    if pids:
+        procedure_dd.value = pids[0]
+    else:
+        with viewer_output:
+            clear_output()
+            print("No procedures loaded for this table.")
+
+
+def _on_procedure_change(change):
+    with viewer_output:
+        clear_output()
+        country = country_dd.value
+        pid = procedure_dd.value
+        if country is None or pid is None:
+            return
+        data = viewer_lookup[country][pid]
+        n_here = len(viewer_lookup[country])
+        info_label.value = f"{country} -- procedure_core_id {pid} (of {n_here} in this table)"
+        ipy_display(JSON(data, expanded=False))
+
+
+country_dd.observe(_on_country_change, names="value")
+procedure_dd.observe(_on_procedure_change, names="value")
+
+if _countries_sorted:
+    country_dd.value = _countries_sorted[0]  # triggers the cascade
+
+ipy_display(widgets.VBox([
+    widgets.HBox([country_dd, procedure_dd]),
+    info_label,
+    viewer_output,
+]))
+
+print(
+    "\nUse the dropdowns above: selecting a table repopulates the procedure_core_id\n"
+    "list, and selecting a procedure renders its full parsed JSON as a collapsible\n"
+    "tree (click to expand/collapse nodes)."
+)
