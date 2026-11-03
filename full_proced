@@ -1,31 +1,25 @@
-AND alert_cat_cde = 'ALERT'
-        AND (location IS NULL OR UPPER(TRIM(location)) NOT IN ('MEXICO', 'EGYPT'))
-        {limit_clause}
-
 # ============================================================
 # GPPS Procedure tables -- attachment / text-quality analysis
-# + interactive JSON viewer
+# + interactive JSON viewer  (FIXED VERSION)
 #
-# Consolidates: schema discovery, full-record field validation
-# (not just a 5-row sample), the "Attachments analysis" output
-# in the same column layout as the policy sheet, and a cascading
-# country -> procedure_core_id JSON viewer.
-#
-# Confirmed in the prior run on this table:
-#   - version_num loads as Int64 (numeric) -- no string-sort risk
-#   - zero (id, version) duplicate pairs -- dedup via
-#     groupby(id).tail(1) gives exactly one row per procedure_core_id
-#   - main text field  = 'procedureText'
-#   - attachment field = 'procedureApplication'
-#   - title field      = 'procedureTitle'
-# This script re-derives those structurally rather than hard-coding
-# them, so it still self-detects correctly if a sibling country
-# procedure table turns up with a different shape.
+# What changed from GPPS_Procedure_Analysis_Final.py:
+#   The previous version measured "text length" using ONLY
+#   procedureText.sgmntText. But procedures carry their real body
+#   content the same way policies do -- in TWO places:
+#     1. procedureText.sgmntText                      (short, top-level)
+#     2. procedureApplication.segment[].procSgmntText (the actual body,
+#        split across segments -- note the key is 'procSgmntText',
+#        NOT 'sgmntText' like it is for policy segments)
+#   Measuring only #1 was undercounting almost all of a procedure's
+#   real content, which is the likely cause of the low "sufficient
+#   text" numbers. This version combines both sources, the same way
+#   the policy EDA combines policyText + policyApplication.segment[].
 # ============================================================
 
 import os
 import re
 import json
+import statistics
 from collections import Counter
 import pandas as pd
 from bs4 import BeautifulSoup
@@ -108,15 +102,15 @@ def detect_physical_columns(df):
 
 
 def detect_json_fields(parsed):
-    """Find the main text field, the attachment-bearing container, and the
-    title field by STRUCTURE (contains sgmntText? contains appendix/guidance?)
+    """Find the main text field and the attachment/segment container by
+    STRUCTURE (contains sgmntText-like key? contains appendix/guidance?)
     rather than by assumed name."""
     text_candidates = []
     application_key = None
     for k, v in parsed.items():
-        if isinstance(v, dict) and "sgmntText" in v:
+        if isinstance(v, dict) and any(re.search(r"(?i)sgmnttext", kk) for kk in v):
             text_candidates.append(k)
-        if isinstance(v, dict) and ("appendix" in v or "guidance" in v):
+        if isinstance(v, dict) and ("appendix" in v or "guidance" in v or "segment" in v):
             application_key = k
 
     main_text_key = next((k for k in text_candidates if "purpose" not in k.lower()), None)
@@ -134,6 +128,58 @@ def detect_json_fields(parsed):
         "application_key": application_key,
         "title_key": title_key,
     }
+
+
+def detect_segment_text_key(parsed, application_key):
+    """Inside application_key's segment[] list, find whichever field
+    holds the body text -- 'sgmntText' for policies, 'procSgmntText'
+    for procedures. Detected by pattern, not hard-coded."""
+    if not application_key:
+        return None
+    segments = (parsed.get(application_key) or {}).get("segment")
+    if not isinstance(segments, list) or not segments:
+        return None
+    first = next((s for s in segments if isinstance(s, dict)), None)
+    if not first:
+        return None
+    return next((k for k in first if re.search(r"(?i)sgmnttext", k)), None)
+
+
+def detect_segment_disp_key(parsed, application_key):
+    """Find a display/active flag on segments, if one exists (e.g.
+    procSgmntDispInd) -- purely informational, not applied as a filter
+    unless you choose to."""
+    if not application_key:
+        return None
+    segments = (parsed.get(application_key) or {}).get("segment")
+    if not isinstance(segments, list) or not segments:
+        return None
+    first = next((s for s in segments if isinstance(s, dict)), None)
+    if not first:
+        return None
+    return next((k for k in first if re.search(r"(?i)disp.*ind|actv.*ind", k)), None)
+
+
+def get_combined_text(parsed, main_text_key, application_key, segment_text_key):
+    """The real procedure text: procedureText.sgmntText PLUS every
+    segment's body text, concatenated -- mirrors how policy text is
+    built from policyText + policyApplication.segment[]."""
+    main_text = ""
+    if main_text_key:
+        main_text = strip_html((parsed.get(main_text_key) or {}).get("sgmntText"))
+
+    segment_texts = []
+    if application_key and segment_text_key:
+        segments = (parsed.get(application_key) or {}).get("segment")
+        if isinstance(segments, list):
+            for seg in segments:
+                if isinstance(seg, dict):
+                    t = strip_html(seg.get(segment_text_key))
+                    if t:
+                        segment_texts.append(t)
+
+    combined = "\n".join([t for t in [main_text] + segment_texts if t])
+    return combined, len(main_text), len(combined), len(segment_texts)
 
 
 def has_active_attachment(parsed, application_key):
@@ -180,9 +226,10 @@ for t in procedure_tables:
 
 
 # ============================================================
-# SECTION 2 -- Load each table ONCE: detect schema, validate
-# field coverage across ALL records, dedup to latest version,
-# compute attachment/text metrics, and stash JSON for the viewer
+# SECTION 2 -- Load each table, detect schema (incl. the segment
+# text key), validate coverage across ALL records, dedup to latest
+# version, compute attachment/text metrics on the COMBINED text,
+# and stash JSON for the viewer
 # ============================================================
 
 print("\n\n" + "=" * 80)
@@ -225,58 +272,85 @@ for table in procedure_tables:
 
     print(f"  Total ROWS (all versions): {len(df):,}")
     print(f"  Distinct {id_col} values:   {df[id_col].nunique():,}")
-    print(f"  {version_col} dtype:        {df[version_col].dtype}")
     dupes = df.groupby([id_col, version_col]).size()
     n_dupes = (dupes > 1).sum()
-    print(f"  (id, version) pairs appearing more than once: {n_dupes}")
     if n_dupes:
-        print("  >>> WARNING: dedup via tail(1) is not guaranteed unique here -- "
-              "investigate before trusting the totals below.")
+        print(f"  >>> WARNING: {n_dupes} (id, version) pairs appear more than once -- "
+              f"dedup via tail(1) is not guaranteed unique here.")
 
-    # dedup to latest version per procedure_core_id
     latest = df.sort_values(version_col).groupby(id_col, as_index=False).tail(1).copy()
     latest["parsed"] = latest[json_col].apply(safe_json_loads)
     total = latest[id_col].nunique()
 
-    # ---- detect JSON field names from the first parseable record ----
     sample_parsed = next((p for p in latest["parsed"] if isinstance(p, dict)), None)
     if sample_parsed is None:
         print("  >>> No parseable JSON records -- skipping this table.")
         continue
+
     fields = detect_json_fields(sample_parsed)
     main_text_key = fields["main_text_key"]
     application_key = fields["application_key"]
-    print(f"  Detected -- main text field: {main_text_key!r}, "
-          f"attachment field: {application_key!r}, title field: {fields['title_key']!r}")
+    segment_text_key = detect_segment_text_key(sample_parsed, application_key)
+    disp_key = detect_segment_disp_key(sample_parsed, application_key)
 
-    # ---- validate field coverage across ALL records, not just the sample ----
+    print(f"  Detected -- main text field: {main_text_key!r}")
+    print(f"              attachment/segment container: {application_key!r}")
+    print(f"              segment body-text field: {segment_text_key!r}  "
+          f"(this is the one the earlier script was missing)")
+    if disp_key:
+        print(f"              segment display/active flag seen: {disp_key!r} "
+              f"(not filtered on below -- all segments counted)")
+
+    # ---- validate field coverage across ALL records ----
     parse_ok = latest["parsed"].apply(lambda p: isinstance(p, dict)).sum()
-    key_counter = Counter()
-    has_main_text_key = 0
-    has_application_key = 0
+    main_only_lens, combined_lens, n_segments_list = [], [], []
+    has_main_text_key = has_segment_text = 0
+    disp_value_counter = Counter()
+
     for p in latest["parsed"]:
         if not isinstance(p, dict):
             continue
-        key_counter.update(p.keys())
         if main_text_key and main_text_key in p:
             has_main_text_key += 1
-        if application_key and application_key in p:
-            has_application_key += 1
+        segs = (p.get(application_key) or {}).get("segment") if application_key else None
+        if isinstance(segs, list) and segment_text_key:
+            if any(isinstance(s, dict) and s.get(segment_text_key) for s in segs):
+                has_segment_text += 1
+            if disp_key:
+                for s in segs:
+                    if isinstance(s, dict):
+                        disp_value_counter[s.get(disp_key)] += 1
+
+        _, main_len, combined_len, n_segs = get_combined_text(
+            p, main_text_key, application_key, segment_text_key
+        )
+        main_only_lens.append(main_len)
+        combined_lens.append(combined_len)
+        n_segments_list.append(n_segs)
 
     print(f"  JSON parse success: {parse_ok}/{total} ({parse_ok / total * 100:.1f}%)")
     if main_text_key:
-        print(f"  Records with {main_text_key!r} key present: "
+        print(f"  Records with {main_text_key!r} present: "
               f"{has_main_text_key}/{parse_ok} ({has_main_text_key / parse_ok * 100:.1f}%)")
-    if application_key:
-        print(f"  Records with {application_key!r} key present: "
-              f"{has_application_key}/{parse_ok} ({has_application_key / parse_ok * 100:.1f}%)")
-    if (main_text_key and has_main_text_key / parse_ok < 0.95) or \
-       (application_key and has_application_key / parse_ok < 0.95):
-        print("  >>> One of the detected fields is missing on a non-trivial share of "
-              "records -- check the top-level key list below for an alternate shape.")
-        print(f"      Most common top-level keys: {key_counter.most_common(10)}")
+    if segment_text_key:
+        print(f"  Records with >=1 non-empty segment text: "
+              f"{has_segment_text}/{parse_ok} ({has_segment_text / parse_ok * 100:.1f}%)")
+    if disp_value_counter:
+        print(f"  Segment {disp_key!r} value distribution: {dict(disp_value_counter)}")
 
-    # ---- score each record + build the viewer lookup ----
+    if main_only_lens and combined_lens:
+        print(f"\n  Text length, OLD method (procedureText only):")
+        print(f"    median={statistics.median(main_only_lens):.0f}, "
+              f"mean={statistics.mean(main_only_lens):.0f}")
+        print(f"  Text length, FIXED method (procedureText + all segment text):")
+        print(f"    median={statistics.median(combined_lens):.0f}, "
+              f"mean={statistics.mean(combined_lens):.0f}")
+        old_sufficient = sum(1 for L in main_only_lens if L > SUFFICIENT_TEXT_LEN)
+        new_sufficient = sum(1 for L in combined_lens if L > SUFFICIENT_TEXT_LEN)
+        print(f"  'Sufficient text' (>1000 chars) count -- OLD: {old_sufficient}, "
+              f"FIXED: {new_sufficient}")
+
+    # ---- score each record on the COMBINED text + build viewer lookup ----
     with_attachment = 0
     sufficient_text = 0
     attach_and_lt500 = 0
@@ -292,10 +366,9 @@ for table in procedure_tables:
 
         viewer_lookup[country][pid] = parsed
 
-        main_text = ""
-        if main_text_key:
-            main_text = strip_html((parsed.get(main_text_key) or {}).get("sgmntText"))
-        text_len = len(main_text)
+        _, _, text_len, _ = get_combined_text(
+            parsed, main_text_key, application_key, segment_text_key
+        )
         if text_len > SUFFICIENT_TEXT_LEN:
             sufficient_text += 1
 
@@ -318,13 +391,14 @@ for table in procedure_tables:
         "% All Procedures: Attachment and Text <1000": round(
             attach_and_lt1000 / total * 100, 2) if total else 0,
     })
-    print(f"  --> {total} procedures scored")
+    print(f"\n  --> {total} procedures scored")
 
 
 result_df = pd.DataFrame(result_rows)
 
 print("\n\n" + "=" * 80)
-print("Result -- same column layout as your 'Attachments analysis' sheet")
+print("Result -- same column layout as your 'Attachments analysis' sheet, now scored "
+      "on the combined text field")
 print("=" * 80)
 display(result_df)
 
