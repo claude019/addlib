@@ -1,0 +1,293 @@
+# ============================================================
+# GPPS Procedure tables -- PER-PROCEDURE detail
+#
+# One row per procedure_core_id (latest version), with:
+#   - combined text length (procedureText + all segment body text,
+#     same fix as GPPS_Procedure_Analysis_Fixed.py)
+#   - number of segments contributing text
+#   - whether it has an active attachment, and how many
+#
+# This is the row-level view behind the country-level summary --
+# use it to spot-check individual procedures, not just totals.
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+from bs4 import BeautifulSoup
+
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+    DATASET = "rc_curated_prod"
+    LOCATION = "EU"  # adjust to match your existing setup if this errors
+
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_rows", 200)
+pd.set_option("display.max_colwidth", 120)
+
+SUFFICIENT_TEXT_LEN = 1000
+
+COUNTRY_CODE_NAMES = {
+    "aa": "Global", "ae": "United Arab Emirates", "ar": "Argentina",
+    "au": "Australia", "bd": "Bangladesh", "be": "Belgium", "bh": "Bahrain",
+    "bm": "Bermuda", "br": "Brazil", "ca": "Canada", "cl": "Chile",
+    "cn": "China", "cz": "Czech Republic", "de": "Germany", "dz": "Algeria",
+    "es": "Spain", "fr": "France", "gb": "United Kingdom", "gg": "Guernsey",
+    "hk": "Hong Kong", "id": "Indonesia", "ie": "Ireland", "il": "Israel",
+    "im": "Isle of Man", "in": "India", "it": "Italy", "je": "Jersey",
+    "jp": "Japan", "kr": "Korea, Republic of (South)", "kw": "Kuwait",
+    "ky": "Cayman Islands", "lk": "Sri Lanka", "lu": "Luxembourg",
+    "mo": "Macau", "mt": "Malta", "mu": "Mauritius", "mv": "Maldives",
+    "my": "Malaysia", "nl": "Netherlands", "nz": "New Zealand", "om": "Oman",
+    "ph": "Philippines", "pl": "Poland", "qa": "Qatar", "sa": "Saudi Arabia",
+    "se": "Sweden", "sg": "Singapore", "th": "Thailand", "tr": "Turkey",
+    "tw": "Taiwan", "us": "United States of America", "uy": "Uruguay",
+    "vn": "Vietnam", "za": "South Africa",
+}
+
+
+# ============================================================
+# Helpers (same detection/combination logic as the Fixed script)
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def strip_html(text):
+    if not isinstance(text, str) or not text.strip():
+        return ""
+    try:
+        return BeautifulSoup(text, "html.parser").get_text(separator=" ", strip=True)
+    except Exception:
+        return re.sub(r"<[^>]+>", " ", text)
+
+
+def detect_physical_columns(df):
+    cols = list(df.columns)
+    id_col = next((c for c in cols if re.search(r"(?i)core.?id$", c)), None) \
+        or next((c for c in cols if re.search(r"(?i)_id$", c)), None)
+    version_col = next((c for c in cols if "version" in c.lower()), None)
+    json_col = next((c for c in cols if "json" in c.lower()), None)
+    return id_col, version_col, json_col
+
+
+def detect_json_fields(parsed):
+    text_candidates = []
+    application_key = None
+    for k, v in parsed.items():
+        if isinstance(v, dict) and any(re.search(r"(?i)sgmnttext", kk) for kk in v):
+            text_candidates.append(k)
+        if isinstance(v, dict) and ("appendix" in v or "guidance" in v or "segment" in v):
+            application_key = k
+
+    main_text_key = next((k for k in text_candidates if "purpose" not in k.lower()), None)
+    if main_text_key is None and text_candidates:
+        main_text_key = text_candidates[0]
+
+    title_key = next(
+        (k for k, v in parsed.items() if isinstance(v, str) and "titl" in k.lower()),
+        None,
+    )
+
+    return {"main_text_key": main_text_key, "application_key": application_key, "title_key": title_key}
+
+
+def detect_segment_text_key(parsed, application_key):
+    if not application_key:
+        return None
+    segments = (parsed.get(application_key) or {}).get("segment")
+    if not isinstance(segments, list) or not segments:
+        return None
+    first = next((s for s in segments if isinstance(s, dict)), None)
+    if not first:
+        return None
+    return next((k for k in first if re.search(r"(?i)sgmnttext", k)), None)
+
+
+def get_combined_text(parsed, main_text_key, application_key, segment_text_key):
+    main_text = ""
+    if main_text_key:
+        main_text = strip_html((parsed.get(main_text_key) or {}).get("sgmntText"))
+
+    segment_texts = []
+    n_segments = 0
+    if application_key and segment_text_key:
+        segments = (parsed.get(application_key) or {}).get("segment")
+        if isinstance(segments, list):
+            for seg in segments:
+                if isinstance(seg, dict):
+                    t = strip_html(seg.get(segment_text_key))
+                    if t:
+                        segment_texts.append(t)
+                        n_segments += 1
+
+    combined = "\n".join([t for t in [main_text] + segment_texts if t])
+    return combined, n_segments
+
+
+def count_active_attachments(parsed, application_key):
+    """Returns (has_attachment: bool, n_active: int, attachment_names: list)."""
+    if not application_key:
+        return False, 0, []
+    app = parsed.get(application_key) or {}
+    n_active = 0
+    names = []
+    for src in ("appendix", "guidance"):
+        items = app.get(src)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("actvFlg") == "Y":
+                    n_active += 1
+                    name = it.get("docName") or it.get("gppsDocName") or it.get("docUrl")
+                    if name:
+                        names.append(str(name))
+    return n_active > 0, n_active, names
+
+
+# ============================================================
+# SECTION 1 -- Discover procedure tables
+# ============================================================
+
+print("=" * 80)
+print("SECTION 1 -- Discovering procedure tables")
+print("=" * 80)
+
+discovery_query = f"""
+    SELECT table_name
+    FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+    WHERE REGEXP_CONTAINS(table_name, r'^[a-z]{{2}}_hsbc_gpps_gpps_procedure$')
+    ORDER BY table_name
+"""
+try:
+    procedure_tables = bq_client.query(discovery_query).to_dataframe()["table_name"].tolist()
+except Exception as e:
+    print(f"INFORMATION_SCHEMA not readable ({str(e)[:80]}); falling back to the single table.")
+    procedure_tables = ["aa_hsbc_gpps_gpps_procedure"]
+
+if not procedure_tables:
+    procedure_tables = ["aa_hsbc_gpps_gpps_procedure"]
+
+print(f"\nFound {len(procedure_tables)} procedure table(s): {procedure_tables}")
+
+
+# ============================================================
+# SECTION 2 -- Build one row per procedure
+# ============================================================
+
+print("\n\n" + "=" * 80)
+print("SECTION 2 -- Scoring every procedure individually")
+print("=" * 80)
+
+detail_rows = []
+
+for table in procedure_tables:
+    code = table.split("_")[0]
+    country = COUNTRY_CODE_NAMES.get(code, code)
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+
+    try:
+        df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+    except Exception as e:
+        print(f"  {country:30s} FAILED to load -- {str(e)[:100]}")
+        continue
+    if len(df) == 0:
+        print(f"  {country:30s} EMPTY")
+        continue
+
+    id_col, version_col, json_col = detect_physical_columns(df)
+    if not all([id_col, version_col, json_col]):
+        print(f"  {country:30s} could not detect physical columns -- skipping")
+        continue
+
+    latest = df.sort_values(version_col).groupby(id_col, as_index=False).tail(1).copy()
+    latest["parsed"] = latest[json_col].apply(safe_json_loads)
+
+    sample_parsed = next((p for p in latest["parsed"] if isinstance(p, dict)), None)
+    if sample_parsed is None:
+        print(f"  {country:30s} no parseable JSON -- skipping")
+        continue
+
+    fields = detect_json_fields(sample_parsed)
+    main_text_key = fields["main_text_key"]
+    application_key = fields["application_key"]
+    title_key = fields["title_key"]
+    segment_text_key = detect_segment_text_key(sample_parsed, application_key)
+
+    for _, row in latest.iterrows():
+        parsed = row["parsed"]
+        pid = row[id_col]
+
+        if not isinstance(parsed, dict):
+            detail_rows.append({
+                "Country": country, "Table": table, "procedure_core_id": pid,
+                "version_num": row[version_col], "Title": None,
+                "Text length": 0, "N segments with text": 0,
+                "Has attachment": False, "N active attachments": 0,
+                "Attachment names": None, "JSON parse error": True,
+            })
+            continue
+
+        combined_text, n_segs = get_combined_text(
+            parsed, main_text_key, application_key, segment_text_key
+        )
+        has_attach, n_attach, attach_names = count_active_attachments(parsed, application_key)
+
+        detail_rows.append({
+            "Country": country,
+            "Table": table,
+            "procedure_core_id": pid,
+            "version_num": row[version_col],
+            "Title": parsed.get(title_key) if title_key else None,
+            "Text length": len(combined_text),
+            "N segments with text": n_segs,
+            "Has attachment": has_attach,
+            "N active attachments": n_attach,
+            "Attachment names": "; ".join(attach_names) if attach_names else None,
+            "JSON parse error": False,
+        })
+
+    print(f"  {country:30s} {latest[id_col].nunique()} procedures scored")
+
+detail_df = pd.DataFrame(detail_rows)
+detail_df = detail_df.sort_values(["Country", "procedure_core_id"]).reset_index(drop=True)
+
+print(f"\nTotal procedures in detail table: {len(detail_df):,}")
+print(f"\nText length distribution:")
+print(detail_df["Text length"].describe())
+print(f"\nWith attachment: {int(detail_df['Has attachment'].sum()):,} "
+      f"({detail_df['Has attachment'].mean() * 100:.1f}%)")
+
+print("\n" + "=" * 80)
+print("Per-procedure detail (first 50 rows)")
+print("=" * 80)
+display(detail_df.head(50))
+
+output_path = "Procedure_level_detail.xlsx"
+with pd.ExcelWriter(output_path, engine="openpyxl") as writer:
+    detail_df.to_excel(writer, sheet_name="Procedure detail", index=False)
+
+print(f"\nFull table ({len(detail_df):,} rows) written to: {output_path}")
+print("The dataframe is also in memory as `detail_df` for further filtering/sorting, e.g.:")
+print("  detail_df.sort_values('Text length')  -- thinnest procedures first")
+print("  detail_df[detail_df['Has attachment'] & (detail_df['Text length'] < 500)]")
