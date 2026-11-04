@@ -1,0 +1,85 @@
+# ============================================================
+# GPPS Procedure -- Attachment x Text-length pivot
+#
+# Reads the per-procedure detail Excel produced by
+# GPPS_Procedure_Level_Detail.py and builds a pivot:
+#   rows    = has attachment / no attachment / total
+#   columns = procedure count, and count under each text-length
+#             threshold (100 / 500 / 1000 chars)
+#
+# Run this in the SAME directory as Procedure_level_detail.xlsx
+# (the file the previous script wrote).
+# ============================================================
+
+import pandas as pd
+
+INPUT_PATH = "Procedure_level_detail.xlsx"
+INPUT_SHEET = "Procedure detail"
+OUTPUT_PATH = "Procedure_Attachment_Pivot.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
+print("=" * 80)
+print("Reading per-procedure detail")
+print("=" * 80)
+
+df = pd.read_excel(INPUT_PATH, sheet_name=INPUT_SHEET)
+print(f"Loaded {len(df):,} rows from {INPUT_PATH!r}, sheet {INPUT_SHEET!r}")
+
+required_cols = {"procedure_core_id", "Text length", "Has attachment"}
+missing = required_cols - set(df.columns)
+if missing:
+    raise ValueError(f"Expected columns missing from the input file: {missing}. "
+                      f"Columns found: {list(df.columns)}")
+
+if "JSON parse error" in df.columns:
+    n_parse_err = int(df["JSON parse error"].sum())
+    if n_parse_err:
+        print(f"Note: {n_parse_err} rows had a JSON parse error (text length 0, "
+              f"counted as 'no attachment' below) -- included in the totals.")
+
+total_unique = df["procedure_core_id"].nunique()
+total_rows = len(df)
+if total_unique != total_rows:
+    print(f"Note: {total_rows:,} rows but only {total_unique:,} distinct "
+          f"procedure_core_id values -- the same id appears in more than one "
+          f"table/country. Pivot below uses ROW count (one row = one procedure "
+          f"instance per table).")
+
+has_mask = df["Has attachment"] == True
+no_mask = ~has_mask
+text = df["Text length"]
+
+THRESHOLDS = [100, 500, 1000]
+
+
+def row_for(mask):
+    out = {"Procedures": int(mask.sum())}
+    for t in THRESHOLDS:
+        out[f"Text length < {t}"] = int((mask & (text < t)).sum())
+    return out
+
+
+pivot_df = pd.DataFrame({
+    "Has attachment": row_for(has_mask),
+    "No attachment": row_for(no_mask),
+}).T
+
+pivot_df.loc["TOTAL"] = pivot_df.sum(numeric_only=True)
+pivot_df = pivot_df.astype(int)
+pivot_df.index.name = "Attachment status"
+
+print("\n" + "=" * 80)
+print("Pivot -- attachment status x text-length threshold")
+print("=" * 80)
+display(pivot_df)
+
+print(f"\nTotal unique procedures (by row count): {total_rows:,}")
+print(f"  With attachment:    {int(has_mask.sum()):,}")
+print(f"  Without attachment: {int(no_mask.sum()):,}")
+
+with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
+    pivot_df.to_excel(writer, sheet_name="Attachment x Text Length")
+
+print(f"\nWritten to: {OUTPUT_PATH}")
