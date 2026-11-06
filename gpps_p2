@@ -1,0 +1,239 @@
+objects = client.list_objects(
+    bucket_name="gpps-11910707-conformed-prod",
+    prefix="gpps_attachment/policy/31/49/",
+)
+
+filenames = [o.split("/")[-1] for o in objects]
+
+print(f"gpps_attachment/policy/31/49/  —  {len(filenames)} file(s)\n")
+for i, name in enumerate(filenames, 1):
+    print(f"{i}. {name}")
+
+# ============================================================
+# GPPS Procedure Attachment Reconciliation (read-only, no copy)
+#
+# Single-table version of the policy audit -- aa_hsbc_gpps_gpps_procedure
+# is the only procedure table, so there's no discovery loop and no
+# per-country split (procedures are recorded as GLOBAL throughout).
+#
+# For every procedure:
+#   - How many active attachments the BQ/JSON record SAYS should exist
+#     (procedureApplication.appendix[] + guidance[], actvFlg == "Y")
+#   - How many objects actually sit in the source GCS bucket at that
+#     procedure's version prefix
+#   - How many of the expected names actually match an object there
+#   - How many expected names have no match
+#
+# This script makes ZERO write/upload/delete calls anywhere -- it only
+# calls GCSClient.list_objects() against gpps-11910707-conformed-prod.
+# No destination bucket, no download, no copy. Pure audit.
+#
+# TWO ASSUMPTIONS CARRIED OVER FROM THE POLICY SCRIPT -- NOT YET VERIFIED
+# FOR PROCEDURES SPECIFICALLY, see the note after PROC_TABLE below.
+# ============================================================
+
+import os
+import json
+import pandas as pd
+
+# ---- Bootstrap: BigQuery ----
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    LOCATION = "EU"  # adjust if this errors in your environment
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+DATASET = "rc_curated_prod"
+PROC_TABLE = "aa_hsbc_gpps_gpps_procedure"  # confirmed the only procedure table
+
+# NOTE -- two assumptions not independently confirmed for procedures:
+#   1. Object path prefix uses "procedure" as the path segment, mirroring
+#      the policy pattern (gpps_attachment/policy/... -> gpps_attachment/
+#      procedure/...). This hasn't been checked against a live GCS listing.
+#      Run SECTION 0 below on one procedure_core_id first and eyeball the
+#      prefix before trusting the full-table numbers.
+#   2. Attachment items under procedureApplication.appendix[]/guidance[]
+#      have the same shape as the policy side (gppsDocName, docName,
+#      actvFlg) -- the one live JSON sample you pulled had both fields
+#      null, so this has never actually been seen populated.
+
+# ---- Bootstrap: source GCS (READ-ONLY -- list_objects only, nothing else) ----
+from py_gcs_tools import GCSClient
+source_client = GCSClient(service_account_name="ee-in-hsbc-rc-analytics")
+SOURCE_BUCKET = "gpps-11910707-conformed-prod"
+
+OUTPUT_PATH = "GPPS_Procedure_Attachment_Reconciliation_Audit.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def pick_latest_version(df):
+    """Per procedure_core_id: the PUBL version (versn.procVersnStatCde ==
+    'PUBL', per the wiki cross-reference -- procedures use a different
+    status field name than policies) with the highest version_num. Falls
+    back to the highest version_num overall if no PUBL version exists.
+    Returns one row per procedure_core_id."""
+    df = df.copy()
+    df["parsed"] = df["json_data"].apply(safe_json_loads)
+    df["vers_stat"] = df["parsed"].apply(
+        lambda p: ((p or {}).get("versn") or {}).get("procVersnStatCde")
+    )
+
+    publ = df[df["vers_stat"] == "PUBL"]
+    publ_latest = (
+        publ.sort_values("version_num")
+        .groupby("procedure_core_id", as_index=False)
+        .tail(1)
+    )
+
+    missing_ids = set(df["procedure_core_id"]) - set(publ_latest["procedure_core_id"])
+    fallback = df[df["procedure_core_id"].isin(missing_ids)]
+    fallback_latest = (
+        fallback.sort_values("version_num")
+        .groupby("procedure_core_id", as_index=False)
+        .tail(1)
+    )
+
+    return pd.concat([publ_latest, fallback_latest], ignore_index=True)
+
+
+def active_attachments(parsed):
+    """Combined appendix[] + guidance[] items with actvFlg == 'Y', under
+    procedureApplication. Returns a list of gppsDocName (falls back to
+    docName if gppsDocName is absent)."""
+    app = (parsed or {}).get("procedureApplication") or {}
+    names = []
+    for src in ("appendix", "guidance"):
+        items = app.get(src)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("actvFlg") == "Y":
+                    name = it.get("gppsDocName") or it.get("docName")
+                    if name:
+                        names.append(name)
+    return names
+
+
+def list_source_objects(procedure_id, version_num):
+    """READ-ONLY. Lists what's physically at the procedure/version prefix
+    in the source bucket -- does not download or modify anything.
+    Prefix segment "procedure" is an assumption -- see note above."""
+    prefix = f"gpps_attachment/procedure/{procedure_id}/{version_num}/"
+    try:
+        objects = source_client.list_objects(bucket_name=SOURCE_BUCKET, prefix=prefix)
+    except Exception as e:
+        print(f"  !! list_objects failed for procedure {procedure_id} v{version_num}: {e}")
+        objects = []
+    return objects
+
+
+# ============================================================
+# SECTION 0 -- sanity check on one procedure before the full run
+# (uncomment and run this first; see note above)
+# ============================================================
+
+# sample_df = bq_client.query(
+#     f"SELECT * FROM `{DATA_PROJECT}.{DATASET}.{PROC_TABLE}` LIMIT 1"
+# ).to_dataframe()
+# sample_parsed = safe_json_loads(sample_df.iloc[0]["json_data"])
+# sample_id = sample_df.iloc[0]["procedure_core_id"]
+# sample_version = sample_df.iloc[0]["version_num"]
+# print("Active attachments expected:", active_attachments(sample_parsed))
+# print("Objects at assumed prefix:", list_source_objects(sample_id, sample_version))
+
+
+# ============================================================
+# Main loop
+# ============================================================
+
+full_table = f"{DATA_PROJECT}.{DATASET}.{PROC_TABLE}"
+print(f"Loading {PROC_TABLE} ...")
+df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+print(f"{len(df):,} rows loaded.")
+
+latest = pick_latest_version(df)
+print(f"{len(latest):,} procedures (latest version each)")
+
+audit_rows = []
+
+for _, row in latest.iterrows():
+    procedure_id = row["procedure_core_id"]
+    version_num = row["version_num"]
+    parsed = row["parsed"]
+    if not isinstance(parsed, dict):
+        continue
+
+    expected_names = active_attachments(parsed)
+    expected_count = len(expected_names)
+
+    if expected_count == 0:
+        audit_rows.append({
+            "Country": "GLOBAL",
+            "Table": PROC_TABLE,
+            "Procedure_id": procedure_id,
+            "Version": version_num,
+            "Number of attachments found in the BQ table": 0,
+            "Number of attachments found in the gcs bucket": 0,
+            "Number of attachments matched (BQ vs gcs)": 0,
+            "Number of attachments not matched": 0,
+        })
+        continue
+
+    objects = list_source_objects(procedure_id, version_num)
+    found_names = {os.path.basename(o) for o in objects}
+    found_count = len(objects)
+
+    matched_names = [n for n in expected_names if n in found_names]
+    matches_count = len(matched_names)
+    not_matched_count = expected_count - matches_count
+
+    audit_rows.append({
+        "Country": "GLOBAL",
+        "Table": PROC_TABLE,
+        "Procedure_id": procedure_id,
+        "Version": version_num,
+        "Number of attachments found in the BQ table": expected_count,
+        "Number of attachments found in the gcs bucket": found_count,
+        "Number of attachments matched (BQ vs gcs)": matches_count,
+        "Number of attachments not matched": not_matched_count,
+    })
+
+print("\nDone.")
+
+# ============================================================
+# Audit table export
+# ============================================================
+
+audit_df = (
+    pd.DataFrame(audit_rows)
+    .sort_values(["Procedure_id"])
+    .reset_index(drop=True)
+)
+audit_df.to_excel(OUTPUT_PATH, index=False)
+print(f"\nReconciliation audit written to: {OUTPUT_PATH}")
+display(audit_df)
