@@ -1,0 +1,224 @@
+# ============================================================
+# GPPS Attachment Reconciliation (read-only, no copy)
+#
+# Audits, per policy, across all policy_core_id tables (54 country tables
+# plus the Global table, discovered live):
+#   - How many active attachments the BQ/JSON record SAYS should exist
+#     (policyApplication.appendix[] + guidance[], actvFlg == "Y")
+#   - How many objects actually sit in the source GCS bucket at that
+#     policy's version prefix
+#   - How many of the expected names actually match an object there
+#     (matched on gppsDocName at the policy_id + version prefix)
+#   - How many expected names have no match
+#
+# This script makes ZERO write/upload/delete calls anywhere -- it only
+# calls GCSClient.list_objects() against gpps-11910707-conformed-prod.
+# No destination bucket, no download, no copy. Pure audit.
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+
+# ---- Bootstrap: BigQuery ----
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    LOCATION = "EU"  # adjust if this errors in your environment
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+DATASET = "rc_curated_prod"
+
+# ---- Bootstrap: source GCS (READ-ONLY -- list_objects only, nothing else) ----
+from py_gcs_tools import GCSClient
+source_client = GCSClient(service_account_name="ee-in-hsbc-rc-analytics")
+SOURCE_BUCKET = "gpps-11910707-conformed-prod"
+
+OUTPUT_PATH = "GPPS_Attachment_Reconciliation_Audit.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def discover_policy_tables():
+    """All *_hsbc_gpps_gpps_policy tables in the dataset -- 54 country tables
+    plus aa_hsbc_gpps_gpps_policy (Global). Discovered live via
+    INFORMATION_SCHEMA rather than hard-coded."""
+    query = f"""
+        SELECT table_name
+        FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+        WHERE table_name LIKE '%_hsbc_gpps_gpps_policy'
+    """
+    rows = bq_client.query(query).to_dataframe()
+    return sorted(rows["table_name"].tolist())
+
+
+def country_code_from_table(table_name):
+    # "{cc}_hsbc_gpps_gpps_policy" -> cc (uppercased); "aa" = Global
+    m = re.match(r"^([a-z]{2})_hsbc_gpps_gpps_policy$", table_name)
+    return m.group(1).upper() if m else table_name
+
+
+def pick_latest_version(df):
+    """Per policy_core_id: the PUBL version with the highest version_num.
+    Falls back to the highest version_num overall if no PUBL version exists
+    for that policy. Returns one row per policy_core_id."""
+    df = df.copy()
+    df["parsed"] = df["json_data"].apply(safe_json_loads)
+    df["vers_stat"] = df["parsed"].apply(
+        lambda p: ((p or {}).get("versn") or {}).get("versStatCde")
+    )
+
+    publ = df[df["vers_stat"] == "PUBL"]
+    publ_latest = (
+        publ.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+    )
+
+    missing_ids = set(df["policy_core_id"]) - set(publ_latest["policy_core_id"])
+    fallback = df[df["policy_core_id"].isin(missing_ids)]
+    fallback_latest = (
+        fallback.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+    )
+
+    return pd.concat([publ_latest, fallback_latest], ignore_index=True)
+
+
+def active_attachments(parsed):
+    """Combined appendix[] + guidance[] items with actvFlg == 'Y'.
+    Returns a list of gppsDocName (falls back to docName if absent)."""
+    app = (parsed or {}).get("policyApplication") or {}
+    names = []
+    for src in ("appendix", "guidance"):
+        items = app.get(src)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("actvFlg") == "Y":
+                    name = it.get("gppsDocName") or it.get("docName")
+                    if name:
+                        names.append(name)
+    return names
+
+
+def list_source_objects(policy_id, version_num):
+    """READ-ONLY. Lists what's physically at the policy/version prefix in
+    the source bucket -- does not download or modify anything."""
+    prefix = f"gpps_attachment/policy/{policy_id}/{version_num}/"
+    try:
+        objects = source_client.list_objects(bucket_name=SOURCE_BUCKET, prefix=prefix)
+    except Exception as e:
+        print(f"  !! list_objects failed for policy {policy_id} v{version_num}: {e}")
+        objects = []
+    return objects
+
+
+# ============================================================
+# Main loop
+# ============================================================
+
+tables = discover_policy_tables()
+print(f"Discovered {len(tables)} policy tables.")
+
+audit_rows = []
+
+for table in tables:
+    country = country_code_from_table(table)
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+    print(f"\n{'=' * 70}\n{table}  (Country: {country})\n{'=' * 70}")
+
+    try:
+        df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+    except Exception as e:
+        print(f"  !! load failed: {e}")
+        continue
+
+    if df.empty:
+        continue
+
+    latest = pick_latest_version(df)
+    print(f"  {len(latest)} policies (latest version each)")
+
+    for _, row in latest.iterrows():
+        policy_id = row["policy_core_id"]
+        version_num = row["version_num"]
+        parsed = row["parsed"]
+        if not isinstance(parsed, dict):
+            continue
+
+        expected_names = active_attachments(parsed)
+        expected_count = len(expected_names)
+
+        if expected_count == 0:
+            audit_rows.append({
+                "Country": country,
+                "Table": table,
+                "Policy_id": policy_id,
+                "Version": version_num,
+                "Number of attachments found in the BQ table": 0,
+                "Number of attachments found in the gcs bucket": 0,
+                "Number of attachments matched (BQ vs gcs)": 0,
+                "Number of attachments not matched": 0,
+            })
+            continue
+
+        objects = list_source_objects(policy_id, version_num)
+        found_names = {os.path.basename(o) for o in objects}
+        found_count = len(objects)
+
+        matched_names = [n for n in expected_names if n in found_names]
+        matches_count = len(matched_names)
+        not_matched_count = expected_count - matches_count
+
+        audit_rows.append({
+            "Country": country,
+            "Table": table,
+            "Policy_id": policy_id,
+            "Version": version_num,
+            "Number of attachments found in the BQ table": expected_count,
+            "Number of attachments found in the gcs bucket": found_count,
+            "Number of attachments matched (BQ vs gcs)": matches_count,
+            "Number of attachments not matched": not_matched_count,
+        })
+
+print("\nDone.")
+
+# ============================================================
+# Audit table export
+# ============================================================
+
+audit_df = (
+    pd.DataFrame(audit_rows)
+    .sort_values(["Country", "Policy_id"])
+    .reset_index(drop=True)
+)
+audit_df.to_excel(OUTPUT_PATH, index=False)
+print(f"\nReconciliation audit written to: {OUTPUT_PATH}")
+display(audit_df)
