@@ -1,0 +1,452 @@
+# ============================================================
+# GPPS Policy Attachment Snapshot Pipeline
+#
+# Single script, single pass. Meant to be handed off and re-run at any
+# later date to get an updated snapshot -- no manual setup beyond having
+# access to the two buckets and BigQuery.
+#
+# Each run, in ONE pass per policy (compute its audit row, then
+# immediately copy its matched files -- not three separate full sweeps):
+#
+#   1. AUDIT -- for every policy, across all policy_core_id tables (54
+#      country tables + Global, discovered live via INFORMATION_SCHEMA),
+#      compares what the BQ/JSON record says should exist (active
+#      appendix[]/guidance[] items, actvFlg == "Y", matched on docName)
+#      against what's actually sitting in the source GCS bucket.
+#   2. COPY -- for every matched attachment, copies it from the source
+#      bucket into this run's own timestamped snapshot folder, organized
+#      by country then policy.
+#   3. LOG -- writes a diagnostics log directly into that snapshot folder
+#      in GCS, alongside the files it describes.
+#
+# If you'd rather have the full audit complete first, as a gate, before
+# any copying starts (e.g. to review before committing to the copy),
+# that's a different script shape -- this one interleaves per policy.
+#
+# Source (READ-ONLY): gpps-11910707-conformed-prod, via py_gcs_tools.GCSClient
+#   -- only list_objects() / download_object() ever called against it.
+#   Never any write/upload/delete call against this bucket, under any
+#   circumstance.
+#
+# Destination (WRITE): cmlp_exp_003_1_prod, via google.cloud.storage
+#   gs://cmlp_exp_003_1_prod/MODEL_2/gpps_attachments/policies_{timestamp}/
+#   {country}/{policy_id}/{filename}
+#   -- {country} is the full ISO 3166-1 country name (lowercase, spaces ->
+#      underscores), resolved from the table's 2-letter prefix via
+#      pycountry -- e.g. "india", "united_kingdom", "united_arab_emirates".
+#      The "uk" table prefix is mapped to ISO "gb" first, since HSBC's
+#      prefix doesn't match the ISO code directly. The Global table
+#      ("aa") maps to the folder "global".
+#   -- Flat under policy_id, no version subfolder: only the latest
+#      version's attachments are kept; re-running overwrites with the
+#      then-current latest.
+#
+# The "Country" column inside the audit sheets stays the 2-letter table
+# code (e.g. "IN", "GB", "AA") -- unchanged from earlier versions of this
+# script -- while only the GCS folder uses the full country name. Say if
+# you want the sheets to show the full name too.
+#
+# Version selection: per policy_core_id, the versn.versStatCde == "PUBL"
+# row with the highest version_num; falls back to the highest version_num
+# overall if no PUBL version exists for that policy.
+#
+# Output:
+#   - Local: GPPS_Policy_Attachment_Snapshot.xlsx, three sheets --
+#     Audit (one row per policy), Overall level (per-country Set A /
+#     Set B rollup), Set B - missing policies (every incomplete policy,
+#     with both missing and found filenames).
+#   - GCS: diagnostics_log.txt written directly into this run's snapshot
+#     folder -- the same Overall level + Set B detail, as text, living
+#     next to the files it describes.
+# ============================================================
+
+import os
+import re
+import sys
+import json
+import tempfile
+import datetime
+import subprocess
+from pathlib import Path
+import pandas as pd
+
+# ---- Bootstrap: BigQuery ----
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    LOCATION = "EU"  # adjust if this errors in your environment
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+DATASET = "rc_curated_prod"
+
+# ---- Bootstrap: source GCS (READ-ONLY -- list_objects / download_object only) ----
+from py_gcs_tools import GCSClient
+source_client = GCSClient(service_account_name="ee-in-hsbc-rc-analytics")
+SOURCE_BUCKET = "gpps-11910707-conformed-prod"
+
+# ---- Bootstrap: destination GCS (write) ----
+from google.cloud import storage
+dest_storage_client = storage.Client(project="hsbc-12211200-cmlpwb-prod")
+DEST_BUCKET_NAME = "cmlp_exp_003_1_prod"
+dest_bucket = dest_storage_client.bucket(DEST_BUCKET_NAME)
+
+SNAPSHOT_TIMESTAMP = datetime.datetime.now().strftime("%Y%m%d_%H%M")
+SNAPSHOT_ROOT = f"MODEL_2/gpps_attachments/policies_{SNAPSHOT_TIMESTAMP}"
+print(f"Snapshot root for this run: gs://{DEST_BUCKET_NAME}/{SNAPSHOT_ROOT}/")
+
+OUTPUT_PATH = "GPPS_Policy_Attachment_Snapshot.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
+# ---- Country-name lookup (ISO 3166-1 alpha-2, via pycountry) ----
+try:
+    import pycountry
+except ImportError:
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--break-system-packages", "-q", "pycountry"]
+        )
+        import pycountry
+    except Exception as e:
+        print(f"  !! could not install pycountry ({e}) -- GCS folder names will fall back to raw table codes")
+        pycountry = None
+
+# HSBC table-prefix -> ISO alpha-2, only for prefixes that don't match ISO directly.
+# Add more here if other runs turn up similar mismatches.
+CODE_OVERRIDES = {
+    "uk": "gb",  # HSBC's table prefix is "uk"; ISO 3166-1 alpha-2 for the UK is "gb"
+}
+
+
+def country_folder_name(table_code):
+    """2-letter table prefix (e.g. 'in', 'uk', 'aa') -> lowercase,
+    filesystem-safe country name for the GCS folder, via ISO 3166-1
+    alpha-2 (pycountry). 'aa' (Global) maps to 'global'. A code that
+    can't be resolved falls back to the raw code, with a warning printed
+    so it doesn't silently produce the wrong folder."""
+    code = table_code.lower()
+    if code == "aa":
+        return "global"
+    iso_code = CODE_OVERRIDES.get(code, code)
+    if pycountry is not None:
+        try:
+            country = pycountry.countries.get(alpha_2=iso_code.upper())
+            if country is not None:
+                return re.sub(r"[^a-z0-9]+", "_", country.name.lower()).strip("_")
+        except Exception:
+            pass
+    print(f"  !! no ISO country name found for code '{code}' -- using raw code as the GCS folder name")
+    return code
+
+
+# ============================================================
+# Helpers
+# ============================================================
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+def discover_policy_tables():
+    """All *_hsbc_gpps_gpps_policy tables in the dataset -- 54 country
+    tables plus aa_hsbc_gpps_gpps_policy (Global). Discovered live via
+    INFORMATION_SCHEMA rather than hard-coded."""
+    query = f"""
+        SELECT table_name
+        FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+        WHERE table_name LIKE '%_hsbc_gpps_gpps_policy'
+    """
+    rows = bq_client.query(query).to_dataframe()
+    return sorted(rows["table_name"].tolist())
+
+
+def country_code_from_table(table_name):
+    # "{cc}_hsbc_gpps_gpps_policy" -> cc (uppercased); "aa" = Global
+    m = re.match(r"^([a-z]{2})_hsbc_gpps_gpps_policy$", table_name)
+    return m.group(1).upper() if m else table_name
+
+
+def pick_latest_version(df):
+    """Per policy_core_id: the PUBL version with the highest version_num.
+    Falls back to the highest version_num overall if no PUBL version
+    exists for that policy. Returns one row per policy_core_id."""
+    df = df.copy()
+    df["parsed"] = df["json_data"].apply(safe_json_loads)
+    df["vers_stat"] = df["parsed"].apply(
+        lambda p: ((p or {}).get("versn") or {}).get("versStatCde")
+    )
+
+    publ = df[df["vers_stat"] == "PUBL"]
+    publ_latest = (
+        publ.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+    )
+
+    missing_ids = set(df["policy_core_id"]) - set(publ_latest["policy_core_id"])
+    fallback = df[df["policy_core_id"].isin(missing_ids)]
+    fallback_latest = (
+        fallback.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+    )
+
+    return pd.concat([publ_latest, fallback_latest], ignore_index=True)
+
+
+def active_attachments(parsed):
+    """Combined appendix[] + guidance[] items with actvFlg == 'Y'.
+    Returns a list of docName (confirmed to match the GCS bucket's actual
+    filenames; falls back to gppsDocName only if docName is absent)."""
+    app = (parsed or {}).get("policyApplication") or {}
+    names = []
+    for src in ("appendix", "guidance"):
+        items = app.get(src)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("actvFlg") == "Y":
+                    name = it.get("docName") or it.get("gppsDocName")
+                    if name:
+                        names.append(name)
+    return names
+
+
+def list_source_objects(policy_id, version_num):
+    prefix = f"gpps_attachment/policy/{policy_id}/{version_num}/"
+    try:
+        objects = source_client.list_objects(bucket_name=SOURCE_BUCKET, prefix=prefix)
+    except Exception as e:
+        print(f"  !! list_objects failed for policy {policy_id} v{version_num}: {e}")
+        objects = []
+    return objects, prefix
+
+
+def copy_one_file(object_name, dest_blob_path, doc_name):
+    """Download from the source (read-only) bucket, upload to the
+    destination bucket, then let the TemporaryDirectory clean up the
+    local copy -- keeps local disk usage to one file at a time."""
+    with tempfile.TemporaryDirectory() as tmp:
+        local_path = Path(tmp) / doc_name
+        source_client.download_object(
+            bucket_name=SOURCE_BUCKET,
+            object_name=object_name,
+            destination_file=str(local_path),
+        )
+        blob = dest_bucket.blob(dest_blob_path)
+        blob.upload_from_filename(str(local_path))
+
+
+# ============================================================
+# Main -- single pass: audit + copy together, per policy
+# ============================================================
+
+tables = discover_policy_tables()
+print(f"Discovered {len(tables)} policy tables.")
+
+detail_rows = []
+copy_errors = []  # (policy_id, doc_name, error) -- for the log file
+
+for table in tables:
+    country_code = country_code_from_table(table)
+    country_folder = country_folder_name(country_code)
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+    print(f"\n{'=' * 70}\n{table}  (Country: {country_code} -> {country_folder})\n{'=' * 70}")
+
+    try:
+        df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+    except Exception as e:
+        print(f"  !! load failed: {e}")
+        continue
+
+    if df.empty:
+        continue
+
+    latest = pick_latest_version(df)
+    print(f"  {len(latest)} policies (latest version each)")
+
+    for _, row in latest.iterrows():
+        policy_id = row["policy_core_id"]
+        version_num = row["version_num"]
+        parsed = row["parsed"]
+        if not isinstance(parsed, dict):
+            continue
+
+        expected_names = active_attachments(parsed)
+        expected_count = len(expected_names)
+
+        if expected_count == 0:
+            detail_rows.append({
+                "Country": country_code, "Policy_id": policy_id,
+                "Number of attachments": 0,
+                "No of attachments found in the gcs bucket": 0,
+                "Number of attachments not found": 0,
+                "Number of matches found": 0,
+                "Missing filenames": "",
+                "Found filenames": "",
+            })
+            continue
+
+        objects, prefix = list_source_objects(policy_id, version_num)
+        found_names = {os.path.basename(o) for o in objects}
+        found_count = len(objects)
+
+        matched_names = [n for n in expected_names if n in found_names]
+        missing_names = [n for n in expected_names if n not in found_names]
+        matches_count = len(matched_names)
+        not_found_count = len(missing_names)
+
+        detail_rows.append({
+            "Country": country_code, "Policy_id": policy_id,
+            "Number of attachments": expected_count,
+            "No of attachments found in the gcs bucket": found_count,
+            "Number of attachments not found": not_found_count,
+            "Number of matches found": matches_count,
+            "Missing filenames": "; ".join(missing_names),
+            "Found filenames": "; ".join(matched_names),
+        })
+
+        for doc_name in matched_names:
+            object_name = f"{prefix}{doc_name}"
+            dest_blob_path = f"{SNAPSHOT_ROOT}/{country_folder}/{policy_id}/{doc_name}"
+            try:
+                copy_one_file(object_name, dest_blob_path, doc_name)
+            except Exception as e:
+                print(f"  !! copy failed -- policy {policy_id}, {doc_name}: {e}")
+                copy_errors.append((policy_id, doc_name, str(e)))
+
+print("\nDone.")
+
+# ============================================================
+# Audit table
+# ============================================================
+
+recon_df = (
+    pd.DataFrame(detail_rows)
+    .sort_values(["Country", "Policy_id"])
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# Overall level -- per-country rollup
+#
+# Set A = policies where every expected active attachment was matched
+# (and therefore copied). Set B = policies with at least one missing.
+# Policies with ZERO expected attachments are excluded from both sets --
+# there's nothing to reconcile for them.
+# "Number of documents found" is the total matched-document count across
+# ALL reconcilable policies per country (Set A + Set B combined) --
+# unprefixed, unlike the "Set B -" columns which are scoped to Set B only.
+# ============================================================
+
+MATCH_COL = "Number of matches found"
+NOT_FOUND_COL = "Number of attachments not found"
+EXPECTED_COL = "Number of attachments"
+
+reconcilable = recon_df[recon_df[EXPECTED_COL] > 0].copy()
+reconcilable["is_set_b"] = reconcilable[NOT_FOUND_COL] > 0
+
+overall_rows = []
+for country, grp in reconcilable.groupby("Country"):
+    set_a = grp[~grp["is_set_b"]]
+    set_b = grp[grp["is_set_b"]]
+    overall_rows.append({
+        "Country": country,
+        "Number of policies for which all documents are found": len(set_a),
+        "Number of documents found": grp[MATCH_COL].sum(),
+        "Number of policies for which atleast 1 document is missing (set B)": len(set_b),
+        "Set B - number of documents not found": set_b[NOT_FOUND_COL].sum(),
+        "Set B Number of documents found": set_b[MATCH_COL].sum(),
+    })
+
+overall_df = (
+    pd.DataFrame(overall_rows)
+    .sort_values("Country")
+    .reset_index(drop=True)
+)
+
+set_b_cols = [
+    "Country", "Policy_id", EXPECTED_COL, MATCH_COL, NOT_FOUND_COL,
+    "Missing filenames", "Found filenames",
+]
+set_b_df = (
+    reconcilable[reconcilable["is_set_b"]][set_b_cols]
+    .rename(columns={
+        EXPECTED_COL: "Expected active attachments",
+        MATCH_COL: "Found",
+        NOT_FOUND_COL: "Missing count",
+    })
+    .sort_values(["Country", "Policy_id"])
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# Local export -- three sheets
+# ============================================================
+
+with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
+    recon_df.to_excel(writer, sheet_name="Audit", index=False)
+    overall_df.to_excel(writer, sheet_name="Overall level", index=False)
+    set_b_df.to_excel(writer, sheet_name="Set B - missing policies", index=False)
+
+print(f"\nAudit workbook written to: {OUTPUT_PATH}")
+display(overall_df)
+display(set_b_df)
+
+# ============================================================
+# GCS log file -- written directly into the snapshot folder
+# ============================================================
+
+log_lines = []
+log_lines.append(f"GPPS Policy Attachment Snapshot -- {SNAPSHOT_TIMESTAMP}")
+log_lines.append(f"Destination: gs://{DEST_BUCKET_NAME}/{SNAPSHOT_ROOT}/")
+log_lines.append(f"Tables processed: {len(tables)}")
+log_lines.append(f"Policies reconciled: {len(recon_df)}")
+log_lines.append(f"Copy errors: {len(copy_errors)}")
+log_lines.append("")
+log_lines.append("=" * 70)
+log_lines.append("OVERALL LEVEL (per country)")
+log_lines.append("=" * 70)
+log_lines.append(overall_df.to_string(index=False))
+log_lines.append("")
+log_lines.append("=" * 70)
+log_lines.append(f"SET B -- MISSING POLICIES ({len(set_b_df)} policies)")
+log_lines.append("=" * 70)
+if set_b_df.empty:
+    log_lines.append("(none -- every reconcilable policy had all expected attachments found)")
+else:
+    for _, r in set_b_df.iterrows():
+        log_lines.append(
+            f"[{r['Country']}] Policy {r['Policy_id']} -- "
+            f"{r['Found']}/{r['Expected active attachments']} found, "
+            f"{r['Missing count']} missing: {r['Missing filenames']}"
+        )
+log_lines.append("")
+if copy_errors:
+    log_lines.append("=" * 70)
+    log_lines.append("COPY ERRORS")
+    log_lines.append("=" * 70)
+    for policy_id, doc_name, err in copy_errors:
+        log_lines.append(f"Policy {policy_id} -- {doc_name}: {err}")
+
+log_content = "\n".join(log_lines)
+
+log_blob_path = f"{SNAPSHOT_ROOT}/diagnostics_log.txt"
+dest_bucket.blob(log_blob_path).upload_from_string(log_content, content_type="text/plain")
+print(f"\nDiagnostics log written to: gs://{DEST_BUCKET_NAME}/{log_blob_path}")
