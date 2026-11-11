@@ -43,3 +43,58 @@ OUTPUT_PATH = "GPPS_Duplicate_Attachment_Names.xlsx"
 pd.set_option("display.max_columns", None)
 pd.set_option("display.max_colwidth", 120)
 
+
+
+GPPS_Policy_Attachment_Snapshot.xlsx
+Audit
+Field
+Definition / implication
+Country
+2-letter code of the policy's source table (e.g. IN, GB, AA = Global).
+Policy_id
+The policy's policy_core_id — uniquely identifies it within its table.
+Number of attachments
+How many active (actvFlg="Y") appendix/guidance attachments the policy's latest published version says should exist.
+No of attachments found in the gcs bucket
+Total objects physically sitting at that policy+version's path in the source bucket. Can be higher than "Number of attachments" — it includes orphan files (inactive/superseded attachments still left in the bucket).
+Number of attachments not found
+How many expected active attachments have no matching file in the bucket — a real data gap.
+Number of matches found
+How many expected active attachments were found (and copied to the destination).
+Missing filenames
+The specific filenames expected but not found.
+Found filenames
+The specific filenames expected and found.
+Overall level
+Field
+Definition / implication
+Country
+One row per country.
+Number of policies for which all documents are found
+Count of policies in this country with zero missing attachments — "Set A", fully complete.
+Number of documents found
+Total matched-attachment count across ALL reconcilable policies in this country (Set A + Set B combined) — not just Set A.
+Number of policies for which atleast 1 document is missing (set B)
+Count of policies in this country with at least one missing attachment — "Set B", incomplete.
+Set B - number of documents not found
+Total missing-attachment count, summed only across this country's Set B (incomplete) policies.
+Set B Number of documents found
+Total matched-attachment count, summed only across this country's Set B policies — i.e. the documents that DID get found even though those policies are still incomplete overall.
+Set B - missing policies (one row per incomplete policy, detail view)
+Field
+Definition / implication
+Country
+Country code of the incomplete policy.
+Policy_id
+The policy's id.
+Expected active attachments
+How many attachments the policy's JSON says should exist.
+Found
+How many were actually found.
+Missing count
+How many are missing.
+Missing filenames
+Names of the specific missing attachments — the actionable part of this sheet.
+Found filenames
+Names of the attachments that were found.
+
