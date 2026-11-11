@@ -1,0 +1,45 @@
+# ============================================================
+# GPPS Duplicate Attachment Names (read-only)
+#
+# Finds docName values that appear as an ACTIVE attachment (appendix[] or
+# guidance[], actvFlg == "Y") on more than one policy -- i.e. the same
+# physical filename is referenced by multiple policies, whether that's a
+# genuinely shared/common document (e.g. a group-wide policy attached to
+# several country policies) or a naming collision between unrelated files
+# that just happen to share a name (e.g. "Appendix_A.docx").
+#
+# This only reads BigQuery -- it never touches either GCS bucket, since
+# the question is about what the JSON records reference, not what's
+# physically present in a bucket.
+#
+# Scope: the latest version per policy_core_id (same PUBL-first,
+# fallback-to-highest logic used everywhere else in this project), across
+# all 54 country tables + Global, discovered live.
+# ============================================================
+
+import os
+import re
+import json
+import pandas as pd
+
+# ---- Bootstrap: BigQuery ----
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    LOCATION = "EU"  # adjust if this errors in your environment
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+DATASET = "rc_curated_prod"
+
+OUTPUT_PATH = "GPPS_Duplicate_Attachment_Names.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
