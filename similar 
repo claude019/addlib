@@ -44,57 +44,183 @@ pd.set_option("display.max_columns", None)
 pd.set_option("display.max_colwidth", 120)
 
 
+# ============================================================
+# Helpers (same logic as the policy pipeline)
+# ============================================================
 
-GPPS_Policy_Attachment_Snapshot.xlsx
-Audit
-Field
-Definition / implication
-Country
-2-letter code of the policy's source table (e.g. IN, GB, AA = Global).
-Policy_id
-The policy's policy_core_id — uniquely identifies it within its table.
-Number of attachments
-How many active (actvFlg="Y") appendix/guidance attachments the policy's latest published version says should exist.
-No of attachments found in the gcs bucket
-Total objects physically sitting at that policy+version's path in the source bucket. Can be higher than "Number of attachments" — it includes orphan files (inactive/superseded attachments still left in the bucket).
-Number of attachments not found
-How many expected active attachments have no matching file in the bucket — a real data gap.
-Number of matches found
-How many expected active attachments were found (and copied to the destination).
-Missing filenames
-The specific filenames expected but not found.
-Found filenames
-The specific filenames expected and found.
-Overall level
-Field
-Definition / implication
-Country
-One row per country.
-Number of policies for which all documents are found
-Count of policies in this country with zero missing attachments — "Set A", fully complete.
-Number of documents found
-Total matched-attachment count across ALL reconcilable policies in this country (Set A + Set B combined) — not just Set A.
-Number of policies for which atleast 1 document is missing (set B)
-Count of policies in this country with at least one missing attachment — "Set B", incomplete.
-Set B - number of documents not found
-Total missing-attachment count, summed only across this country's Set B (incomplete) policies.
-Set B Number of documents found
-Total matched-attachment count, summed only across this country's Set B policies — i.e. the documents that DID get found even though those policies are still incomplete overall.
-Set B - missing policies (one row per incomplete policy, detail view)
-Field
-Definition / implication
-Country
-Country code of the incomplete policy.
-Policy_id
-The policy's id.
-Expected active attachments
-How many attachments the policy's JSON says should exist.
-Found
-How many were actually found.
-Missing count
-How many are missing.
-Missing filenames
-Names of the specific missing attachments — the actionable part of this sheet.
-Found filenames
-Names of the attachments that were found.
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
 
+
+def discover_policy_tables():
+    query = f"""
+        SELECT table_name
+        FROM `{DATA_PROJECT}.{DATASET}.INFORMATION_SCHEMA.TABLES`
+        WHERE table_name LIKE '%_hsbc_gpps_gpps_policy'
+    """
+    rows = bq_client.query(query).to_dataframe()
+    return sorted(rows["table_name"].tolist())
+
+
+def country_code_from_table(table_name):
+    m = re.match(r"^([a-z]{2})_hsbc_gpps_gpps_policy$", table_name)
+    return m.group(1).upper() if m else table_name
+
+
+def pick_latest_version(df):
+    df = df.copy()
+    df["parsed"] = df["json_data"].apply(safe_json_loads)
+    df["vers_stat"] = df["parsed"].apply(
+        lambda p: ((p or {}).get("versn") or {}).get("versStatCde")
+    )
+    publ = df[df["vers_stat"] == "PUBL"]
+    publ_latest = (
+        publ.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+    )
+    missing_ids = set(df["policy_core_id"]) - set(publ_latest["policy_core_id"])
+    fallback = df[df["policy_core_id"].isin(missing_ids)]
+    fallback_latest = (
+        fallback.sort_values("version_num")
+        .groupby("policy_core_id", as_index=False)
+        .tail(1)
+    )
+    return pd.concat([publ_latest, fallback_latest], ignore_index=True)
+
+
+def active_attachments(parsed):
+    """Combined appendix[] + guidance[] items with actvFlg == 'Y'.
+    docName first (confirmed against the bucket), gppsDocName fallback."""
+    app = (parsed or {}).get("policyApplication") or {}
+    names = []
+    for src in ("appendix", "guidance"):
+        items = app.get(src)
+        if isinstance(items, list):
+            for it in items:
+                if isinstance(it, dict) and it.get("actvFlg") == "Y":
+                    name = it.get("docName") or it.get("gppsDocName")
+                    if name:
+                        names.append(name)
+    return names
+
+
+# ============================================================
+# Build one row per (policy, active attachment) across every table
+# ============================================================
+
+tables = discover_policy_tables()
+print(f"Discovered {len(tables)} policy tables.")
+
+attachment_rows = []
+
+for table in tables:
+    country = country_code_from_table(table)
+    full_table = f"{DATA_PROJECT}.{DATASET}.{table}"
+    try:
+        df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+    except Exception as e:
+        print(f"  !! load failed for {table}: {e}")
+        continue
+    if df.empty:
+        continue
+
+    latest = pick_latest_version(df)
+
+    for _, row in latest.iterrows():
+        policy_id = row["policy_core_id"]
+        version_num = row["version_num"]
+        parsed = row["parsed"]
+        if not isinstance(parsed, dict):
+            continue
+
+        for doc_name in active_attachments(parsed):
+            attachment_rows.append({
+                "Country": country,
+                "Policy_id": policy_id,
+                "Version": version_num,
+                "docName": doc_name,
+            })
+
+attachments_df = pd.DataFrame(attachment_rows)
+print(f"{len(attachments_df)} active-attachment references found across {attachments_df['Policy_id'].nunique()} policies.")
+
+# ============================================================
+# Cross-policy duplicates -- same docName referenced by >1 DISTINCT policy
+# ============================================================
+
+per_name_policies = (
+    attachments_df.groupby("docName")["Policy_id"]
+    .nunique()
+    .reset_index(name="Number of policies")
+)
+dup_names = set(per_name_policies[per_name_policies["Number of policies"] > 1]["docName"])
+
+dup_rows = []
+for doc_name, grp in attachments_df[attachments_df["docName"].isin(dup_names)].groupby("docName"):
+    policies = (
+        grp[["Country", "Policy_id"]]
+        .drop_duplicates()
+        .sort_values(["Country", "Policy_id"])
+    )
+    policy_list = "; ".join(f"{r.Country}-{r.Policy_id}" for r in policies.itertuples())
+    dup_rows.append({
+        "docName": doc_name,
+        "Number of policies": policies["Policy_id"].nunique(),
+        "Countries": "; ".join(sorted(policies["Country"].unique())),
+        "Country-Policy_id list": policy_list,
+    })
+
+cross_policy_df = (
+    pd.DataFrame(dup_rows)
+    .sort_values("Number of policies", ascending=False)
+    .reset_index(drop=True)
+)
+
+print(f"\n{len(cross_policy_df)} distinct filename(s) are referenced by more than one policy.")
+
+# ============================================================
+# Within-policy duplicates -- same docName listed more than once on the
+# SAME policy's own active attachment list (a data-quality flag, separate
+# question from cross-policy reuse)
+# ============================================================
+
+within_rows = []
+for (country, policy_id), grp in attachments_df.groupby(["Country", "Policy_id"]):
+    counts = grp["docName"].value_counts()
+    repeated = counts[counts > 1]
+    for doc_name, n in repeated.items():
+        within_rows.append({
+            "Country": country,
+            "Policy_id": policy_id,
+            "docName": doc_name,
+            "Times listed on this policy": n,
+        })
+
+within_policy_df = (
+    pd.DataFrame(within_rows)
+    .sort_values(["Country", "Policy_id"])
+    .reset_index(drop=True)
+)
+
+print(f"{len(within_policy_df)} docName/policy pair(s) are listed more than once on the same policy.")
+
+# ============================================================
+# Export
+# ============================================================
+
+with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
+    cross_policy_df.to_excel(writer, sheet_name="Shared across policies", index=False)
+    within_policy_df.to_excel(writer, sheet_name="Repeated within one policy", index=False)
+
+print(f"\nWritten to: {OUTPUT_PATH}")
+display(cross_policy_df)
