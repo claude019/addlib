@@ -1,0 +1,322 @@
+# ============================================================
+# GPPS Attachment Text-Extraction Feasibility Check
+#
+# Scans a snapshot folder already copied into the destination bucket
+# (either a policies_{timestamp} or procedures_{timestamp} run) and, for
+# every attachment, reports:
+#   - file type (from extension)
+#   - whether text could be extracted at all, and with what library
+#   - character count of the extracted text
+#   - for PDFs specifically: page count, chars-per-page, and a flag for
+#     whether it looks like a scanned/image-only PDF that would need OCR
+#
+# This only READS from the destination bucket (download for inspection,
+# then delete the local temp copy) -- it never touches the source bucket
+# and never writes anything back to GCS. Output is a local Excel file.
+#
+# SET THIS before running -- the exact snapshot folder to check:
+# ============================================================
+
+SNAPSHOT_PREFIX = "MODEL_2/gpps_attachments/policies_20261108_1735/"
+# e.g. for a procedure run instead:
+# SNAPSHOT_PREFIX = "MODEL_2/gpps_attachments/procedures_20261108_1735/"
+
+# Only check these country folders (leave as None to check every country
+# in the snapshot, like before). Folder names are what country_folder_name()
+# in the pipeline actually produces -- the full pycountry name, lowercase,
+# spaces -> underscores -- NOT what you'd naturally type:
+#   "global"          -- the Global/aa table
+#   "hong_kong"        -- Hong Kong (table prefix "hk")
+#   "united_kingdom"   -- UK (table prefix "uk" -> overridden to ISO "gb")
+#   "united_states"    -- USA (table prefix "us")
+# If your snapshot's folder names turn out different from this (e.g. the
+# "hk" prefix assumption is wrong, or pycountry resolved a name you
+# didn't expect), list_blobs for that country will just come back empty --
+# worth spot-checking with bash_tool/gsutil or a quick list_blobs(prefix=
+# SNAPSHOT_PREFIX) first if a country shows 0 attachments unexpectedly.
+COUNTRIES_TO_CHECK = ["global", "hong_kong", "united_kingdom", "united_states"]
+
+# ============================================================
+
+import os
+import sys
+import subprocess
+import tempfile
+from pathlib import Path
+import pandas as pd
+
+OUTPUT_PATH = "GPPS_Attachment_Text_Extraction_Feasibility.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
+# ---- Bootstrap: destination GCS (read-only here, even though the bucket
+# itself is writable -- this script only ever calls list_blobs and
+# download_to_filename) ----
+from google.cloud import storage
+storage_client = storage.Client(project="hsbc-12211200-cmlpwb-prod")
+DEST_BUCKET_NAME = "cmlp_exp_003_1_prod"
+
+# ---- Bootstrap: text-extraction libraries, installed on demand ----
+def ensure(pkg, import_name=None):
+    import_name = import_name or pkg
+    try:
+        return __import__(import_name)
+    except ImportError:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-m", "pip", "install", "--break-system-packages", "-q", pkg]
+            )
+            return __import__(import_name)
+        except Exception as e:
+            print(f"  !! could not install {pkg} ({e}) -- that format will be reported as unsupported")
+            return None
+
+pypdf = ensure("pypdf")
+docx = ensure("python-docx", "docx")
+openpyxl_mod = ensure("openpyxl")
+pptx_mod = ensure("python-pptx", "pptx")
+
+# Rough rule of thumb: a genuine text-layer PDF page carries at least a
+# few dozen characters (even a near-empty page has a header/footer/page
+# number). Well below this, across the whole document, is the classic
+# signature of a scanned page with no OCR already applied.
+OCR_CHARS_PER_PAGE_THRESHOLD = 20
+# For non-PDF formats, flag near-empty extraction for manual review --
+# not necessarily "needs OCR" (that's not the usual fix for a native
+# Office file), just "doesn't look right, check it by hand".
+LOW_TEXT_THRESHOLD = 20
+
+
+# ============================================================
+# Per-format extractors. Each returns (text, page_or_slide_count_or_None).
+# ============================================================
+
+def extract_pdf(path):
+    reader = pypdf.PdfReader(str(path))
+    n_pages = len(reader.pages)
+    parts = []
+    for page in reader.pages:
+        try:
+            parts.append(page.extract_text() or "")
+        except Exception:
+            parts.append("")
+    return "\n".join(parts), n_pages
+
+
+def extract_docx(path):
+    d = docx.Document(str(path))
+    parts = [p.text for p in d.paragraphs]
+    for table in d.tables:
+        for row in table.rows:
+            for cell in row.cells:
+                parts.append(cell.text)
+    return "\n".join(parts), None
+
+
+def extract_xlsx(path):
+    wb = openpyxl_mod.load_workbook(str(path), data_only=True, read_only=True)
+    parts = []
+    for ws in wb.worksheets:
+        for row in ws.iter_rows(values_only=True):
+            for val in row:
+                if val is not None:
+                    parts.append(str(val))
+    return "\n".join(parts), None
+
+
+def extract_pptx(path):
+    prs = pptx_mod.Presentation(str(path))
+    n_slides = len(prs.slides)
+    parts = []
+    for slide in prs.slides:
+        for shape in slide.shapes:
+            if shape.has_text_frame:
+                for para in shape.text_frame.paragraphs:
+                    for run in para.runs:
+                        parts.append(run.text)
+    return "\n".join(parts), n_slides
+
+
+# Extensions with no extractor attempted here -- legacy binary formats
+# (pre-2007 Office) and archives. python-docx/openpyxl/python-pptx only
+# read the modern XML-based formats; .doc/.xls/.ppt need a different tool
+# entirely (e.g. LibreOffice headless conversion via a `soffice` binary,
+# which this environment likely doesn't have installed).
+UNSUPPORTED_NOTE = {
+    ".doc": "Legacy binary Word format -- python-docx can't read it. Would need LibreOffice/antiword conversion first.",
+    ".xls": "Legacy binary Excel format -- openpyxl can't read it. Would need xlrd<2.0 or a conversion step.",
+    ".ppt": "Legacy binary PowerPoint format -- python-pptx can't read it. Would need a conversion step.",
+    ".7z": "Archive -- contents not inspected. Needs extraction before any text check.",
+}
+
+EXTRACTORS = {
+    ".pdf": ("pypdf", extract_pdf, pypdf),
+    ".docx": ("python-docx", extract_docx, docx),
+    ".xlsx": ("openpyxl", extract_xlsx, openpyxl_mod),
+    ".pptx": ("python-pptx", extract_pptx, pptx_mod),
+}
+
+
+def classify_and_extract(local_path, ext):
+    if ext in EXTRACTORS:
+        lib_name, func, lib_obj = EXTRACTORS[ext]
+        if lib_obj is None:
+            return "library_unavailable", "", None, f"{lib_name} failed to install in this environment"
+        try:
+            text, count = func(local_path)
+            return "extracted", text, count, ""
+        except Exception as e:
+            return "extraction_failed", "", None, str(e)
+    elif ext in UNSUPPORTED_NOTE:
+        return "unsupported_format", "", None, UNSUPPORTED_NOTE[ext]
+    else:
+        return "unknown_format", "", None, f"No handler for '{ext}'"
+
+
+# ============================================================
+# Main -- walk the snapshot folder
+# ============================================================
+
+if COUNTRIES_TO_CHECK:
+    blobs = []
+    for country in COUNTRIES_TO_CHECK:
+        country_prefix = f"{SNAPSHOT_PREFIX}{country}/"
+        country_blobs = list(storage_client.list_blobs(DEST_BUCKET_NAME, prefix=country_prefix))
+        print(f"  {country}: {len(country_blobs)} object(s) at {country_prefix}")
+        blobs.extend(country_blobs)
+else:
+    blobs = list(storage_client.list_blobs(DEST_BUCKET_NAME, prefix=SNAPSHOT_PREFIX))
+
+blobs = [b for b in blobs if not b.name.endswith("diagnostics_log.txt")]
+print(f"{len(blobs)} attachment(s) total across the selected scope under gs://{DEST_BUCKET_NAME}/{SNAPSHOT_PREFIX}")
+
+rows = []
+
+for i, blob in enumerate(blobs, 1):
+    rel_path = blob.name[len(SNAPSHOT_PREFIX):] if blob.name.startswith(SNAPSHOT_PREFIX) else blob.name
+    parts = rel_path.split("/")
+    # expected shape: {country_or_global}/{policy_or_procedure_id}/{filename}
+    if len(parts) >= 3:
+        folder, item_id, filename = parts[0], parts[1], parts[-1]
+    elif len(parts) == 2:
+        folder, item_id, filename = parts[0], "", parts[-1]
+    else:
+        folder, item_id, filename = "", "", rel_path
+
+    ext = os.path.splitext(filename)[1].lower()
+
+    print(f"[{i}/{len(blobs)}] {rel_path}")
+
+    with tempfile.TemporaryDirectory() as tmp:
+        local_path = Path(tmp) / filename
+        try:
+            blob.download_to_filename(str(local_path))
+        except Exception as e:
+            rows.append({
+                "Folder": folder, "Item_id": item_id, "Filename": filename,
+                "Extension": ext, "Size (KB)": round(blob.size / 1024, 1) if blob.size else None,
+                "Status": "download_failed", "Character count": None,
+                "Pages/slides": None, "Chars per page": None,
+                "OCR likely needed": "", "Notes": str(e),
+            })
+            continue
+
+        status, text, count, note = classify_and_extract(local_path, ext)
+        char_count = len(text.strip()) if text else 0
+
+        ocr_flag = ""
+        chars_per_page = None
+        if ext == ".pdf" and status == "extracted" and count:
+            chars_per_page = round(char_count / count, 1)
+            ocr_flag = "Yes" if chars_per_page < OCR_CHARS_PER_PAGE_THRESHOLD else "No"
+        elif status == "extracted" and char_count < LOW_TEXT_THRESHOLD:
+            ocr_flag = "Low text -- verify manually"
+
+        rows.append({
+            "Folder": folder, "Item_id": item_id, "Filename": filename,
+            "Extension": ext, "Size (KB)": round(blob.size / 1024, 1) if blob.size else None,
+            "Status": status, "Character count": char_count if status == "extracted" else None,
+            "Pages/slides": count, "Chars per page": chars_per_page,
+            "OCR likely needed": ocr_flag, "Notes": note,
+        })
+
+results_df = pd.DataFrame(rows)
+
+
+def build_summary(df):
+    """Same per-extension rollup as before -- factored out so it can run
+    on the full set AND on each country's slice separately."""
+    rows_ = []
+    for ext, grp in df.groupby("Extension"):
+        extracted = grp[grp["Status"] == "extracted"]
+        rows_.append({
+            "Extension": ext if ext else "(none)",
+            "Count": len(grp),
+            "Extracted OK": len(extracted),
+            "Unsupported / failed": len(grp) - len(extracted),
+            "Avg character count": round(extracted["Character count"].mean(), 1) if not extracted.empty else None,
+            "Flagged -- OCR likely needed": int((grp["OCR likely needed"] == "Yes").sum()),
+        })
+    return (
+        pd.DataFrame(rows_)
+        .sort_values("Count", ascending=False)
+        .reset_index(drop=True)
+    )
+
+
+# ============================================================
+# Summary -- combined (all selected countries pooled, as before)
+# ============================================================
+
+summary_df = build_summary(results_df)
+
+# ============================================================
+# Summary -- by country AND file type, one filterable sheet
+# ============================================================
+
+country_type_rows = []
+for (folder, ext), grp in results_df.groupby(["Folder", "Extension"]):
+    extracted = grp[grp["Status"] == "extracted"]
+    country_type_rows.append({
+        "Folder": folder,
+        "Extension": ext if ext else "(none)",
+        "Count": len(grp),
+        "Extracted OK": len(extracted),
+        "Unsupported / failed": len(grp) - len(extracted),
+        "Avg character count": round(extracted["Character count"].mean(), 1) if not extracted.empty else None,
+        "Flagged -- OCR likely needed": int((grp["OCR likely needed"] == "Yes").sum()),
+    })
+
+summary_by_country_df = (
+    pd.DataFrame(country_type_rows)
+    .sort_values(["Folder", "Count"], ascending=[True, False])
+    .reset_index(drop=True)
+)
+
+# ============================================================
+# Summary -- one standalone sheet per country
+# ============================================================
+
+countries_present = COUNTRIES_TO_CHECK if COUNTRIES_TO_CHECK else sorted(results_df["Folder"].unique())
+per_country_summaries = {
+    country: build_summary(results_df[results_df["Folder"] == country])
+    for country in countries_present
+}
+
+print(f"\n{(results_df['OCR likely needed'] == 'Yes').sum()} attachment(s) flagged as likely needing OCR.")
+print(f"{(results_df['Status'] != 'extracted').sum()} attachment(s) could not be extracted (unsupported format, missing library, or error).")
+
+with pd.ExcelWriter(OUTPUT_PATH, engine="openpyxl") as writer:
+    results_df.to_excel(writer, sheet_name="Attachment text audit", index=False)
+    summary_df.to_excel(writer, sheet_name="Summary by file type", index=False)
+    summary_by_country_df.to_excel(writer, sheet_name="Summary by country & type", index=False)
+    for country, df_ in per_country_summaries.items():
+        # Excel sheet names cap at 31 chars
+        sheet_name = f"Summary - {country}"[:31]
+        df_.to_excel(writer, sheet_name=sheet_name, index=False)
+
+print(f"\nWritten to: {OUTPUT_PATH}")
+for country, df_ in per_country_summaries.items():
+    print(f"\n--- {country} ---")
+    display(df_)
