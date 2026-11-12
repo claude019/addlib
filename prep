@@ -1,0 +1,150 @@
+# ============================================================
+# GPPS Policy Text Data Preparation
+#
+# Pulls the keep-list fields from the GPPS policy golden source
+# (aa_hsbc_gpps_gpps_policy), filters to versStatCde == "PUBL", keeps the
+# latest PUBL version per policy_core_id (no fallback to draft/superseded
+# versions -- the keep-list says "filtered to PUBL", not "latest
+# available"), cleans the free-text fields, and returns one row per
+# policy. Column names are the original field names, unchanged -- cleaned
+# in place, no "_clean" suffixes.
+#
+# SCOPE ASSUMPTION: reads only aa_hsbc_gpps_gpps_policy (the Global
+# table), matching the "small golden source (~200 records)" / "one
+# embedding per policy" framing elsewhere in this project. If the
+# solution actually needs the 54 country tables too, that's a different,
+# larger pull -- say so and this gets extended with the same
+# INFORMATION_SCHEMA discovery the attachment pipeline scripts use.
+# ============================================================
+
+import os
+import re
+import sys
+import json
+import subprocess
+import pandas as pd
+
+# ---- Bootstrap: BigQuery ----
+try:
+    bq_client
+except NameError:
+    from google.cloud import bigquery
+    ANALYTICS_PROJECT = "hsbc-12211200-cmlpwb-prod"
+    LOCATION = "EU"  # adjust if this errors in your environment
+    os.environ["GOOGLE_CLOUD_PROJECT"] = ANALYTICS_PROJECT
+    os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = (
+        "/home/jovyan/.config/gcloud/application_default_credentials.json"
+    )
+    bq_client = bigquery.Client(project=ANALYTICS_PROJECT, location=LOCATION)
+
+DATA_PROJECT = "hsbc-11545401-cmpdatcwrs1-prod"
+DATASET = "rc_curated_prod"
+POLICY_TABLE = "aa_hsbc_gpps_gpps_policy"
+
+OUTPUT_PATH = "GPPS_Policy_Text_Data_Prep.xlsx"
+
+pd.set_option("display.max_columns", None)
+pd.set_option("display.max_colwidth", 120)
+
+# ---- Bootstrap: HTML cleaning ----
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "--break-system-packages", "-q", "beautifulsoup4"]
+    )
+    from bs4 import BeautifulSoup
+
+
+def clean_text(raw):
+    """Strip HTML tags/entities and collapse whitespace. "" for empty input."""
+    if not raw:
+        return ""
+    text = BeautifulSoup(str(raw), "html.parser").get_text(separator=" ")
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def safe_json_loads(x):
+    if x is None:
+        return None
+    if isinstance(x, dict):
+        return x
+    if isinstance(x, str):
+        try:
+            return json.loads(x)
+        except Exception:
+            return None
+    return None
+
+
+# ============================================================
+# Load, parse, filter to PUBL, keep the latest PUBL version per policy
+# ============================================================
+
+full_table = f"{DATA_PROJECT}.{DATASET}.{POLICY_TABLE}"
+print(f"Loading {POLICY_TABLE} ...")
+df = bq_client.query(f"SELECT * FROM `{full_table}`").to_dataframe()
+print(f"{len(df):,} rows loaded.")
+
+df["parsed"] = df["json_data"].apply(safe_json_loads)
+df["versStatCde"] = df["parsed"].apply(lambda p: ((p or {}).get("versn") or {}).get("versStatCde"))
+
+publ_df = df[df["versStatCde"] == "PUBL"].copy()
+print(f"{len(publ_df):,} rows with versStatCde == 'PUBL' (non-PUBL versions dropped entirely, no fallback).")
+
+latest_publ = (
+    publ_df.sort_values("version_num")
+    .groupby("policy_core_id", as_index=False)
+    .tail(1)
+)
+print(f"{len(latest_publ):,} policies after keeping the latest PUBL version each.")
+
+
+# ============================================================
+# Extract + clean the keep-list fields -- column names unchanged
+# ============================================================
+
+def extract_row(row):
+    parsed = row["parsed"] or {}
+    versn = parsed.get("versn") or {}
+    app = parsed.get("policyApplication") or {}
+
+    policy_text_obj = parsed.get("policyText") or {}
+    policy_purpose_obj = parsed.get("policyPurpose") or {}
+    segments = app.get("segment")
+
+    # policyApplication.segment[] is an array of segment objects, each
+    # carrying its body text under sgmntText (same field name pattern as
+    # policyText / policyPurpose) -- concatenated into one string per
+    # policy, since the embedding is one-per-policy, not one-per-segment.
+    segment_text = ""
+    if isinstance(segments, list):
+        segment_text = " ".join(
+            clean_text(seg.get("sgmntText"))
+            for seg in segments
+            if isinstance(seg, dict) and seg.get("sgmntText")
+        )
+
+    return pd.Series({
+        "policy_core_id": row["policy_core_id"],
+        "version_num": row["version_num"],
+        "versStatCde": versn.get("versStatCde"),
+        "versActlPublDt": versn.get("versActlPublDt"),
+        "snapshot_time": row.get("snapshot_time"),
+        "policyRiskTypePrimary": parsed.get("policyRiskTypePrimary"),
+        "riskTxnmyL2Text": app.get("riskTxnmyL2Text"),
+        "region": parsed.get("region"),
+        "policyTitle": clean_text(parsed.get("policyTitle")),
+        "policyPurpose": clean_text(policy_purpose_obj.get("sgmntText")),
+        "policyText": clean_text(policy_text_obj.get("sgmntText")),
+        "segment": segment_text,
+    })
+
+
+prepared_df = latest_publ.apply(extract_row, axis=1).reset_index(drop=True)
+
+print(f"\nPrepared {len(prepared_df):,} policy rows.")
+display(prepared_df.head())
+
+prepared_df.to_excel(OUTPUT_PATH, index=False)
+print(f"\nWritten to: {OUTPUT_PATH}")
