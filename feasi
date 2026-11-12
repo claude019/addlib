@@ -21,6 +21,21 @@ SNAPSHOT_PREFIX = "MODEL_2/gpps_attachments/policies_20261108_1735/"
 # e.g. for a procedure run instead:
 # SNAPSHOT_PREFIX = "MODEL_2/gpps_attachments/procedures_20261108_1735/"
 
+# Only check these country folders (leave as None to check every country
+# in the snapshot, like before). Folder names are what country_folder_name()
+# in the pipeline actually produces -- the full pycountry name, lowercase,
+# spaces -> underscores -- NOT what you'd naturally type:
+#   "global"          -- the Global/aa table
+#   "hong_kong"        -- Hong Kong (table prefix "hk")
+#   "united_kingdom"   -- UK (table prefix "uk" -> overridden to ISO "gb")
+#   "united_states"    -- USA (table prefix "us")
+# If your snapshot's folder names turn out different from this (e.g. the
+# "hk" prefix assumption is wrong, or pycountry resolved a name you
+# didn't expect), list_blobs for that country will just come back empty --
+# worth spot-checking with bash_tool/gsutil or a quick list_blobs(prefix=
+# SNAPSHOT_PREFIX) first if a country shows 0 attachments unexpectedly.
+COUNTRIES_TO_CHECK = ["global", "hong_kong", "united_kingdom", "united_states"]
+
 # ============================================================
 
 import os
@@ -163,9 +178,18 @@ def classify_and_extract(local_path, ext):
 # Main -- walk the snapshot folder
 # ============================================================
 
-blobs = list(storage_client.list_blobs(DEST_BUCKET_NAME, prefix=SNAPSHOT_PREFIX))
+if COUNTRIES_TO_CHECK:
+    blobs = []
+    for country in COUNTRIES_TO_CHECK:
+        country_prefix = f"{SNAPSHOT_PREFIX}{country}/"
+        country_blobs = list(storage_client.list_blobs(DEST_BUCKET_NAME, prefix=country_prefix))
+        print(f"  {country}: {len(country_blobs)} object(s) at {country_prefix}")
+        blobs.extend(country_blobs)
+else:
+    blobs = list(storage_client.list_blobs(DEST_BUCKET_NAME, prefix=SNAPSHOT_PREFIX))
+
 blobs = [b for b in blobs if not b.name.endswith("diagnostics_log.txt")]
-print(f"{len(blobs)} attachment(s) found under gs://{DEST_BUCKET_NAME}/{SNAPSHOT_PREFIX}")
+print(f"{len(blobs)} attachment(s) total across the selected scope under gs://{DEST_BUCKET_NAME}/{SNAPSHOT_PREFIX}")
 
 rows = []
 
