@@ -1,0 +1,989 @@
+# =============================================================================
+# ALERT -> POLICY LINKAGE  (full cross-join, cost-tracked, resumable)
+# NO PARENTAGE / NO GOLDEN / NO RECALL SCORING -- pure linking, nothing else.
+#
+# THE STORY THIS PIPELINE TELLS:
+#   Every alert is judged against EVERY published policy -- no RSM cascade, no
+#   candidate filtering, no golden-truth derivation. You get exactly one
+#   thing out the other end: a verdict (LINKED / NOT_LINKED /
+#   INSUFFICIENT_EVIDENCE / ERROR) for every (alert, policy) pair, plus a
+#   LINKED-only view for convenience.
+#
+# WHAT WAS REMOVED relative to the earlier direct_policy_linkage.py this was
+# built from -- all of it existed ONLY to measure recall against a golden
+# dataset, never to decide what the judge sees:
+#   - IA_RSM_POLICY_Linkage load (policy_links) -- existed only to derive
+#     REG_ID -> POLICY_ID for the golden chain
+#   - golden dataset load + derive_golden_policy() -- the record -> policy
+#     "answer key"
+#   - build_parentage() / print_funnel_report() -- reachability + funnel
+#     stats, all golden-dependent
+#   - [D]-[H]: scorecard, confusion matrix, LLM-judge audit, honest recall,
+#     by-policy breakdown, performance pack workbook -- all compare verdicts
+#     against golden; with no golden, there is nothing to compare against
+#   - SCOPE_MODE="golden" -- scope is now "all" (every alert in the extract)
+#     or "csv" (an explicit list you provide)
+#
+# WHAT'S UNCHANGED -- the actual linking machinery, verbatim:
+#   load_policies() (adapted for the new data-prep's column names -- see
+#   POLICY_RENAME), load_alerts(), the cost ledger (chat_with_cost /
+#   embed_with_cost / log_cost), build_plan() (full cross-join, optional
+#   embedding-based ordering, chunking, checkpointing), run_policy_linkage()
+#   (concurrent judge calls, resumable, crash-safe), _finalise().
+#
+# SECTIONS
+#   0.  Imports + paths + run id        0b. Cost ledger
+#   A.  Data load (policies + alerts)   A1. Scope           A2. Validation probe
+#   B1. Config + model params           B2. Cost projection
+#   P.  Provenance fingerprint
+#   C.  Work plan + checkpointed model execution
+#   E.  LINKED-only convenience output
+# =============================================================================
+
+
+# %% ==========================================================================
+# [0] IMPORTS + PATHS
+# =============================================================================
+import os, re, json, time, html, math, hashlib, asyncio
+import numpy as np
+import pandas as pd
+from pathlib import Path
+from datetime import datetime, timezone
+from tqdm.auto import tqdm
+
+import nest_asyncio                 # embed_with_cache calls run_until_complete
+nest_asyncio.apply()                # -> must patch the Jupyter loop first
+
+pd.set_option("display.width", 220)
+pd.set_option("display.max_columns", 60)
+
+# --- Gateway objects already defined upstream (do NOT recreate) --------------
+oai         = openai_client
+tok         = trust_token
+MODEL       = CHAT_MODEL
+clean       = clean_text
+embed_cache = embed_with_cache       # (ids, texts, cache_tag) -> L2-normalised matrix
+USE_CASE    = globals().get("USE_CASE", "alert_policy_linkage")
+EMBED_MODEL = globals().get("EMBED_MODEL", "gemini-embedding-001")   # cost attribution only
+
+# --- Paths ------------------------------------------------------------------
+DATA_DIR   = Path("/home/jovyan/data")
+REGMAP_DIR = DATA_DIR / "Tactical_Regmap_Data"
+
+PROJECT_OUTPUT_DIR   = Path("../output/execution_output/policy_linkage_no_parentage")
+EXECUTION_OUTPUT_DIR = PROJECT_OUTPUT_DIR / "Iteration_1"
+
+POLICIES_DIR       = Path("/home/jovyan/codes/Policies")
+POLICY_FILE        = POLICIES_DIR / "GPPS_Policy_Text_Data_Prep_Master.xlsx"  # output of GPPS_Policy_Text_Data_Prep.py
+RAPID2_FILE        = REGMAP_DIR / "Rapid2_REGDEV_US_2020_2025.parquet"
+POLICY_PROMPT_PATH = Path("/home/jovyan/prompt/policy_linkage/prompt_policy_linkage_v0.txt")
+
+OUTPUT_DIR = Path(EXECUTION_OUTPUT_DIR); OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+CKPT_DIR   = OUTPUT_DIR / "checkpoints";  CKPT_DIR.mkdir(parents=True, exist_ok=True)
+
+RUN_ID      = "POL_direct_noparent_iter1_v0"
+RUN_COMMENT = "Alert -> Policy, full cross-join over PUBL policies, no parentage/golden"
+
+# --- Team cost file (same format as earlier runs) ----------------------------
+COST_DIR = PROJECT_OUTPUT_DIR / "cost"; COST_DIR.mkdir(parents=True, exist_ok=True)
+STAFF_ID = globals().get("STAFF_ID", "<staff_id>")      # bind upstream or set here
+
+_COST_RUN_ID_FILE = CKPT_DIR / "cost_run_id.txt"
+if _COST_RUN_ID_FILE.exists():
+    COST_RUN_ID = _COST_RUN_ID_FILE.read_text().strip()
+else:
+    COST_RUN_ID = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    _COST_RUN_ID_FILE.write_text(COST_RUN_ID)
+COST_PARQUET = COST_DIR / f"cost_log_{COST_RUN_ID}.parquet"
+
+# --- Path sanity check ------------------------------------------------------
+for _name, _p in [("POLICY", POLICY_FILE), ("RAPID2", RAPID2_FILE),
+                  ("PROMPT", POLICY_PROMPT_PATH)]:
+    print(f"{_name:12s} {'OK     ' if _p.exists() else 'MISSING'} {_p}")
+print(f"{'OUTPUT':12s} {OUTPUT_DIR.resolve()}")
+print(f"{'COST':12s} {COST_PARQUET}")
+
+
+# %% ==========================================================================
+# [0b] COST LEDGER -- unchanged from the earlier lanes
+# =============================================================================
+PRICING = {
+    MODEL:       {"in": None, "cached_in": None, "out": None},
+    EMBED_MODEL: {"in": None, "cached_in": None, "out": 0.0},
+}
+EMBED_COST_LOGGED_UPSTREAM = False
+COST_KIND_MAP = {"embedding": "emb", "chat": "chat"}
+
+COST_LEDGER       = OUTPUT_DIR / "cost_ledger.jsonl"
+COST_FILE         = OUTPUT_DIR / f"cost_log_{MODEL}.csv"
+COST_SUMMARY_FILE = OUTPUT_DIR / f"cost_summary_{MODEL}.csv"
+
+_COST_SESSION = {"calls": 0, "usd": 0.0, "unpriced_calls": 0}
+
+for _m, _p in PRICING.items():
+    if _p.get("in") is None:
+        print(f"[0b] WARNING no price for '{_m}' -- tokens will be logged, cost left blank.")
+
+
+def _append_jsonl(path, obj):
+    path = Path(path)
+    if path.exists() and path.stat().st_size:
+        with open(path, "rb") as fh:
+            fh.seek(-1, os.SEEK_END)
+            needs_nl = fh.read(1) != b"\n"
+        if needs_nl:
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write("\n")
+    with open(path, "a", encoding="utf-8") as fh:
+        fh.write(json.dumps(obj, ensure_ascii=False, default=str) + "\n")
+        fh.flush(); os.fsync(fh.fileno())
+
+
+def _read_jsonl(path):
+    out = []
+    if not Path(path).exists():
+        return out
+    with open(path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                print(f"    [jsonl] dropping one torn line in {Path(path).name}")
+    return out
+
+
+try:
+    import tiktoken
+    _ENC = tiktoken.get_encoding("o200k_base")
+    TOKEN_ESTIMATOR = "tiktoken:o200k_base"
+except Exception:
+    _ENC = None
+    TOKEN_ESTIMATOR = "chars/4"
+
+
+def _count_tokens(text) -> int:
+    if not isinstance(text, str) or not text:
+        return 0
+    if _ENC is not None:
+        try:
+            return len(_ENC.encode(text, disallowed_special=()))
+        except Exception:
+            pass
+    return max(1, len(text) // 4)
+
+
+def _usd(model, prompt_tokens=0, cached_tokens=0, completion_tokens=0):
+    p = PRICING.get(model)
+    if not p or p.get("in") is None:
+        return None
+    cached = int(cached_tokens or 0)
+    fresh  = max(int(prompt_tokens or 0) - cached, 0)
+    c_in   = p["in"] if p.get("cached_in") is None else p["cached_in"]
+    out    = p.get("out") or 0.0
+    return (fresh * p["in"] + cached * c_in + int(completion_tokens or 0) * out) / 1e6
+
+
+def log_cost(step, model, kind="chat", prompt_tokens=0, completion_tokens=0,
+             reasoning_tokens=0, cached_tokens=0, status="ok", estimated=False,
+             record_id=None, unit=None, attempt=None, n_items=None,
+             finish_reason=None, latency_s=None, error=None, note=None):
+    usd = _usd(model, prompt_tokens, cached_tokens, completion_tokens)
+    row = {"run_id": RUN_ID, "cost_run_id": COST_RUN_ID, "ts_epoch": time.time(),
+           "ts": datetime.now(timezone.utc).isoformat(),
+           "step": step, "kind": kind, "model": model, "status": status,
+           "attempt": attempt, "record_id": record_id, "unit": unit,
+           "n_items": n_items,
+           "prompt_tokens": int(prompt_tokens or 0),
+           "cached_tokens": int(cached_tokens or 0),
+           "completion_tokens": int(completion_tokens or 0),
+           "reasoning_tokens": int(reasoning_tokens or 0),
+           "finish_reason": finish_reason,
+           "latency_s": None if latency_s is None else round(latency_s, 3),
+           "estimated": bool(estimated), "cost_usd": usd,
+           "error": None if error is None else str(error)[:500], "note": note}
+    _append_jsonl(COST_LEDGER, row)
+    _COST_SESSION["calls"] += 1
+    if usd is None:
+        _COST_SESSION["unpriced_calls"] += 1
+    else:
+        _COST_SESSION["usd"] += usd
+    return row
+
+
+def _usage_fields(u):
+    if u is None:
+        return dict(prompt_tokens=0, completion_tokens=0,
+                    reasoning_tokens=0, cached_tokens=0)
+    ctd = getattr(u, "completion_tokens_details", None)
+    ptd = getattr(u, "prompt_tokens_details", None)
+    return dict(
+        prompt_tokens=getattr(u, "prompt_tokens", 0) or 0,
+        completion_tokens=getattr(u, "completion_tokens", 0) or 0,
+        reasoning_tokens=(getattr(ctd, "reasoning_tokens", 0) or 0) if ctd else 0,
+        cached_tokens=(getattr(ptd, "cached_tokens", 0) or 0) if ptd else 0)
+
+
+async def chat_with_cost(step, messages, call_kwargs, parse=None, *,
+                         record_id=None, unit=None, attempt=1, n_items=None):
+    model = call_kwargs.get("model", MODEL)
+    t0 = time.time()
+    try:
+        token = await tok.get()
+        r = await oai.chat.completions.create(
+            messages=messages,
+            extra_headers={"Authorization": f"Bearer {token}"},
+            **call_kwargs)
+    except Exception as e:
+        log_cost(step, model, status="call_error", record_id=record_id, unit=unit,
+                 attempt=attempt, n_items=n_items, latency_s=time.time() - t0,
+                 error=f"{type(e).__name__}: {e}")
+        raise
+
+    u  = _usage_fields(getattr(r, "usage", None))
+    fr = r.choices[0].finish_reason if getattr(r, "choices", None) else None
+    parsed, status, err = r, "ok", None
+    if parse is not None:
+        try:
+            parsed = parse(r)
+        except Exception as e:
+            status, err = "parse_error", f"{type(e).__name__}: {e}"
+    log_cost(step, model, status=status, record_id=record_id, unit=unit,
+             attempt=attempt, n_items=n_items, finish_reason=fr,
+             latency_s=time.time() - t0, error=err, **u)
+    if err:
+        raise ValueError(f"[{step}] unparseable response (finish_reason={fr}): {err}")
+    return parsed, u
+
+
+def embed_with_cost(step, ids, texts, cache_tag):
+    t0 = time.time()
+    try:
+        vecs = embed_cache(ids, texts, cache_tag)
+    except Exception as e:
+        log_cost(step, EMBED_MODEL, kind="embedding", status="call_error",
+                 n_items=len(texts), latency_s=time.time() - t0,
+                 error=f"{type(e).__name__}: {e}", note=f"cache_tag={cache_tag}")
+        raise
+    if EMBED_COST_LOGGED_UPSTREAM:
+        return vecs
+    n_tok = int(sum(_count_tokens(t) for t in texts))
+    log_cost(step, EMBED_MODEL, kind="embedding", prompt_tokens=n_tok,
+             estimated=True, n_items=len(texts), latency_s=time.time() - t0,
+             note=f"cache_tag={cache_tag}; {TOKEN_ESTIMATOR}; upper bound (cache hits free)")
+    return vecs
+
+
+def write_team_cost_file(verbose=False):
+    rows = [r for r in _read_jsonl(COST_LEDGER) if r.get("cost_run_id") == COST_RUN_ID]
+    df = pd.DataFrame(rows)
+    if not len(df):
+        return None
+    df = df[(df.prompt_tokens > 0) | (df.completion_tokens > 0)]
+    usd = [_usd(m, p, c, o) for m, p, c, o in zip(df.model, df.prompt_tokens,
+                                                   df.cached_tokens, df.completion_tokens)]
+    run_total = None if any(u is None for u in usd) else float(sum(usd))
+    out = pd.DataFrame({
+        "kind":         df["kind"].map(COST_KIND_MAP).fillna(df["kind"]).values,
+        "in":           df["prompt_tokens"].astype("int64").values,
+        "out":          df["completion_tokens"].astype("int64").values,
+        "ts":           df["ts_epoch"].astype("float64").values,
+        "use_case":     USE_CASE,
+        "staff_id":     STAFF_ID,
+        "run_id":       COST_RUN_ID,
+        "run_cost_usd": run_total,
+    })
+    tmp = COST_PARQUET.with_suffix(".parquet.tmp")
+    out.to_parquet(tmp, index=False)
+    os.replace(tmp, COST_PARQUET)
+    if verbose:
+        print(f"    [cost] {len(out):,} rows {out.kind.value_counts().to_dict()} "
+              f"run_cost_usd={'unpriced' if run_total is None else f'{run_total:.6f}'}"
+              f" -> {COST_PARQUET.name}")
+    return out
+
+
+def _spend_line():
+    s = _COST_SESSION
+    tail = f" (+{s['unpriced_calls']} unpriced)" if s["unpriced_calls"] else ""
+    return f"session spend ${s['usd']:.4f} over {s['calls']:,} calls{tail}"
+
+
+# %% ==========================================================================
+# [A] DATA LOAD -- policies + alerts ONLY. No policy_links, no golden.
+# =============================================================================
+# Column names match GPPS_Policy_Text_Data_Prep.py's actual master output
+# (one row per policy, across all 54 country tables + Global, PUBL-only).
+# Three fields that earlier extracts carried don't exist in this one;
+# load_policies() synthesizes them right after the read so the rest of this
+# dict and the eligibility logic below need no further changes:
+#   - global_policy_key : built as Country + "_" + policy_core_id, since
+#     policy_core_id alone is only unique WITHIN its own country's table.
+#   - used_fallback_non_publ : always False -- this data-prep filters to
+#     versStatCde == "PUBL" with no fallback to a draft version.
+#   - policyDocType : not in the keep-list -- synthesized as "".
+POLICY_RENAME = {
+    "global_policy_key":      "POLICY_ID",
+    "policy_core_id":         "POL_CORE_ID",   # kept for reference only -- nothing
+                                                # downstream in this script joins on it
+    "Country":                "POL_COUNTRY",
+    "version_num":            "VERSION_NUM",
+    "versStatCde":            "POL_STATUS",
+    "versActlPublDt":         "PUBL_DATE",
+    "policyRiskTypePrimary":  "POL_RISK_TYPE",
+    "riskTxnmyL2Text":        "POL_TAX_L2",
+    "region":                 "POL_REGION",
+    "policyDocType":          "POL_DOC_TYPE",
+    "policyTitle":            "POL_TITLE",
+    "policyPurpose":          "POL_PURPOSE",
+    "policyText":             "POL_TEXT",
+    "used_fallback_non_publ": "POL_FALLBACK",
+    # "segment":               "SEGMENT_TEXT",  # available in the data-prep output,
+                                                 # not wired in -- see POLICY_TEXT_FIELDS below
+}
+PUBLISHED_CODE        = "PUBL"
+POLICY_TEXT_MAX_CHARS = 12_000
+
+# This extract spans multiple countries' GPPS tables. Set this once you've
+# confirmed the values POL_COUNTRY actually takes (e.g. {"US", "AA"}).
+# None = no filter (keep every country).
+POLICY_COUNTRY_FILTER = None
+
+POLICY_TEXT_FIELDS = [
+    ("POL_TITLE",     "Policy Title"),
+    ("POL_RISK_TYPE", "Primary Risk Type"),
+    ("POL_TAX_L2",    "Risk Taxonomy L2"),
+    ("POL_COUNTRY",   "Country"),
+    ("POL_REGION",    "Region"),
+    ("POL_DOC_TYPE",  "Policy Doc Type"),
+    ("POL_PURPOSE",   "Purpose"),
+    ("POL_TEXT",      "Policy Text"),       # kept last; this one gets truncated
+    # ("SEGMENT_TEXT", "Segment Text"),     # <- uncomment once wired into POLICY_RENAME
+]
+POLICY_TEXT_COLS = [c for c, _ in POLICY_TEXT_FIELDS]
+
+_BLANK = {"", "NONE", "NAN", "-", "NAT", "<NA>"}
+
+
+def _read_parquet(path, columns=None) -> pd.DataFrame:
+    try:
+        return pd.read_parquet(path, columns=columns)
+    except TypeError as e:
+        if "not understood" not in str(e):
+            raise
+    try:
+        import db_dtypes  # noqa: F401
+        return pd.read_parquet(path, columns=columns)
+    except (ImportError, TypeError):
+        pass
+    import pyarrow.parquet as pq
+    df = pq.read_table(path, columns=columns).to_pandas(ignore_metadata=True)
+    return df.drop(columns=[c for c in df.columns if str(c).startswith("__index_level_")])
+
+
+def _read_any(path: Path, usecols=None) -> pd.DataFrame:
+    suffix = Path(path).suffix.lower()
+    if suffix == ".parquet":
+        df = _read_parquet(path, columns=usecols)
+    elif suffix in (".xlsx", ".xls"):
+        df = pd.read_excel(path)
+        if usecols:
+            df = df[[c for c in usecols if c in df.columns]]
+    else:
+        df = pd.read_csv(path)
+    df.columns = [str(c).strip() for c in df.columns]
+    return df
+
+
+def _norm_id(series) -> pd.Series:
+    return (pd.Series(series).astype(str).str.strip().str.upper()
+              .str.replace(r"\.0+$", "", regex=True))
+
+
+def _nid(x) -> str:
+    return re.sub(r"\.0+$", "", str(x).strip().upper())
+
+
+def _as_text(v) -> str:
+    if isinstance(v, (list, tuple, np.ndarray)):
+        return "; ".join(t for t in (_as_text(x) for x in v) if t)
+    try:
+        if pd.isna(v):
+            return ""
+    except (TypeError, ValueError):
+        pass
+    return str(v)
+
+
+def _as_bool(v) -> bool:
+    if isinstance(v, (bool, np.bool_)):
+        return bool(v)
+    return str(v).strip().upper() in {"TRUE", "1", "YES", "Y"}
+
+
+def _clean_field(v) -> str:
+    s = html.unescape(html.unescape(_as_text(v)))
+    s = re.sub(r"<[^>]+>", " ", s)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def _truncate(s: str, n: int = None) -> str:
+    n = n or POLICY_TEXT_MAX_CHARS
+    if len(s) <= n:
+        return s
+    return s[:n].rsplit(" ", 1)[0] + " [... policy text truncated]"
+
+
+def load_policies():
+    """One row per policy with a judgeable `policy_text`, from
+    GPPS_Policy_Text_Data_Prep_Master.xlsx.
+
+    POLICY_ID = global_policy_key (Country + "_" + policy_core_id), the only
+    field guaranteed unique across the multi-country pool. Kept rows are
+    POL_STATUS == 'PUBL' (always true here, since the data-prep already
+    filtered to PUBL-only with no fallback); duplicates (shouldn't occur,
+    this extract is meant to be one row per policy already) are broken by
+    VERSION_NUM desc, then PUBL_DATE desc, then longest body.
+
+    Returns (policies_df, ids_any_status)."""
+    raw = _read_any(POLICY_FILE)
+    raw["global_policy_key"]      = raw["Country"].astype(str) + "_" + raw["policy_core_id"].astype(str)
+    raw["used_fallback_non_publ"] = False
+    raw["policyDocType"]          = ""
+    raw = raw.rename(columns=POLICY_RENAME)
+    missing = [c for c in POLICY_RENAME.values() if c not in raw.columns]
+    if missing:
+        raise KeyError(f"policy extract missing {missing}; columns are {list(raw.columns)}")
+
+    raw["POLICY_ID"]    = _norm_id(raw["POLICY_ID"])
+    raw["POL_CORE_ID"]  = _norm_id(raw["POL_CORE_ID"])
+    raw = raw[~raw.POLICY_ID.isin(_BLANK)].copy()
+    raw["POL_COUNTRY"]  = raw["POL_COUNTRY"].map(_clean_field)
+    raw["POL_STATUS"]   = raw["POL_STATUS"].astype(str).str.strip().str.upper()
+    raw["VERSION_NUM"]  = pd.to_numeric(raw["VERSION_NUM"], errors="coerce")
+    raw["PUBL_DATE"]    = pd.to_datetime(raw["PUBL_DATE"], errors="coerce")
+    raw["POL_FALLBACK"] = raw["POL_FALLBACK"].map(_as_bool)
+    ids_any_status = set(raw.POLICY_ID)
+
+    if POLICY_COUNTRY_FILTER:
+        before = len(raw)
+        raw = raw[raw.POL_COUNTRY.str.upper().isin(
+            {c.upper() for c in POLICY_COUNTRY_FILTER})].copy()
+        print(f"[A] policy extract: POLICY_COUNTRY_FILTER kept {len(raw):,} of {before:,} rows")
+
+    eligible = raw[raw.POL_STATUS.eq(PUBLISHED_CODE) | raw.POL_FALLBACK].copy()
+    dup_rows = int(eligible.POLICY_ID.duplicated().sum())
+    eligible["_len"] = eligible["POL_TEXT"].map(lambda v: len(_as_text(v)))
+    pol = (eligible.sort_values(["VERSION_NUM", "PUBL_DATE", "_len"],
+                               ascending=False, na_position="last")
+                   .drop_duplicates("POLICY_ID").drop(columns="_len").copy())
+
+    for c in POLICY_TEXT_COLS:
+        pol[c] = pol[c].map(_clean_field)
+
+    pol["body_chars"]     = pol["POL_TEXT"].str.len()
+    pol["text_truncated"] = pol["body_chars"] > POLICY_TEXT_MAX_CHARS
+
+    pieces = []
+    for col, label in POLICY_TEXT_FIELDS:
+        vals = pol[col].map(_truncate) if col == "POL_TEXT" else pol[col]
+        pieces.append(f"{label}:- " + vals)
+    pol["policy_text"] = pieces[0]
+    for piece in pieces[1:]:
+        pol["policy_text"] = pol["policy_text"] + "\n\n" + piece
+    pol["policy_text"] = pol["policy_text"].map(clean)
+
+    print(f"[A] policy extract: rows={len(raw):,}  eligible ({PUBLISHED_CODE}) rows="
+          f"{len(eligible):,}  duplicates collapsed={dup_rows:,}  -> policies={len(pol):,}  "
+          f"(ids any status={len(ids_any_status):,})")
+
+    keep = ["POLICY_ID", "POL_CORE_ID", "POL_COUNTRY", "POL_TITLE", "POL_RISK_TYPE",
+            "POL_TAX_L2", "POL_REGION", "POL_DOC_TYPE", "VERSION_NUM", "PUBL_DATE",
+            "POL_FALLBACK", "body_chars", "text_truncated", "policy_text"]
+    return pol[keep].reset_index(drop=True), ids_any_status
+
+
+def load_alerts(record_ids) -> pd.DataFrame:
+    """Build one cleaned alert text per record, restricted to the records we run."""
+    df = _read_parquet(RAPID2_FILE)
+
+    for col in ["TITLE", "SUMM_CONTENT", "SUMM_UPDATE",
+                "RECORD_JURISDICTION_CODE", "RECORD_JURISDICTION_NAME", "REGULATOR_CODE"]:
+        if col in df.columns:
+            df[col] = df[col].fillna("").map(clean)
+        else:
+            df[col] = ""
+
+    content_equals_update = df["SUMM_CONTENT"] == df["SUMM_UPDATE"]
+    df["alert_text"] = np.where(
+        content_equals_update,
+        (df.TITLE + "\n\n" + df.SUMM_CONTENT).str.strip(),
+        ("Title:- "                   + df.TITLE
+         + "\n\nContent:- "           + df.SUMM_CONTENT
+         + "\n\nUpdate:- "            + df.SUMM_UPDATE
+         + "\n\nJurisdiction Code:- " + df.RECORD_JURISDICTION_CODE
+         + "\n\nJurisdiction Name:- " + df.RECORD_JURISDICTION_NAME
+         + "\n\nRegulator Code:- "    + df.REGULATOR_CODE).str.strip())
+
+    df["RECORD_ID"] = _norm_id(df["RECORD_ID"])
+    df = df[df.RECORD_ID.isin(record_ids) & (df.alert_text.str.len() > 0)]
+    return df[["RECORD_ID", "alert_text"]].drop_duplicates("RECORD_ID").reset_index(drop=True)
+
+
+# ---- Execute the loads ------------------------------------------------------
+policies, policy_ids_any_status = load_policies()
+print("[A] loaded:", f"policies={len(policies):,}")
+
+
+# %% ==========================================================================
+# [A2] VALIDATION PROBE -- POLICY POOL ONLY (no golden/linkage to check here)
+# =============================================================================
+print("=" * 78); print("[A2] VALIDATION PROBE -- POLICY LANE"); print("=" * 78)
+_ln = policies.policy_text.str.len()
+print(f"  published policies with text : {len(policies):,}")
+print(f"  policy_text chars med/min/max: {int(_ln.median()):,} / {int(_ln.min()):,} / {int(_ln.max()):,}")
+print(f"  bodies truncated at {POLICY_TEXT_MAX_CHARS:,}    : {int(policies.text_truncated.sum()):,}")
+print(f"  policies with EMPTY body     : {int((policies.body_chars == 0).sum()):,}")
+print(f"  countries                    : {policies.POL_COUNTRY.value_counts().to_dict()}")
+print(f"  regions                       : {policies.POL_REGION.value_counts().to_dict()}")
+print("=" * 78)
+
+
+# %% ==========================================================================
+# [B1] CONFIG + MODEL PARAMS + CHECKPOINT CONFIG
+# =============================================================================
+with open(POLICY_PROMPT_PATH, "r") as fh:
+    POLICY_SYSTEM_PROMPT = fh.read()
+print(POLICY_SYSTEM_PROMPT[:600])
+PROMPT_SHA = hashlib.sha256(POLICY_SYSTEM_PROMPT.encode()).hexdigest()[:12]
+
+LANE = {
+    "top_k":              None,   # None -> judge EVERY published policy, every time.
+    "max_tokens":         50000,
+    "concurrency":        30,
+    "chunk":              10,
+    "max_retries":        3,
+    "reasoning":          "low",
+    "order_by_embedding": True,
+}
+JUDGE_LOGPROBS = False
+
+EST_OUT_TOKENS_PER_POLICY = 80
+PER_POLICY_JSON_OVERHEAD  = 15
+PER_CALL_MSG_OVERHEAD     = 30
+
+SNAPSHOT_EVERY  = 25
+MAX_PAIRS_GUARD = 400_000
+
+PLAN_FILE      = CKPT_DIR / "plan.json"
+VERDICTS_JSONL = CKPT_DIR / "verdicts.jsonl"
+STATE_FILE     = CKPT_DIR / "run_state.json"
+PARTIAL_FILE   = OUTPUT_DIR / f"policy_verdicts_partial_{MODEL}.parquet"
+FINAL_FILE     = OUTPUT_DIR / f"policy_verdicts_{MODEL}.parquet"
+
+DECISION_RANK   = {"LINKED": 4, "INSUFFICIENT_EVIDENCE": 3, "NOT_LINKED": 2,
+                   "MISSING": 1, "ERROR": 0}
+
+
+# %% ==========================================================================
+# [P] DATA PROVENANCE FINGERPRINT
+# =============================================================================
+def _fp(path):
+    p = Path(path)
+    if not p.exists():
+        return f"MISSING: {p}"
+    st = p.stat()
+    return (f"{p.name:55s} modified "
+            f"{datetime.fromtimestamp(st.st_mtime, tz=timezone.utc):%Y-%m-%d %H:%M UTC}"
+            f"   size {st.st_size:,} B")
+
+
+def _hash_ids(series):
+    vals = sorted(set(str(v) for v in series if v is not None))
+    return hashlib.sha256("|".join(vals).encode()).hexdigest()[:12]
+
+
+def run_provenance_check(label):
+    print("=" * 78); print(f"[P] DATA PROVENANCE -- {label}"); print("=" * 78)
+    for lbl, path in [("POLICY_FILE", POLICY_FILE), ("RAPID2_FILE (alerts)", RAPID2_FILE),
+                      ("PROMPT_PATH", POLICY_PROMPT_PATH)]:
+        print(f"  {lbl:24s} {_fp(path)}")
+    print("-" * 78)
+    print(f"  policies      : {len(policies):,} rows | hash {_hash_ids(policies.POLICY_ID)}")
+    print(f"  MODEL         : {MODEL}   EMBED: {EMBED_MODEL}")
+    print(f"  prompt hash   : {PROMPT_SHA}   ({len(POLICY_SYSTEM_PROMPT):,} chars)")
+    if PLAN_FILE.exists():
+        _plan = json.loads(PLAN_FILE.read_text())
+        print(f"  plan built_at : {_plan.get('built_at')}   prompt_sha {_plan.get('prompt_sha')}")
+    else:
+        print("  plan.json     : not yet built")
+    print(f"  {'verdicts parquet':14s}: {_fp(FINAL_FILE)}")
+    print(f"  {'cost file':14s}: {_fp(COST_PARQUET)}")
+    print("=" * 78)
+
+
+run_provenance_check("BEFORE [C] -- baseline, nothing spent yet")
+
+
+# %% ==========================================================================
+# [B2] COST PROJECTION -- no parentage/funnel/reachability; nothing here
+# depends on a golden dataset.
+# =============================================================================
+def project_cost(records):
+    """Rough spend BEFORE the run. Candidates are the WHOLE published pool
+    for every record -- a true full cross-join -- so this is n_alert x n_policy."""
+    alerts_df = load_alerts(set(records))
+    n_alert, n_pol, chunk = len(alerts_df), len(policies), LANE["chunk"]
+    calls_per_alert = math.ceil(n_pol / chunk) if n_pol else 0
+
+    p_tok   = policies.policy_text.map(_count_tokens)
+    a_tok   = alerts_df.alert_text.map(_count_tokens)
+    sys_tok = _count_tokens(POLICY_SYSTEM_PROMPT)
+
+    fixed_per_alert = (calls_per_alert * (sys_tok + PER_CALL_MSG_OVERHEAD)
+                       + int(p_tok.sum()) + n_pol * PER_POLICY_JSON_OVERHEAD)
+    judge_in  = (n_alert * fixed_per_alert
+                 + int((a_tok * calls_per_alert).sum()))
+    judge_out = n_alert * n_pol * EST_OUT_TOKENS_PER_POLICY
+    worst_chunk_in = (sys_tok + int(a_tok.max() if len(a_tok) else 0)
+                      + int(p_tok.nlargest(chunk).sum()))
+    embed_tok = int(p_tok.sum() + a_tok.sum()) if LANE["order_by_embedding"] else 0
+
+    usd_judge = _usd(MODEL, judge_in, 0, judge_out)
+    usd_embed = _usd(EMBED_MODEL, embed_tok, 0, 0)
+    fmt = lambda x: "unpriced" if x is None else f"${x:,.2f}"
+
+    bar = "=" * 78
+    print(bar); print(f"[B2] COST PROJECTION  (tokens: {TOKEN_ESTIMATOR})"); print(bar)
+    print(f"  alerts x policies (full cross-join): {n_alert:,} x {n_pol:,}")
+    print(f"  judge calls (chunk={chunk})              : {n_alert * calls_per_alert:,}")
+    print(f"  policy tokens  median / max        : "
+          f"{int(p_tok.median()):,} / {int(p_tok.max()):,}")
+    print(f"  WORST-CASE input per call           : {worst_chunk_in:,} tokens"
+          "   <- lower chunk if this nears the context limit")
+    print(f"  judge  in / out tokens              : {judge_in:,} / {judge_out:,}  -> {fmt(usd_judge)}")
+    print(f"  embeddings (upper bound)            : {embed_tok:,}  -> {fmt(usd_embed)}")
+    if usd_judge is not None:
+        print(f"  judge cost per alert                : ${usd_judge/max(n_alert,1):.4f}")
+    return {"judge_in": judge_in, "judge_out": judge_out,
+            "calls": n_alert * calls_per_alert,
+            "usd_judge": usd_judge, "usd_embed": usd_embed, "pairs": n_alert * n_pol}
+
+
+# %% ==========================================================================
+# [A1] SCOPE -- which records this run judges.
+#   "all"  -> every alert in the extract (default -- no golden to restrict to)
+#   "csv"  -> an explicit list you drop at SCOPE_CSV
+# Pinned to SCOPE_CSV on first run; later runs reuse it unless SCOPE_FORCE=True.
+# =============================================================================
+SCOPE_MODE  = "all"
+SCOPE_FORCE = False
+SCOPE_CSV   = OUTPUT_DIR / "scope_records.csv"
+
+
+def resolve_scope(mode=SCOPE_MODE, force=SCOPE_FORCE, save=True):
+    bar = "=" * 78
+    print(bar); print("[A1] SCOPE"); print(bar)
+    alert_ids = set(_norm_id(_read_parquet(RAPID2_FILE, columns=["RECORD_ID"])["RECORD_ID"]))
+
+    if SCOPE_CSV.exists() and not force:
+        scope = set(_norm_id(pd.read_csv(SCOPE_CSV, dtype=str)["RECORD_ID"]))
+        src, save = f"pinned {SCOPE_CSV.name}", False
+    elif mode == "all":
+        scope, src = alert_ids, "all alerts"
+    elif mode == "csv":
+        raise FileNotFoundError(f"SCOPE_MODE='csv' but {SCOPE_CSV} does not exist.")
+    else:
+        raise ValueError(f"unknown SCOPE_MODE '{mode}' (no 'golden' mode -- no golden dataset here)")
+
+    if save:
+        pd.DataFrame({"RECORD_ID": sorted(scope)}).to_csv(SCOPE_CSV, index=False)
+        print(f"  scope saved                  : {SCOPE_CSV}")
+    print(f"  ==> SCOPE = {len(scope):,} records   (source: {src})")
+    return scope
+
+
+# ---- Execute -----------------------------------------------------------------
+scope_records = resolve_scope()
+
+# >>> First pass: run on a handful of records before scaling up. <<<
+# scope_records = set(sorted(scope_records)[:10])
+
+projection = project_cost(scope_records)
+
+
+# %% ==========================================================================
+# [C] WORK PLAN + CHECKPOINTED MODEL EXECUTION (concurrent, resumable)
+# Unchanged from the earlier lane -- this is the actual linking logic.
+# =============================================================================
+POLICY_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "policy_linkage", "strict": True,
+        "schema": {
+            "type": "object", "additionalProperties": False, "required": ["items"],
+            "properties": {"items": {"type": "array", "items": {
+                "type": "object", "additionalProperties": False,
+                "required": ["policy_id", "decision", "relevance_score", "reasoning"],
+                "properties": {
+                    "policy_id":       {"type": "string"},
+                    "decision":        {"type": "string",
+                                        "enum": ["LINKED", "NOT_LINKED", "INSUFFICIENT_EVIDENCE"]},
+                    "relevance_score": {"type": "integer"},
+                    "reasoning":       {"type": ["string", "null"]},
+                }}}}}
+    }
+}
+
+
+def load_completed():
+    done, rows = set(), []
+    for rec in _read_jsonl(VERDICTS_JSONL):
+        key = rec.get("unit")
+        if key is None or key in done:
+            continue
+        done.add(key)
+        rows.extend(rec.get("rows", []))
+    return done, rows
+
+
+def _snapshot(rows, n_done, n_total):
+    df = pd.DataFrame(rows).drop_duplicates(["RECORD_ID", "POLICY_ID"])
+    df.to_parquet(PARTIAL_FILE, index=False)
+    STATE_FILE.write_text(json.dumps({
+        "run_id": RUN_ID, "units_done": n_done, "units_total": n_total,
+        "rows": len(df), "session_usd": round(_COST_SESSION["usd"], 6),
+        "updated": datetime.now(timezone.utc).isoformat()}))
+    write_team_cost_file()
+    print(f"    [ckpt] {n_done}/{n_total} units, {len(df):,} rows -> "
+          f"{PARTIAL_FILE.name} | {_spend_line()}")
+
+
+def _finalise(rows):
+    df = pd.DataFrame(rows)
+    if len(df):
+        df["_r"] = df.decision.astype(str).str.upper().map(DECISION_RANK).fillna(-1)
+        df = (df.sort_values("_r", ascending=False)
+                .drop_duplicates(["RECORD_ID", "POLICY_ID"])
+                .drop(columns="_r").reset_index(drop=True))
+    df.to_parquet(FINAL_FILE, index=False)
+    n_linked = int((df.decision.astype(str).str.upper() == "LINKED").sum()) if len(df) else 0
+    print(f"[C] verdicts: {len(df):,}  linked: {n_linked:,}  -> {FINAL_FILE}")
+    write_team_cost_file(verbose=True)
+    print(f"[C] {_spend_line()}")
+    return df
+
+
+def build_plan(records, top_k=None, chunk=None, force=False):
+    """Candidates = EVERY published policy, for EVERY record -- a true full
+    cross-join. Embeddings (if enabled) only order the chunk sequence; with
+    top_k=None nothing is dropped."""
+    chunk = chunk or LANE["chunk"]
+
+    if PLAN_FILE.exists() and not force:
+        plan = json.loads(PLAN_FILE.read_text())
+        print(f"[C] plan loaded from checkpoint: {len(plan['units']):,} units, "
+              f"{len(plan['records']):,} records, chunk={plan['chunk']}")
+        if plan.get("prompt_sha") != PROMPT_SHA:
+            print(f"[C] WARNING prompt changed since the plan was built "
+                  f"({plan.get('prompt_sha')} -> {PROMPT_SHA}). Start a new "
+                  f"EXECUTION_OUTPUT_DIR for a clean run.")
+        return plan
+
+    pol_text_by_id = {p: t for p, t in zip(policies.POLICY_ID, policies.policy_text)
+                      if isinstance(t, str) and t.strip()}
+    alerts_df = load_alerts(set(records))
+    alert_text_by_id = dict(zip(alerts_df.RECORD_ID, alerts_df.alert_text))
+
+    dropped = set(records) - set(alert_text_by_id)
+    if dropped:
+        print(f"[C] WARNING {len(dropped)} scoped records have no alert text and are "
+              f"dropped: {sorted(dropped)[:5]}")
+
+    full_pool = list(pol_text_by_id)
+    rec_list  = [rid for rid in sorted(records) if rid in alert_text_by_id]
+    cand_by_rec = {rid: list(full_pool) for rid in rec_list}
+
+    if not full_pool:
+        raise ValueError(f"No published policies with text (pool empty). "
+                         f"alerts in scope={len(alert_text_by_id)}")
+
+    used_embeddings = False
+    if LANE["order_by_embedding"]:
+        try:
+            pool = sorted(pol_text_by_id)
+            pol_vecs = embed_with_cost("embed_policies", pool,
+                                       [pol_text_by_id[p] for p in pool],
+                                       "gpps_policies_v1")
+            alert_vecs = embed_with_cost("embed_alerts", rec_list,
+                                         [alert_text_by_id[r] for r in rec_list],
+                                         "alerts_policy_lane")
+            P, A = np.asarray(pol_vecs), np.asarray(alert_vecs)
+            ppos = {p: i for i, p in enumerate(pool)}
+            for i, rid in enumerate(rec_list):
+                child = cand_by_rec[rid]
+                sims  = P[[ppos[p] for p in child]] @ A[i]
+                order = np.argsort(-sims) if top_k is None else np.argsort(-sims)[:top_k]
+                cand_by_rec[rid] = [child[j] for j in order]
+            used_embeddings = True
+        except Exception as e:
+            print(f"[C] embedding ordering skipped ({type(e).__name__}: {e}); linkage order.")
+    if not used_embeddings and top_k:
+        cand_by_rec = {r: c[:top_k] for r, c in cand_by_rec.items()}
+
+    units = []
+    for rid in rec_list:
+        cands = cand_by_rec[rid]
+        for i in range(0, len(cands), chunk):
+            units.append([rid, i // chunk, cands[i:i + chunk]])
+
+    total_pairs = sum(len(u[2]) for u in units)
+    if total_pairs > MAX_PAIRS_GUARD:
+        raise ValueError(f"plan would judge {total_pairs:,} pairs (> MAX_PAIRS_GUARD="
+                         f"{MAX_PAIRS_GUARD:,}). Set LANE['top_k'] for a smoke run, or "
+                         f"raise the guard deliberately.")
+
+    plan = {"run_id": RUN_ID, "comment": RUN_COMMENT, "model": MODEL,
+            "chunk": chunk, "top_k": top_k,
+            "built_at": datetime.now(timezone.utc).isoformat(),
+            "prompt_sha": PROMPT_SHA,
+            "records": cand_by_rec, "units": units}
+    PLAN_FILE.write_text(json.dumps(plan))
+    write_team_cost_file()
+    print(f"[C] plan built: {len(units):,} units over {len(rec_list):,} records, "
+          f"{total_pairs:,} pairs, chunk={chunk}, "
+          f"ordering={'cosine' if used_embeddings else 'linkage order'}")
+    return plan
+
+
+def _judge_call_kwargs():
+    kw = {"model": MODEL, "user": USE_CASE, "response_format": POLICY_SCHEMA}
+    if JUDGE_LOGPROBS:
+        kw["logprobs"] = True; kw["top_logprobs"] = 5
+    if "gemini" in MODEL.lower():
+        kw.update(temperature=0.0, seed=42,
+                  reasoning_effort=LANE["reasoning"], max_tokens=LANE["max_tokens"])
+    else:
+        kw.update(reasoning_effort=LANE["reasoning"],
+                  max_completion_tokens=LANE["max_tokens"])
+    return kw
+
+
+def _parse_items(r):
+    return json.loads(r.choices[0].message.content)["items"]
+
+
+async def _judge_one_chunk(alert_text, policy_chunk, rid=None, unit=None):
+    payload = {"alert_text": alert_text,
+               "policies": [{"policy_id": p, "policy_text": t} for p, t in policy_chunk]}
+    messages = [{"role": "system", "content": POLICY_SYSTEM_PROMPT},
+                {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}]
+    last_err = None
+    for attempt in range(1, LANE["max_retries"] + 1):
+        try:
+            items, _ = await chat_with_cost(
+                "judge", messages, _judge_call_kwargs(), parse=_parse_items,
+                record_id=rid, unit=unit, attempt=attempt, n_items=len(policy_chunk))
+            return items, None
+        except Exception as e:
+            last_err = e
+            if "401" in str(e) or "unauth" in str(e).lower():
+                try:
+                    await tok.invalidate()
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5 ** attempt)
+
+    return ([{"policy_id": p, "decision": "ERROR", "relevance_score": 0,
+              "reasoning": f"n/a: {last_err}"} for p, _ in policy_chunk], last_err)
+
+
+async def run_policy_linkage(plan, resume=True):
+    """Execute the plan with checkpointing. Safe to call repeatedly."""
+    pol_text_by_id   = dict(zip(policies.POLICY_ID, policies.policy_text))
+    alerts_df        = load_alerts(set(plan["records"]))
+    alert_text_by_id = dict(zip(alerts_df.RECORD_ID, alerts_df.alert_text))
+
+    done, rows_on_disk = (load_completed() if resume else (set(), []))
+    pending = [(rid, idx, cands) for rid, idx, cands in plan["units"]
+               if f"{rid}#{idx}" not in done]
+
+    print(f"[C] units total={len(plan['units']):,}  done={len(done):,}  "
+          f"pending={len(pending):,}  (rows already on disk: {len(rows_on_disk):,})")
+    if not pending:
+        print("[C] nothing pending -- assembling from checkpoint.")
+        return _finalise(rows_on_disk)
+
+    sem       = asyncio.Semaphore(LANE["concurrency"])
+    write_lok = asyncio.Lock()
+    counter   = {"n": len(done), "rows": list(rows_on_disk)}
+
+    async def _one(rid, idx, pol_ids):
+        key = f"{rid}#{idx}"
+        async with sem:
+            pairs = [(p, pol_text_by_id.get(p, "")) for p in pol_ids]
+            items, _err = await _judge_one_chunk(alert_text_by_id.get(rid, ""), pairs,
+                                                 rid=rid, unit=key)
+            got = {_nid(it.get("policy_id", "")): it for it in items}
+            rows = []
+            for pid, _ in pairs:
+                it = got.get(pid)
+                rows.append({"RECORD_ID": rid, "POLICY_ID": pid,
+                             "decision": (it or {}).get("decision", "MISSING"),
+                             "relevance_score": (it or {}).get("relevance_score", 0),
+                             "reasoning": (it or {}).get("reasoning")})
+        async with write_lok:
+            _append_jsonl(VERDICTS_JSONL, {"unit": key, "ts": time.time(), "rows": rows})
+            counter["n"] += 1
+            counter["rows"].extend(rows)
+            if counter["n"] % SNAPSHOT_EVERY == 0:
+                _snapshot(counter["rows"], counter["n"], len(plan["units"]))
+        return len(rows)
+
+    tasks = [asyncio.create_task(_one(rid, idx, c)) for rid, idx, c in pending]
+    try:
+        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="judge units"):
+            await fut
+    except BaseException:
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _snapshot(counter["rows"], counter["n"], len(plan["units"]))
+        print(f"[C] INTERRUPTED at {counter['n']}/{len(plan['units'])} units. "
+              f"Checkpoint intact -- re-run cells [0] -> [C] to finish.")
+        raise
+    return _finalise(counter["rows"])
+
+
+# ---- Execute -----------------------------------------------------------------
+plan = build_plan(scope_records, top_k=LANE["top_k"])
+
+verdicts = await run_policy_linkage(plan)
+
+_led = pd.DataFrame([r for r in _read_jsonl(COST_LEDGER)
+                     if r.get("run_id") == RUN_ID and r.get("step") == "judge"])
+if len(_led):
+    print("[C] judge attempts by status:", _led.status.value_counts().to_dict(),
+          "| finish_reason:", _led.finish_reason.value_counts(dropna=False).to_dict())
+
+
+# %% ==========================================================================
+# [E] LINKED-ONLY CONVENIENCE OUTPUT
+# `verdicts` already has one row per judged (alert, policy) pair, every
+# decision included. This is just the subset you actually asked for --
+# "the alert linked to the policies".
+# =============================================================================
+linked = (
+    verdicts[verdicts.decision.astype(str).str.upper() == "LINKED"]
+    .merge(policies[["POLICY_ID", "POL_TITLE", "POL_COUNTRY"]], on="POLICY_ID", how="left")
+    .sort_values(["RECORD_ID", "relevance_score"], ascending=[True, False])
+    .reset_index(drop=True)
+)
+LINKED_FILE = OUTPUT_DIR / f"policy_links_LINKED_only_{MODEL}.parquet"
+linked.to_parquet(LINKED_FILE, index=False)
+print(f"[E] {len(linked):,} LINKED alert-policy pairs over "
+      f"{linked.RECORD_ID.nunique():,} alerts -> {LINKED_FILE}")
+display(linked.head(20))
