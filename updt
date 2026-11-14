@@ -782,13 +782,21 @@ def _snapshot(rows, n_done, n_total):
 
 def _best_verdicts(verdicts_df):
     """Collapse to the strongest decision per (record, policy) pair -- used
-    both at finalise time and by the [F] audit slice selector below."""
+    both at finalise time and by the [F] audit slice selector below.
+
+    NOTE: the helper columns are named `rank_` / `score_` (trailing
+    underscore), not `_r` / `_s` (leading underscore). select_audit_slice()
+    returns slices of this frame, and run_audit() iterates those slices
+    with `.itertuples()` -- pandas can't turn a *leading*-underscore column
+    into a namedtuple attribute (it silently falls back to a positional
+    name instead), so `row._s`-style access would crash downstream. A
+    trailing underscore is safe."""
     v = verdicts_df.copy()
     v["REC"], v["POL"] = _norm_id(v.RECORD_ID), _norm_id(v.POLICY_ID)
-    v["DEC"] = v.decision.astype(str).str.strip().str.upper()
-    v["_r"]  = v.DEC.map(DECISION_RANK).fillna(-1)
-    v["_s"]  = pd.to_numeric(v.relevance_score, errors="coerce").fillna(0)
-    return (v.sort_values(["REC", "_r", "_s"], ascending=[True, False, False])
+    v["DEC"]    = v.decision.astype(str).str.strip().str.upper()
+    v["rank_"]  = v.DEC.map(DECISION_RANK).fillna(-1)
+    v["score_"] = pd.to_numeric(v.relevance_score, errors="coerce").fillna(0)
+    return (v.sort_values(["REC", "rank_", "score_"], ascending=[True, False, False])
               .drop_duplicates(["REC", "POL"]))
 
 
@@ -1148,7 +1156,7 @@ def select_audit_slice(verdicts_df, which=AUDIT_SLICE, sample=AUDIT_SAMPLE,
     if which == "ambiguous_middle":
         lo, hi = score_band
         sl = v[(v.DEC == "INSUFFICIENT_EVIDENCE") |
-               (v.DEC.isin(["LINKED", "NOT_LINKED"]) & v._s.between(lo, hi))].copy()
+               (v.DEC.isin(["LINKED", "NOT_LINKED"]) & v.score_.between(lo, hi))].copy()
     elif which == "all_linked":
         sl = v[v.DEC == "LINKED"].copy()
     elif which == "sample":
@@ -1169,10 +1177,10 @@ async def run_audit(slice_df, alert_text_by_id, policy_text_by_id, concurrency=2
         async with sem:
             out = await _audit_one(alert_text_by_id.get(row.REC, ""),
                                    policy_text_by_id.get(row.POL, ""),
-                                   row.DEC, getattr(row, "reasoning", None), row._s,
+                                   row.DEC, getattr(row, "reasoning", None), row.score_,
                                    rid=row.REC, pid=row.POL)
             return {"REC": row.REC, "POL": row.POL, "model_decision": row.DEC,
-                    "model_relevance_score": row._s, **out}
+                    "model_relevance_score": row.score_, **out}
 
     tasks = [asyncio.create_task(_one(r)) for r in slice_df.itertuples()]
     out = []
