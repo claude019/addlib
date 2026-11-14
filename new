@@ -1,43 +1,46 @@
 # =============================================================================
-# ALERT -> POLICY LINKAGE  (full cross-join, cost-tracked, resumable)
-# NO PARENTAGE / NO GOLDEN / NO RECALL SCORING -- pure linking, nothing else.
+# ALERT -> POLICY DIRECT LINKAGE  (full cross-join, cost-tracked, resumable,
+# audited by a second, independent LLM)
 #
-# THE STORY THIS PIPELINE TELLS:
-#   Every alert is judged against EVERY published policy -- no RSM cascade, no
-#   candidate filtering, no golden-truth derivation. You get exactly one
-#   thing out the other end: a verdict (LINKED / NOT_LINKED /
-#   INSUFFICIENT_EVIDENCE / ERROR) for every (alert, policy) pair, plus a
-#   LINKED-only view for convenience.
+# This is the DIRECT lane, standalone -- NO routed-lane content at all. The
+# routed lane (record -> LINKED RSM -> IA_RSM_POLICY_Linkage -> Policy) is a
+# different pipeline entirely; nothing here loads IA_RSM_POLICY_Linkage,
+# builds parentage, or derives a record -> policy golden chain through it.
+# Candidates are, and only ever are, "every published policy, every alert."
 #
-# WHAT WAS REMOVED relative to the earlier direct_policy_linkage.py this was
-# built from -- all of it existed ONLY to measure recall against a golden
-# dataset, never to decide what the judge sees:
-#   - IA_RSM_POLICY_Linkage load (policy_links) -- existed only to derive
-#     REG_ID -> POLICY_ID for the golden chain
-#   - golden dataset load + derive_golden_policy() -- the record -> policy
-#     "answer key"
-#   - build_parentage() / print_funnel_report() -- reachability + funnel
-#     stats, all golden-dependent
-#   - [D]-[H]: scorecard, confusion matrix, LLM-judge audit, honest recall,
-#     by-policy breakdown, performance pack workbook -- all compare verdicts
-#     against golden; with no golden, there is nothing to compare against
-#   - SCOPE_MODE="golden" -- scope is now "all" (every alert in the extract)
-#     or "csv" (an explicit list you provide)
+# WHAT THIS MEANS FOR GOLDEN / RECALL, PLAINLY:
+#   GOLDEN_FILE (record -> REGULATION, hand-curated) still loads -- it's used
+#   ONLY to pick which alerts to run (SCOPE_MODE="golden"), not to build
+#   candidates and not to score recall. Without the routed lane's
+#   REG_ID -> POLICY_ID chain, there is no record -> POLICY golden here, so
+#   there is no recall number, no scorecard, no confusion matrix in this
+#   script. That isn't a bug to route around -- it's the direct consequence
+#   of not bringing routed-lane data in. If you get a proper policy-level
+#   golden some other way later, scoring can be added back; faking it from
+#   regulation-level golden alone would just reproduce the structural
+#   over-mapping problem the original file's comments warned about.
 #
-# WHAT'S UNCHANGED -- the actual linking machinery, verbatim:
-#   load_policies() (adapted for the new data-prep's column names -- see
-#   POLICY_RENAME), load_alerts(), the cost ledger (chat_with_cost /
-#   embed_with_cost / log_cost), build_plan() (full cross-join, optional
-#   embedding-based ordering, chunking, checkpointing), run_policy_linkage()
-#   (concurrent judge calls, resumable, crash-safe), _finalise().
+# WHAT "JUDGED BY AN INDEPENDENT LLM" MEANS HERE ([F]):
+#   A second LLM call re-reads each (alert, policy) pair independently --
+#   same two texts, none of the first judge's context except its decision --
+#   and says whether it AGREES or DISAGREES, and why. This is a genuine
+#   second opinion / QC pass, not a comparison against golden (there's no
+#   policy-level golden to compare against). Default slice is the AMBIGUOUS
+#   MIDDLE: every INSUFFICIENT_EVIDENCE verdict, plus LINKED/NOT_LINKED
+#   verdicts whose relevance_score falls in a borderline band -- exactly the
+#   cases most worth a second opinion. Switch AUDIT_SLICE to "all_linked" or
+#   "sample" if you'd rather audit something else; see [F].
 #
 # SECTIONS
 #   0.  Imports + paths + run id        0b. Cost ledger
-#   A.  Data load (policies + alerts)   A1. Scope           A2. Validation probe
+#   A.  Data load (policies, alerts, golden-for-scope-only)
+#   A1. Scope                           A2. Validation probe
 #   B1. Config + model params           B2. Cost projection
 #   P.  Provenance fingerprint
-#   C.  Work plan + checkpointed model execution
+#   C.  Work plan + checkpointed model execution  (the primary judge)
 #   E.  LINKED-only convenience output
+#   F.  Independent LLM audit layer (second opinion, no golden needed)
+#   G.  Wrap-up summary
 # =============================================================================
 
 
@@ -51,8 +54,8 @@ from pathlib import Path
 from datetime import datetime, timezone
 from tqdm.auto import tqdm
 
-import nest_asyncio                 # embed_with_cache calls run_until_complete
-nest_asyncio.apply()                # -> must patch the Jupyter loop first
+import nest_asyncio
+nest_asyncio.apply()
 
 pd.set_option("display.width", 220)
 pd.set_option("display.max_columns", 60)
@@ -62,31 +65,32 @@ oai         = openai_client
 tok         = trust_token
 MODEL       = CHAT_MODEL
 clean       = clean_text
-embed_cache = embed_with_cache       # (ids, texts, cache_tag) -> L2-normalised matrix
+embed_cache = embed_with_cache
 USE_CASE    = globals().get("USE_CASE", "alert_policy_linkage")
-EMBED_MODEL = globals().get("EMBED_MODEL", "gemini-embedding-001")   # cost attribution only
+EMBED_MODEL = globals().get("EMBED_MODEL", "gemini-embedding-001")
 
 # --- Paths ------------------------------------------------------------------
 DATA_DIR   = Path("/home/jovyan/data")
 REGMAP_DIR = DATA_DIR / "Tactical_Regmap_Data"
 
-PROJECT_OUTPUT_DIR   = Path("../output/execution_output/policy_linkage_no_parentage")
+PROJECT_OUTPUT_DIR   = Path("../output/execution_output/policy_linkage_direct")
 EXECUTION_OUTPUT_DIR = PROJECT_OUTPUT_DIR / "Iteration_1"
 
 POLICIES_DIR       = Path("/home/jovyan/codes/Policies")
 POLICY_FILE        = POLICIES_DIR / "GPPS_Policy_Text_Data_Prep_Master.xlsx"  # output of GPPS_Policy_Text_Data_Prep.py
+GOLDEN_FILE        = REGMAP_DIR / "golden_record_regulation.xlsx"  # <-- CONFIRM exact filename; record -> regulation only, used for SCOPE, nothing else
 RAPID2_FILE        = REGMAP_DIR / "Rapid2_REGDEV_US_2020_2025.parquet"
 POLICY_PROMPT_PATH = Path("/home/jovyan/prompt/policy_linkage/prompt_policy_linkage_v0.txt")
 
 OUTPUT_DIR = Path(EXECUTION_OUTPUT_DIR); OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 CKPT_DIR   = OUTPUT_DIR / "checkpoints";  CKPT_DIR.mkdir(parents=True, exist_ok=True)
 
-RUN_ID      = "POL_direct_noparent_iter1_v0"
-RUN_COMMENT = "Alert -> Policy, full cross-join over PUBL policies, no parentage/golden"
+RUN_ID      = "POL_direct_iter1_v0"
+RUN_COMMENT = "Alert -> Policy, full cross-join over PUBL policies, no routed-lane data, independent-LLM audit"
 
-# --- Team cost file (same format as earlier runs) ----------------------------
+# --- Team cost file -----------------------------------------------------------
 COST_DIR = PROJECT_OUTPUT_DIR / "cost"; COST_DIR.mkdir(parents=True, exist_ok=True)
-STAFF_ID = globals().get("STAFF_ID", "<staff_id>")      # bind upstream or set here
+STAFF_ID = globals().get("STAFF_ID", "<staff_id>")
 
 _COST_RUN_ID_FILE = CKPT_DIR / "cost_run_id.txt"
 if _COST_RUN_ID_FILE.exists():
@@ -96,8 +100,7 @@ else:
     _COST_RUN_ID_FILE.write_text(COST_RUN_ID)
 COST_PARQUET = COST_DIR / f"cost_log_{COST_RUN_ID}.parquet"
 
-# --- Path sanity check ------------------------------------------------------
-for _name, _p in [("POLICY", POLICY_FILE), ("RAPID2", RAPID2_FILE),
+for _name, _p in [("POLICY", POLICY_FILE), ("GOLDEN", GOLDEN_FILE), ("RAPID2", RAPID2_FILE),
                   ("PROMPT", POLICY_PROMPT_PATH)]:
     print(f"{_name:12s} {'OK     ' if _p.exists() else 'MISSING'} {_p}")
 print(f"{'OUTPUT':12s} {OUTPUT_DIR.resolve()}")
@@ -105,7 +108,7 @@ print(f"{'COST':12s} {COST_PARQUET}")
 
 
 # %% ==========================================================================
-# [0b] COST LEDGER -- unchanged from the earlier lanes
+# [0b] COST LEDGER
 # =============================================================================
 PRICING = {
     MODEL:       {"in": None, "cached_in": None, "out": None},
@@ -228,6 +231,9 @@ def _usage_fields(u):
 
 async def chat_with_cost(step, messages, call_kwargs, parse=None, *,
                          record_id=None, unit=None, attempt=1, n_items=None):
+    """The ONLY way this script talks to the chat endpoint -- primary judge
+    AND independent audit both go through here, so every attempt of either
+    is costed, win or lose."""
     model = call_kwargs.get("model", MODEL)
     t0 = time.time()
     try:
@@ -312,22 +318,12 @@ def _spend_line():
 
 
 # %% ==========================================================================
-# [A] DATA LOAD -- policies + alerts ONLY. No policy_links, no golden.
+# [A] DATA LOAD -- policies, alerts, and golden (SCOPE ONLY -- no routed-lane
+# chain, no record->policy derivation, no recall scoring).
 # =============================================================================
-# Column names match GPPS_Policy_Text_Data_Prep.py's actual master output
-# (one row per policy, across all 54 country tables + Global, PUBL-only).
-# Three fields that earlier extracts carried don't exist in this one;
-# load_policies() synthesizes them right after the read so the rest of this
-# dict and the eligibility logic below need no further changes:
-#   - global_policy_key : built as Country + "_" + policy_core_id, since
-#     policy_core_id alone is only unique WITHIN its own country's table.
-#   - used_fallback_non_publ : always False -- this data-prep filters to
-#     versStatCde == "PUBL" with no fallback to a draft version.
-#   - policyDocType : not in the keep-list -- synthesized as "".
 POLICY_RENAME = {
     "global_policy_key":      "POLICY_ID",
-    "policy_core_id":         "POL_CORE_ID",   # kept for reference only -- nothing
-                                                # downstream in this script joins on it
+    "policy_core_id":         "POL_CORE_ID",
     "Country":                "POL_COUNTRY",
     "version_num":            "VERSION_NUM",
     "versStatCde":            "POL_STATUS",
@@ -340,16 +336,10 @@ POLICY_RENAME = {
     "policyPurpose":          "POL_PURPOSE",
     "policyText":             "POL_TEXT",
     "used_fallback_non_publ": "POL_FALLBACK",
-    # "segment":               "SEGMENT_TEXT",  # available in the data-prep output,
-                                                 # not wired in -- see POLICY_TEXT_FIELDS below
 }
 PUBLISHED_CODE        = "PUBL"
 POLICY_TEXT_MAX_CHARS = 12_000
-
-# This extract spans multiple countries' GPPS tables. Set this once you've
-# confirmed the values POL_COUNTRY actually takes (e.g. {"US", "AA"}).
-# None = no filter (keep every country).
-POLICY_COUNTRY_FILTER = None
+POLICY_COUNTRY_FILTER = None   # None = every country; e.g. {"US"} to restrict
 
 POLICY_TEXT_FIELDS = [
     ("POL_TITLE",     "Policy Title"),
@@ -359,8 +349,7 @@ POLICY_TEXT_FIELDS = [
     ("POL_REGION",    "Region"),
     ("POL_DOC_TYPE",  "Policy Doc Type"),
     ("POL_PURPOSE",   "Purpose"),
-    ("POL_TEXT",      "Policy Text"),       # kept last; this one gets truncated
-    # ("SEGMENT_TEXT", "Segment Text"),     # <- uncomment once wired into POLICY_RENAME
+    ("POL_TEXT",      "Policy Text"),
 ]
 POLICY_TEXT_COLS = [c for c, _ in POLICY_TEXT_FIELDS]
 
@@ -438,16 +427,11 @@ def _truncate(s: str, n: int = None) -> str:
 
 def load_policies():
     """One row per policy with a judgeable `policy_text`, from
-    GPPS_Policy_Text_Data_Prep_Master.xlsx.
-
-    POLICY_ID = global_policy_key (Country + "_" + policy_core_id), the only
-    field guaranteed unique across the multi-country pool. Kept rows are
-    POL_STATUS == 'PUBL' (always true here, since the data-prep already
-    filtered to PUBL-only with no fallback); duplicates (shouldn't occur,
-    this extract is meant to be one row per policy already) are broken by
-    VERSION_NUM desc, then PUBL_DATE desc, then longest body.
-
-    Returns (policies_df, ids_any_status)."""
+    GPPS_Policy_Text_Data_Prep_Master.xlsx. POLICY_ID = global_policy_key
+    (Country + "_" + policy_core_id) -- the only field guaranteed unique
+    across the multi-country pool. Kept rows are POL_STATUS == 'PUBL'
+    (always true here; the data-prep already filtered to PUBL-only, no
+    fallback)."""
     raw = _read_any(POLICY_FILE)
     raw["global_policy_key"]      = raw["Country"].astype(str) + "_" + raw["policy_core_id"].astype(str)
     raw["used_fallback_non_publ"] = False
@@ -505,6 +489,22 @@ def load_policies():
     return pol[keep].reset_index(drop=True), ids_any_status
 
 
+def load_golden() -> pd.DataFrame:
+    """Golden record -> REGULATION, hand-curated. SCOPE ONLY: tells you which
+    alerts have a known regulatory link worth running (SCOPE_MODE="golden").
+    No routed-lane chain, no record->POLICY derivation, no recall scoring --
+    there is nothing downstream that reads REG_ID for any other purpose."""
+    g = _read_any(GOLDEN_FILE).rename(columns={
+        "Record ID":     "RECORD_ID",
+        "Regulation ID": "REG_ID",
+    })
+    for c in ["RECORD_ID", "REG_ID"]:
+        if c not in g.columns:
+            raise KeyError(f"golden missing {c}. Columns: {list(g.columns)}")
+        g[c] = _norm_id(g[c])
+    return g[~g.RECORD_ID.isin(_BLANK) & ~g.REG_ID.isin(_BLANK)].reset_index(drop=True)
+
+
 def load_alerts(record_ids) -> pd.DataFrame:
     """Build one cleaned alert text per record, restricted to the records we run."""
     df = _read_parquet(RAPID2_FILE)
@@ -534,11 +534,12 @@ def load_alerts(record_ids) -> pd.DataFrame:
 
 # ---- Execute the loads ------------------------------------------------------
 policies, policy_ids_any_status = load_policies()
-print("[A] loaded:", f"policies={len(policies):,}")
+golden_reg = load_golden()        # SCOPE ONLY -- see docstring
+print("[A] loaded:", f"policies={len(policies):,}  golden_reg={len(golden_reg):,}")
 
 
 # %% ==========================================================================
-# [A2] VALIDATION PROBE -- POLICY POOL ONLY (no golden/linkage to check here)
+# [A2] VALIDATION PROBE
 # =============================================================================
 print("=" * 78); print("[A2] VALIDATION PROBE -- POLICY LANE"); print("=" * 78)
 _ln = policies.policy_text.str.len()
@@ -548,6 +549,10 @@ print(f"  bodies truncated at {POLICY_TEXT_MAX_CHARS:,}    : {int(policies.text_
 print(f"  policies with EMPTY body     : {int((policies.body_chars == 0).sum()):,}")
 print(f"  countries                    : {policies.POL_COUNTRY.value_counts().to_dict()}")
 print(f"  regions                       : {policies.POL_REGION.value_counts().to_dict()}")
+print(f"\n  golden records (scope only)  : {golden_reg.RECORD_ID.nunique():,}")
+print("  READ: golden is used only to pick which alerts SCOPE_MODE='golden' runs.")
+print("        There is no record->POLICY golden in this script, so no recall/")
+print("        scorecard numbers are produced here -- see header comment.")
 print("=" * 78)
 
 
@@ -561,6 +566,8 @@ PROMPT_SHA = hashlib.sha256(POLICY_SYSTEM_PROMPT.encode()).hexdigest()[:12]
 
 LANE = {
     "top_k":              None,   # None -> judge EVERY published policy, every time.
+                                  # Similarity (order_by_embedding) only orders the
+                                  # chunk sequence -- it never drops a policy.
     "max_tokens":         50000,
     "concurrency":        30,
     "chunk":              10,
@@ -607,11 +614,14 @@ def _hash_ids(series):
 
 def run_provenance_check(label):
     print("=" * 78); print(f"[P] DATA PROVENANCE -- {label}"); print("=" * 78)
-    for lbl, path in [("POLICY_FILE", POLICY_FILE), ("RAPID2_FILE (alerts)", RAPID2_FILE),
-                      ("PROMPT_PATH", POLICY_PROMPT_PATH)]:
+    for lbl, path in [("POLICY_FILE", POLICY_FILE), ("GOLDEN_FILE", GOLDEN_FILE),
+                      ("RAPID2_FILE (alerts)", RAPID2_FILE),
+                      ("POLICY_PROMPT_PATH", POLICY_PROMPT_PATH)]:
         print(f"  {lbl:24s} {_fp(path)}")
     print("-" * 78)
     print(f"  policies      : {len(policies):,} rows | hash {_hash_ids(policies.POLICY_ID)}")
+    print(f"  golden_reg    : {len(golden_reg):,} rows | "
+          f"{golden_reg.RECORD_ID.nunique():,} records | hash {_hash_ids(golden_reg.REG_ID)}")
     print(f"  MODEL         : {MODEL}   EMBED: {EMBED_MODEL}")
     print(f"  prompt hash   : {PROMPT_SHA}   ({len(POLICY_SYSTEM_PROMPT):,} chars)")
     if PLAN_FILE.exists():
@@ -628,12 +638,11 @@ run_provenance_check("BEFORE [C] -- baseline, nothing spent yet")
 
 
 # %% ==========================================================================
-# [B2] COST PROJECTION -- no parentage/funnel/reachability; nothing here
-# depends on a golden dataset.
+# [B2] COST PROJECTION
 # =============================================================================
 def project_cost(records):
-    """Rough spend BEFORE the run. Candidates are the WHOLE published pool
-    for every record -- a true full cross-join -- so this is n_alert x n_policy."""
+    """Candidates are the WHOLE published pool for every record -- a true full
+    cross-join -- so this is n_alert x n_policy throughout."""
     alerts_df = load_alerts(set(records))
     n_alert, n_pol, chunk = len(alerts_df), len(policies), LANE["chunk"]
     calls_per_alert = math.ceil(n_pol / chunk) if n_pol else 0
@@ -674,11 +683,12 @@ def project_cost(records):
 
 # %% ==========================================================================
 # [A1] SCOPE -- which records this run judges.
-#   "all"  -> every alert in the extract (default -- no golden to restrict to)
-#   "csv"  -> an explicit list you drop at SCOPE_CSV
-# Pinned to SCOPE_CSV on first run; later runs reuse it unless SCOPE_FORCE=True.
+#   "golden" -> golden records that exist in the alerts file (default --
+#               scope only, see [A]'s docstring; NOT a recall mechanism here)
+#   "all"    -> every alert in the extract
+#   "csv"    -> an explicit list you drop at SCOPE_CSV
 # =============================================================================
-SCOPE_MODE  = "all"
+SCOPE_MODE  = "golden"
 SCOPE_FORCE = False
 SCOPE_CSV   = OUTPUT_DIR / "scope_records.csv"
 
@@ -691,12 +701,20 @@ def resolve_scope(mode=SCOPE_MODE, force=SCOPE_FORCE, save=True):
     if SCOPE_CSV.exists() and not force:
         scope = set(_norm_id(pd.read_csv(SCOPE_CSV, dtype=str)["RECORD_ID"]))
         src, save = f"pinned {SCOPE_CSV.name}", False
+    elif mode == "golden":
+        g_ids = set(golden_reg.RECORD_ID)
+        scope = g_ids & alert_ids
+        gone  = g_ids - alert_ids
+        print(f"  golden records               : {len(g_ids):,}")
+        print(f"  ... missing from alerts file  : {len(gone):,}"
+              + (f"  e.g. {sorted(gone)[:3]}" if gone else ""))
+        src = "golden records present in alerts"
     elif mode == "all":
         scope, src = alert_ids, "all alerts"
     elif mode == "csv":
         raise FileNotFoundError(f"SCOPE_MODE='csv' but {SCOPE_CSV} does not exist.")
     else:
-        raise ValueError(f"unknown SCOPE_MODE '{mode}' (no 'golden' mode -- no golden dataset here)")
+        raise ValueError(f"unknown SCOPE_MODE '{mode}'")
 
     if save:
         pd.DataFrame({"RECORD_ID": sorted(scope)}).to_csv(SCOPE_CSV, index=False)
@@ -716,7 +734,8 @@ projection = project_cost(scope_records)
 
 # %% ==========================================================================
 # [C] WORK PLAN + CHECKPOINTED MODEL EXECUTION (concurrent, resumable)
-# Unchanged from the earlier lane -- this is the actual linking logic.
+# THE PRIMARY JUDGE. Full cross-join: every record in scope against every
+# published policy. Unchanged from the original lane's mechanics.
 # =============================================================================
 POLICY_SCHEMA = {
     "type": "json_schema",
@@ -759,6 +778,18 @@ def _snapshot(rows, n_done, n_total):
     write_team_cost_file()
     print(f"    [ckpt] {n_done}/{n_total} units, {len(df):,} rows -> "
           f"{PARTIAL_FILE.name} | {_spend_line()}")
+
+
+def _best_verdicts(verdicts_df):
+    """Collapse to the strongest decision per (record, policy) pair -- used
+    both at finalise time and by the [F] audit slice selector below."""
+    v = verdicts_df.copy()
+    v["REC"], v["POL"] = _norm_id(v.RECORD_ID), _norm_id(v.POLICY_ID)
+    v["DEC"] = v.decision.astype(str).str.strip().str.upper()
+    v["_r"]  = v.DEC.map(DECISION_RANK).fillna(-1)
+    v["_s"]  = pd.to_numeric(v.relevance_score, errors="coerce").fillna(0)
+    return (v.sort_values(["REC", "_r", "_s"], ascending=[True, False, False])
+              .drop_duplicates(["REC", "POL"]))
 
 
 def _finalise(rows):
@@ -972,9 +1003,6 @@ if len(_led):
 
 # %% ==========================================================================
 # [E] LINKED-ONLY CONVENIENCE OUTPUT
-# `verdicts` already has one row per judged (alert, policy) pair, every
-# decision included. This is just the subset you actually asked for --
-# "the alert linked to the policies".
 # =============================================================================
 linked = (
     verdicts[verdicts.decision.astype(str).str.upper() == "LINKED"]
@@ -987,3 +1015,212 @@ linked.to_parquet(LINKED_FILE, index=False)
 print(f"[E] {len(linked):,} LINKED alert-policy pairs over "
       f"{linked.RECORD_ID.nunique():,} alerts -> {LINKED_FILE}")
 display(linked.head(20))
+
+
+# %% ==========================================================================
+# [F] INDEPENDENT LLM AUDIT LAYER -- a second opinion, NOT a golden comparison
+#
+# A second LLM call re-reads each (alert, policy) pair -- the two texts and
+# the primary judge's own decision/reasoning, nothing else -- and says
+# whether it AGREES or DISAGREES, and why. No golden input anywhere here;
+# "DISAGREE" just means the two LLMs didn't reach the same conclusion, not
+# that either one is proven right.
+#
+# AUDIT_SLICE picks what gets the second opinion:
+#   "ambiguous_middle" (default) -- every INSUFFICIENT_EVIDENCE verdict, plus
+#       LINKED/NOT_LINKED verdicts whose relevance_score falls inside
+#       AUDIT_SCORE_BAND. These are the cases most worth a second read.
+#       NOTE: relevance_score's scale isn't fixed by the schema (just
+#       "integer") -- confirm your prompt's actual scale and adjust
+#       AUDIT_SCORE_BAND if it isn't roughly 0-100.
+#   "all_linked"       -- every LINKED verdict, full QC sweep on positives.
+#   "sample"            -- a random sample across all decision types.
+# =============================================================================
+AUDIT_BUCKETS = ["AGREE_WITH_MODEL", "DISAGREE_SHOULD_LINK",
+                 "DISAGREE_SHOULD_NOT_LINK", "TEXT_INSUFFICIENT", "AMBIGUOUS"]
+
+SUB_REASONS = {
+    "AGREE_WITH_MODEL": [
+        "CLEAR_MATCH_CONFIRMED",
+        "CLEAR_REJECTION_CONFIRMED",
+    ],
+    "DISAGREE_SHOULD_LINK": [
+        "MODEL_ERROR_TEXT_SUPPORTS_LINK",
+        "POLICY_TEXT_TOO_THIN",
+        "TRUNCATED_POLICY_BODY",
+    ],
+    "DISAGREE_SHOULD_NOT_LINK": [
+        "DIFFERENT_SUBJECT_MATTER",
+        "JURISDICTION_MISMATCH",
+        "WRONG_RISK_TYPE",
+        "MODEL_OVER_LINKED",
+    ],
+    "TEXT_INSUFFICIENT": [
+        "IMPLICIT_DOMAIN_KNOWLEDGE",
+        "REQUIRES_POLICY_OWNER_VIEW",
+        "INDIRECT_DOWNSTREAM_IMPACT",
+    ],
+    "AMBIGUOUS": ["INSUFFICIENT_INFORMATION"],
+}
+ALL_SUB_REASONS = [s for subs in SUB_REASONS.values() for s in subs]
+
+AUDIT_SYSTEM_PROMPT = f"""ROLE:
+You are an independent model-risk reviewer. A linkage model judged whether a
+regulatory alert bears on an internal POLICY, from the alert and policy text
+alone. You have NO access to any external ground truth. Independently
+re-read both texts and decide whether you AGREE or DISAGREE with the
+model's decision, and why.
+
+Return exactly one bucket and one sub-reason.
+
+BUCKETS: {", ".join(AUDIT_BUCKETS)}
+SUB_REASONS: {json.dumps(SUB_REASONS)}
+
+GUIDANCE:
+- Judge only on the supplied texts. If the link needs knowledge that is in
+  neither text, that is IMPLICIT_DOMAIN_KNOWLEDGE or SME_JUDGEMENT-flavoured
+  (use TEXT_INSUFFICIENT).
+- Policy text may be truncated; if the decisive clause is plainly missing,
+  say TRUNCATED_POLICY_BODY.
+- "Disagree" means your independent reading differs from the model's -- it
+  does not mean the model is provably wrong, since neither of you has
+  external ground truth here.
+Return JSON only."""
+
+AUDIT_SCHEMA = {
+    "type": "json_schema",
+    "json_schema": {
+        "name": "audit_verdict", "strict": True,
+        "schema": {
+            "type": "object", "additionalProperties": False,
+            "required": ["audit_category", "sub_reason", "explanation"],
+            "properties": {
+                "audit_category": {"type": "string", "enum": AUDIT_BUCKETS},
+                "sub_reason":     {"type": "string", "enum": ALL_SUB_REASONS},
+                "explanation":    {"type": ["string", "null"]},
+            }}}
+}
+
+AUDIT_SLICE      = "ambiguous_middle"   # "ambiguous_middle" | "all_linked" | "sample"
+AUDIT_SCORE_BAND = (40, 70)             # confirm against your prompt's actual score scale
+AUDIT_SAMPLE     = None                 # an int to cap any slice, or None for all
+
+
+def _audit_call_kwargs():
+    kw = {"model": MODEL, "user": USE_CASE, "response_format": AUDIT_SCHEMA}
+    if "gemini" in MODEL.lower():
+        kw.update(temperature=0.0, seed=42, reasoning_effort="low", max_tokens=4000)
+    else:
+        kw.update(reasoning_effort="low", max_completion_tokens=4000)
+    return kw
+
+
+async def _audit_one(alert_text, policy_text, model_decision, model_reasoning,
+                     model_score, rid=None, pid=None):
+    payload = {"alert_text": alert_text, "policy_text": policy_text,
+               "model_decision": model_decision, "model_reasoning": model_reasoning,
+               "model_relevance_score": model_score}
+    messages = [{"role": "system", "content": AUDIT_SYSTEM_PROMPT},
+                {"role": "user",   "content": json.dumps(payload, ensure_ascii=False)}]
+    last = None
+    for attempt in range(1, 3 + 1):
+        try:
+            parsed, _ = await chat_with_cost(
+                "audit", messages, _audit_call_kwargs(),
+                parse=lambda r: json.loads(r.choices[0].message.content),
+                record_id=rid, unit=f"audit:{rid}|{pid}", attempt=attempt, n_items=1)
+            return parsed
+        except Exception as e:
+            last = e
+            if "401" in str(e) or "unauth" in str(e).lower():
+                try:
+                    await tok.invalidate()
+                except Exception:
+                    pass
+            await asyncio.sleep(1.5 ** attempt)
+    return {"audit_category": "AMBIGUOUS", "sub_reason": "INSUFFICIENT_INFORMATION",
+            "explanation": f"audit failed: {last}"}
+
+
+def select_audit_slice(verdicts_df, which=AUDIT_SLICE, sample=AUDIT_SAMPLE,
+                       score_band=AUDIT_SCORE_BAND, seed=42):
+    v = _best_verdicts(verdicts_df)
+    if which == "ambiguous_middle":
+        lo, hi = score_band
+        sl = v[(v.DEC == "INSUFFICIENT_EVIDENCE") |
+               (v.DEC.isin(["LINKED", "NOT_LINKED"]) & v._s.between(lo, hi))].copy()
+    elif which == "all_linked":
+        sl = v[v.DEC == "LINKED"].copy()
+    elif which == "sample":
+        sl = v.copy()
+    else:
+        raise ValueError("AUDIT_SLICE must be 'ambiguous_middle', 'all_linked', or 'sample'")
+
+    if sample and len(sl) > sample:
+        sl = sl.sample(sample, random_state=seed)
+    print(f"[F] audit slice '{which}': {len(sl):,} pairs")
+    return sl.reset_index(drop=True)
+
+
+async def run_audit(slice_df, alert_text_by_id, policy_text_by_id, concurrency=20):
+    sem = asyncio.Semaphore(concurrency)
+
+    async def _one(row):
+        async with sem:
+            out = await _audit_one(alert_text_by_id.get(row.REC, ""),
+                                   policy_text_by_id.get(row.POL, ""),
+                                   row.DEC, getattr(row, "reasoning", None), row._s,
+                                   rid=row.REC, pid=row.POL)
+            return {"REC": row.REC, "POL": row.POL, "model_decision": row.DEC,
+                    "model_relevance_score": row._s, **out}
+
+    tasks = [asyncio.create_task(_one(r)) for r in slice_df.itertuples()]
+    out = []
+    for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="audit"):
+        out.append(await fut)
+    write_team_cost_file()
+    return pd.DataFrame(out)
+
+
+def audit_report(audited_df):
+    if not len(audited_df):
+        print("[F] nothing audited."); return None
+    bar = "=" * 70
+    print(bar); print("[F] INDEPENDENT AUDIT -- SECOND OPINION"); print(bar)
+    cat = audited_df.audit_category.value_counts()
+    for k, c in cat.items():
+        print(f"  {k:26s}: {c:,}  ({c/len(audited_df):.1%})")
+    agree_rate = (audited_df.audit_category == "AGREE_WITH_MODEL").mean()
+    print(f"\n  agreement rate with primary judge: {agree_rate:.1%}")
+    print("-" * 60)
+    print(audited_df.sub_reason.value_counts().to_string())
+    return cat
+
+
+# ---- Execute -----------------------------------------------------------------
+_alert_txt  = dict(zip(*(lambda d: (d.RECORD_ID, d.alert_text))(load_alerts(scope_records))))
+_policy_txt = dict(zip(policies.POLICY_ID, policies.policy_text))
+
+audit_slice = select_audit_slice(verdicts)
+audited     = await run_audit(audit_slice, _alert_txt, _policy_txt)
+_ = audit_report(audited)
+
+AUDITED_FILE = OUTPUT_DIR / f"policy_audit_{MODEL}.parquet"
+audited.to_parquet(AUDITED_FILE, index=False)
+print(f"[F] audit results -> {AUDITED_FILE}")
+
+
+# %% ==========================================================================
+# [G] WRAP-UP SUMMARY
+# =============================================================================
+print("=" * 78); print("[G] RUN SUMMARY"); print("=" * 78)
+print(f"  alerts judged                : {verdicts.RECORD_ID.nunique():,}")
+print(f"  policies in pool              : {len(policies):,}")
+print(f"  total (alert, policy) verdicts: {len(verdicts):,}")
+print(f"  LINKED                        : {len(linked):,}")
+print(f"  audited (second opinion)      : {len(audited):,}")
+if len(audited):
+    print(f"  audit agreement rate          : "
+          f"{(audited.audit_category == 'AGREE_WITH_MODEL').mean():.1%}")
+print(f"  {_spend_line()}")
+print("=" * 78)
